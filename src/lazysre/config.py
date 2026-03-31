@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     model_mode: str = "heuristic"
     model_name: str = "gpt-5.4-mini"
     max_reflections: int = 2
+    data_dir: str = ".data"
+    task_store_file: str = "tasks.json"
     openai_api_key: str = Field(default="", validation_alias="OPENAI_API_KEY")
 
 
