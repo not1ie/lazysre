@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     max_reflections: int = 2
     data_dir: str = ".data"
     task_store_file: str = "tasks.json"
+    platform_store_file: str = "platform.json"
     openai_api_key: str = Field(default="", validation_alias="OPENAI_API_KEY")
 
 
