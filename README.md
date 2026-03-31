@@ -1,0 +1,2 @@
+# lazysre
+aisre-agent
