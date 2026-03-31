@@ -62,4 +62,3 @@ curl http://127.0.0.1:8000/v1/tasks/<task_id>
 1. 接入真实 SRE 工具（K8s、Prometheus、日志系统）
 2. 增加任务队列与持久化存储（PostgreSQL + Redis）
 3. 加入多智能体协作（诊断 Agent、修复 Agent、复盘 Agent）
-
