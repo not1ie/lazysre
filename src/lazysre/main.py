@@ -1,8 +1,10 @@
 import asyncio
 import json
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from lazysre.models import MemorySearchResponse, TaskCreateRequest, TaskRecord
 from lazysre.platform.models import (
@@ -20,11 +22,22 @@ from lazysre.services.task_service import TaskService
 app = FastAPI(title="LazySRE", version="0.1.0")
 task_service = TaskService()
 platform_service = PlatformService()
+web_dir = Path(__file__).resolve().parent / "web"
+
+if web_dir.exists():
+    app.mount("/web", StaticFiles(directory=web_dir), name="web")
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/", include_in_schema=False)
+async def web_console() -> FileResponse:
+    if not web_dir.exists():
+        raise HTTPException(status_code=404, detail="web console not found")
+    return FileResponse(web_dir / "index.html")
 
 
 @app.post("/v1/tasks", response_model=TaskRecord)

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LazySRE Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/web/styles.css" />
+  </head>
+  <body>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+    <main class="shell">
+      <header class="hero card">
+        <p class="eyebrow">LAZYSRE PLATFORM</p>
+        <h1>纯 AI 智能体编排控制台</h1>
+        <p class="subtitle">
+          在一个界面完成 Quickstart、Workflow Run、实时事件流观测。
+        </p>
+        <div class="hero-stats">
+          <div><span id="agents-count">0</span><label>Agents</label></div>
+          <div><span id="workflows-count">0</span><label>Workflows</label></div>
+          <div><span id="runs-count">0</span><label>Runs</label></div>
+        </div>
+      </header>
+
+      <section class="layout">
+        <aside class="left-col">
+          <section class="card">
+            <h2>Quickstart</h2>
+            <form id="quickstart-form" class="stack">
+              <label>
+                Flow 名称
+                <input id="flow-name" value="Prod Incident Flow" required />
+              </label>
+              <label>
+                目标 Objective
+                <textarea
+                  id="flow-objective"
+                  required
+                >定位并修复 gateway 5xx 异常，输出回滚与验证步骤</textarea>
+              </label>
+              <button type="submit">创建默认多智能体流程</button>
+            </form>
+          </section>
+
+          <section class="card">
+            <div class="row-head">
+              <h2>Workflows</h2>
+              <button id="refresh-workflows" class="ghost">刷新</button>
+            </div>
+            <div id="workflow-list" class="list"></div>
+          </section>
+        </aside>
+
+        <section class="right-col">
+          <section class="card">
+            <h2>Run Launcher</h2>
+            <form id="run-form" class="stack">
+              <label>
+                Input JSON
+                <textarea id="run-input">{"service":"gateway","cluster":"prod-sh"}</textarea>
+              </label>
+              <div class="actions">
+                <button type="submit">启动 Run</button>
+                <button type="button" id="cancel-run-btn" class="danger">取消当前 Run</button>
+              </div>
+            </form>
+            <p id="active-summary" class="meta">尚未选择 Workflow。</p>
+          </section>
+
+          <section class="card">
+            <div class="row-head">
+              <h2>Runs</h2>
+              <button id="refresh-runs" class="ghost">刷新</button>
+            </div>
+            <div id="run-list" class="list"></div>
+          </section>
+
+          <section class="card">
+            <h2>Live Event Stream</h2>
+            <pre id="event-log" class="log"></pre>
+          </section>
+
+          <section class="card">
+            <h2>Node Outputs</h2>
+            <div id="outputs-grid" class="outputs"></div>
+          </section>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="/web/app.js"></script>
+  </body>
+</html>
+

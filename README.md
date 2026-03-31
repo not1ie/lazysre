@@ -35,6 +35,10 @@ pip install -e ".[dev]"
 uvicorn lazysre.main:app --reload
 ```
 
+启动后可直接打开控制台：
+
+- `http://127.0.0.1:8000/`
+
 ## 环境变量
 
 复制 `.env.example` 到 `.env` 后按需调整。
