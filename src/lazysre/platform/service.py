@@ -15,6 +15,8 @@ from lazysre.platform.models import (
     AgentDefinition,
     AgentRole,
     AutoDesignRequest,
+    EnvironmentBootstrapRequest,
+    EnvironmentBootstrapResult,
     OpsToolDefinition,
     OpsToolKind,
     PlatformOverview,
@@ -73,19 +75,7 @@ class PlatformService:
         return sorted(self._state.agents.values(), key=lambda x: x.created_at, reverse=True)
 
     async def create_tool(self, req: ToolCreateRequest) -> OpsToolDefinition:
-        tool = OpsToolDefinition(
-            name=req.name,
-            kind=req.kind,
-            base_url=req.base_url.rstrip("/"),
-            headers=req.headers,
-            verify_tls=req.verify_tls,
-            default_query=req.default_query,
-            required_permission=_normalize_permission(req.required_permission),
-        )
-        async with self._lock:
-            self._state.tools[tool.id] = tool
-            self._persist_unlocked()
-        return tool
+        return await self._upsert_tool(req)
 
     async def list_tools(self) -> list[OpsToolDefinition]:
         return sorted(self._state.tools.values(), key=lambda x: x.created_at, reverse=True)
@@ -104,6 +94,75 @@ class PlatformService:
 
     async def list_templates(self) -> list[PlatformTemplate]:
         return list(self._templates.values())
+
+    async def bootstrap_environment(
+        self, req: EnvironmentBootstrapRequest
+    ) -> EnvironmentBootstrapResult:
+        monitoring_urls = _build_monitoring_url_candidates(req.monitoring_ip, req.monitoring_port)
+        if not monitoring_urls:
+            raise ValueError("monitoring_ip is invalid")
+
+        created_tools: list[OpsToolDefinition] = []
+        probe_results: dict[str, str] = {}
+        primary_prometheus_id: str | None = None
+
+        for idx, base_url in enumerate(monitoring_urls, start=1):
+            tool = await self._upsert_tool(
+                ToolCreateRequest(
+                    name=(
+                        "Prometheus Primary"
+                        if idx == 1
+                        else f"Prometheus Candidate {idx}"
+                    ),
+                    kind=OpsToolKind.prometheus,
+                    base_url=base_url,
+                    default_query="up",
+                    required_permission="read",
+                )
+            )
+            created_tools.append(tool)
+            try:
+                probe = await self.probe_tool(
+                    tool.id, ToolProbeRequest(query=tool.default_query, timeout_sec=5.0)
+                )
+                probe_results[tool.id] = f"ok: {probe.preview[:180]}"
+                if primary_prometheus_id is None:
+                    primary_prometheus_id = tool.id
+            except Exception as exc:
+                probe_results[tool.id] = f"error: {exc}"
+
+        k8s_tool = await self._upsert_tool(
+            ToolCreateRequest(
+                name="K8s API Primary",
+                kind=OpsToolKind.kubernetes,
+                base_url=req.k8s_api_url.rstrip("/"),
+                verify_tls=req.k8s_verify_tls,
+                default_query="/version",
+                required_permission="read",
+            )
+        )
+        created_tools.append(k8s_tool)
+        try:
+            probe = await self.probe_tool(
+                k8s_tool.id, ToolProbeRequest(query=k8s_tool.default_query, timeout_sec=5.0)
+            )
+            probe_results[k8s_tool.id] = f"ok: {probe.preview[:180]}"
+        except Exception as exc:
+            probe_results[k8s_tool.id] = f"error: {exc}"
+
+        workflow: WorkflowDefinition | None = None
+        if req.create_mission_workflow:
+            workflow = await self._upsert_prod_incident_workflow(
+                name=req.workflow_name.strip() or "Prod Autonomous Incident",
+                prometheus_tool_id=primary_prometheus_id,
+                kubernetes_tool_id=k8s_tool.id,
+            )
+        return EnvironmentBootstrapResult(
+            tools=created_tools,
+            primary_tool_id=primary_prometheus_id or (created_tools[0].id if created_tools else None),
+            workflow=workflow,
+            probe_results=probe_results,
+        )
 
     async def create_workflow(self, req: WorkflowCreateRequest) -> WorkflowDefinition:
         wf = WorkflowDefinition(
@@ -294,7 +353,8 @@ class PlatformService:
         system_prompt = (
             "你是运维编排设计器。给定目标后，请只输出 JSON 数组。"
             "每个元素包含: id, role(planner|worker|critic|responder), instruction, "
-            "required_permission(read|write|admin), requires_approval(bool), next_nodes(string[])."
+            "required_permission(read|write|admin), requires_approval(bool), next_nodes(string[])。"
+            "可选字段: tool_binding(string), tool_query(string)."
             "最多 6 个节点。"
         )
         user_prompt = f"objective={objective}\ntemplate={template.model_dump() if template else '{}'}"
@@ -316,6 +376,12 @@ class PlatformService:
                             "id": str(item.get("id") or f"node-{len(normalized)+1}"),
                             "role": role,
                             "instruction": str(item.get("instruction") or "补充诊断步骤"),
+                            "tool_binding": (
+                                str(item.get("tool_binding")) if item.get("tool_binding") else None
+                            ),
+                            "tool_query": (
+                                str(item.get("tool_query")) if item.get("tool_query") else None
+                            ),
                             "required_permission": _normalize_permission(
                                 str(item.get("required_permission", "read"))
                             ),
@@ -362,6 +428,7 @@ class PlatformService:
             tool_binding = (
                 str(item.get("tool_binding")) if item.get("tool_binding") else None
             ) or (preferred_tool_id if role == "worker" else None)
+            tool_query = str(item.get("tool_query")).strip() if item.get("tool_query") else None
 
             nodes.append(
                 WorkflowNode(
@@ -369,6 +436,7 @@ class PlatformService:
                     agent_id=agent_id,
                     instruction=instruction,
                     tool_binding=tool_binding,
+                    tool_query=tool_query,
                     required_permission=required_permission,
                     requires_approval=requires_approval,
                     approval_reason=approval_reason,
@@ -444,6 +512,130 @@ class PlatformService:
                 body = " ".join(resp.text.split())
             return body[:1500]
 
+    async def _upsert_tool(self, req: ToolCreateRequest) -> OpsToolDefinition:
+        normalized_url = req.base_url.rstrip("/")
+        req_perm = _normalize_permission(req.required_permission)
+        async with self._lock:
+            for tool in self._state.tools.values():
+                if tool.kind == req.kind and tool.base_url.rstrip("/") == normalized_url:
+                    tool.name = req.name
+                    tool.headers = req.headers
+                    tool.verify_tls = req.verify_tls
+                    tool.default_query = req.default_query
+                    tool.required_permission = req_perm
+                    self._persist_unlocked()
+                    return tool
+
+            tool = OpsToolDefinition(
+                name=req.name,
+                kind=req.kind,
+                base_url=normalized_url,
+                headers=req.headers,
+                verify_tls=req.verify_tls,
+                default_query=req.default_query,
+                required_permission=req_perm,
+            )
+            self._state.tools[tool.id] = tool
+            self._persist_unlocked()
+            return tool
+
+    async def _upsert_prod_incident_workflow(
+        self, name: str, prometheus_tool_id: str | None, kubernetes_tool_id: str | None
+    ) -> WorkflowDefinition:
+        planner = await self._ensure_agent(
+            name="Planner Agent",
+            role=AgentRole.planner,
+            prompt="你是SRE规划智能体，产出分阶段排查计划和优先级。",
+        )
+        worker = await self._ensure_agent(
+            name="Worker Agent",
+            role=AgentRole.worker,
+            prompt="你是SRE执行智能体，输出证据、命令和修复动作。",
+        )
+        critic = await self._ensure_agent(
+            name="Critic Agent",
+            role=AgentRole.critic,
+            prompt="你是SRE评审智能体，输出风险、回滚和验证清单。",
+        )
+        responder = await self._ensure_agent(
+            name="Responder Agent",
+            role=AgentRole.custom,
+            prompt="你是值班沟通智能体，生成通报、进展播报和复盘摘要。",
+        )
+
+        nodes = [
+            WorkflowNode(
+                id="triage_signal",
+                agent_id=planner.id,
+                instruction="先读取监控信号，判断是否存在系统性可用性下降，并确定优先排查方向。",
+                tool_binding=prometheus_tool_id,
+                tool_query='sum(up) by (job)',
+                required_permission="read",
+                requires_approval=False,
+                next_nodes=["correlate_k8s"],
+            ),
+            WorkflowNode(
+                id="correlate_k8s",
+                agent_id=worker.id,
+                instruction="结合 K8s API 输出集群版本、组件健康与潜在异常范围。",
+                tool_binding=kubernetes_tool_id,
+                tool_query="/version",
+                required_permission="read",
+                requires_approval=False,
+                next_nodes=["risk_review"],
+            ),
+            WorkflowNode(
+                id="risk_review",
+                agent_id=critic.id,
+                instruction="综合证据给出根因假设、风险矩阵和可回滚修复方案。",
+                required_permission="read",
+                requires_approval=False,
+                next_nodes=["guarded_action"],
+            ),
+            WorkflowNode(
+                id="guarded_action",
+                agent_id=worker.id,
+                instruction="根据评审结论，生成可执行变更动作与验证步骤，不直接执行破坏性操作。",
+                tool_binding=kubernetes_tool_id,
+                tool_query="/api/v1/nodes?limit=20",
+                required_permission="admin",
+                requires_approval=True,
+                approval_reason="该步骤会生成生产变更动作建议，需人工审批后继续",
+                next_nodes=["incident_comms"],
+            ),
+            WorkflowNode(
+                id="incident_comms",
+                agent_id=responder.id,
+                instruction="生成对内通报、对外说明和复盘纪要模板。",
+                required_permission="read",
+                requires_approval=False,
+                next_nodes=[],
+            ),
+        ]
+
+        wf = WorkflowDefinition(
+            name=name,
+            objective="围绕生产可用性故障进行信号采集、根因定位、审批变更与沟通闭环。",
+            start_node="triage_signal",
+            nodes=nodes,
+        )
+        self._validate_workflow(wf)
+
+        async with self._lock:
+            existing = next(
+                (x for x in self._state.workflows.values() if x.name == name),
+                None,
+            )
+            if existing:
+                existing.objective = wf.objective
+                existing.start_node = wf.start_node
+                existing.nodes = wf.nodes
+                self._persist_unlocked()
+                return existing
+            self._state.workflows[wf.id] = wf
+            self._persist_unlocked()
+            return wf
+
     def _pick_default_tool_binding(self) -> str | None:
         if not self._state.tools:
             return None
@@ -517,6 +709,28 @@ def _is_risky_instruction(instruction: str) -> bool:
     lowered = instruction.lower()
     risky_keywords = ("delete", "restart", "scale", "rollback", "drain", "kill", "升级")
     return any(word in lowered for word in risky_keywords)
+
+
+def _build_monitoring_url_candidates(ip_or_url: str, port: int) -> list[str]:
+    raw = ip_or_url.strip()
+    if not raw:
+        return []
+    if raw.startswith(("http://", "https://")):
+        return [raw.rstrip("/")]
+
+    candidates = [f"http://{raw}:{port}"]
+    if raw.startswith("92."):
+        # 用户常见误写场景: 92.x.x.x -> 192.x.x.x
+        candidates.append(f"http://192.{raw[len('92.'):]}:{port}")
+
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if item in seen:
+            continue
+        uniq.append(item)
+        seen.add(item)
+    return uniq
 
 
 def _fallback_blueprint(template: PlatformTemplate | None = None) -> list[dict[str, object]]:

@@ -105,6 +105,21 @@ curl http://127.0.0.1:8000/v1/platform/overview
 curl http://127.0.0.1:8000/v1/platform/templates
 ```
 
+目标环境一键引导（推荐，自动创建/更新 Prom + K8s 工具并生成生产故障流程）：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/platform/bootstrap/environment \
+  -H "Content-Type: application/json" \
+  -d '{
+    "monitoring_ip":"92.168.69.176",
+    "monitoring_port":9090,
+    "k8s_api_url":"https://192.168.10.1:6443",
+    "k8s_verify_tls":false,
+    "create_mission_workflow":true,
+    "workflow_name":"Prod Autonomous Incident"
+  }'
+```
+
 注册工具与连通性探测：
 
 ```bash

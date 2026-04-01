@@ -11,6 +11,8 @@ from lazysre.platform.models import (
     AgentCreateRequest,
     AgentDefinition,
     AutoDesignRequest,
+    EnvironmentBootstrapRequest,
+    EnvironmentBootstrapResult,
     OpsToolDefinition,
     PlatformOverview,
     PlatformTemplate,
@@ -112,6 +114,16 @@ async def create_tool(req: ToolCreateRequest) -> OpsToolDefinition:
 @app.get("/v1/platform/tools", response_model=list[OpsToolDefinition])
 async def list_tools() -> list[OpsToolDefinition]:
     return await platform_service.list_tools()
+
+
+@app.post("/v1/platform/bootstrap/environment", response_model=EnvironmentBootstrapResult)
+async def bootstrap_environment(req: EnvironmentBootstrapRequest) -> EnvironmentBootstrapResult:
+    try:
+        return await platform_service.bootstrap_environment(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"bootstrap failed: {exc}") from exc
 
 
 @app.post("/v1/platform/tools/{tool_id}/probe", response_model=ToolProbeResult)

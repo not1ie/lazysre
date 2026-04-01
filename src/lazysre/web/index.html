@@ -71,6 +71,30 @@
             <button type="submit">生成 Workflow</button>
           </form>
           <hr />
+          <form id="env-form" class="stack">
+            <h3>Target Environment</h3>
+            <label>
+              监控 IP
+              <input id="env-monitoring-ip" value="92.168.69.176" />
+            </label>
+            <label>
+              监控端口
+              <input id="env-monitoring-port" value="9090" />
+            </label>
+            <label>
+              K8s API URL
+              <input id="env-k8s-url" value="https://192.168.10.1:6443" />
+            </label>
+            <label>
+              K8s TLS 校验
+              <select id="env-k8s-verify-tls">
+                <option value="false" selected>skip verify</option>
+                <option value="true">verify on</option>
+              </select>
+            </label>
+            <button type="submit">一键引导环境</button>
+          </form>
+          <hr />
           <form id="tool-form" class="stack">
             <h3>Tool Hub</h3>
             <label>

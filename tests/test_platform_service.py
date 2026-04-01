@@ -4,6 +4,7 @@ from pathlib import Path
 from lazysre.platform.models import (
     AgentCreateRequest,
     AutoDesignRequest,
+    EnvironmentBootstrapRequest,
     QuickstartRequest,
     RunApprovalRequest,
     RunCreateRequest,
@@ -178,3 +179,48 @@ async def test_permission_denied_run(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.error is not None
     assert "permission denied" in loaded.error
+
+
+async def test_environment_bootstrap_with_monitoring_fallback(tmp_path: Path) -> None:
+    service = PlatformService(store_path=str(tmp_path / "platform.json"))
+
+    async def fake_execute_tool(tool, query, context, timeout_sec=10.0):  # type: ignore[no-untyped-def]
+        if "92.168.69.176" in tool.base_url:
+            raise RuntimeError("connect timeout")
+        return f'{{"tool":"{tool.kind.value}","query":"{query}"}}'
+
+    service._execute_tool = fake_execute_tool  # type: ignore[method-assign]
+
+    boot = await service.bootstrap_environment(
+        EnvironmentBootstrapRequest(
+            monitoring_ip="92.168.69.176",
+            monitoring_port=9090,
+            k8s_api_url="https://192.168.10.1:6443",
+            k8s_verify_tls=False,
+            create_mission_workflow=True,
+            workflow_name="Prod Autonomous Incident",
+        )
+    )
+    assert boot.workflow is not None
+    assert boot.primary_tool_id is not None
+    assert any("error:" in x for x in boot.probe_results.values())
+    assert any("ok:" in x for x in boot.probe_results.values())
+    assert any(t.base_url == "http://192.168.69.176:9090" for t in boot.tools)
+
+    triage = next((n for n in boot.workflow.nodes if n.id == "triage_signal"), None)
+    assert triage is not None
+    assert triage.tool_query == "sum(up) by (job)"
+
+    run = await service.create_run(
+        workflow_id=boot.workflow.id,
+        req=RunCreateRequest(
+            input={
+                "actor_permission": "admin",
+                "service": "gateway",
+                "cluster": "prod-sh",
+            }
+        ),
+    )
+    assert run is not None
+    status = await _wait_run(service, run.id)
+    assert status in (RunStatus.waiting_approval, RunStatus.completed)

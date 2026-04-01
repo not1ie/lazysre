@@ -18,6 +18,11 @@ const els = {
   missionMode: $("mission-mode"),
   templateSelect: $("template-select"),
   workflowName: $("workflow-name"),
+  envForm: $("env-form"),
+  envMonitoringIp: $("env-monitoring-ip"),
+  envMonitoringPort: $("env-monitoring-port"),
+  envK8sUrl: $("env-k8s-url"),
+  envK8sVerifyTls: $("env-k8s-verify-tls"),
   toolForm: $("tool-form"),
   toolName: $("tool-name"),
   toolKind: $("tool-kind"),
@@ -402,6 +407,42 @@ async function createTool() {
   setSummary(`tool registered: ${payload.name}`);
 }
 
+async function bootstrapEnvironment() {
+  const monitoringIp = els.envMonitoringIp.value.trim();
+  const monitoringPort = Number.parseInt(els.envMonitoringPort.value.trim(), 10);
+  const k8sApiUrl = els.envK8sUrl.value.trim();
+  const k8sVerifyTls = els.envK8sVerifyTls.value === "true";
+  if (!monitoringIp || !k8sApiUrl || Number.isNaN(monitoringPort)) {
+    alert("请完整填写监控与 K8s 环境参数");
+    return;
+  }
+
+  const resp = await api("/v1/platform/bootstrap/environment", {
+    method: "POST",
+    body: JSON.stringify({
+      monitoring_ip: monitoringIp,
+      monitoring_port: monitoringPort,
+      k8s_api_url: k8sApiUrl,
+      k8s_verify_tls: k8sVerifyTls,
+      create_mission_workflow: true,
+      workflow_name: "Prod Autonomous Incident",
+    }),
+  });
+
+  await refreshAll();
+  if (resp.workflow && resp.workflow.id) {
+    state.selectedWorkflowId = resp.workflow.id;
+    renderWorkflows();
+    renderCanvas(resp.workflow);
+  }
+
+  const probeLines = Object.entries(resp.probe_results || {})
+    .slice(0, 4)
+    .map(([, v]) => v)
+    .join(" | ");
+  setSummary(`环境引导完成，primaryTool=${(resp.primary_tool_id || "").slice(0, 8)} ${probeLines}`);
+}
+
 async function approveOrReject(action) {
   if (!state.selectedRunId) {
     alert("请先选择 run");
@@ -457,6 +498,15 @@ els.toolForm.addEventListener("submit", async (e) => {
     await createTool();
   } catch (err) {
     alert(`注册 tool 失败: ${err.message}`);
+  }
+});
+
+els.envForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await bootstrapEnvironment();
+  } catch (err) {
+    alert(`环境引导失败: ${err.message}`);
   }
 });
 

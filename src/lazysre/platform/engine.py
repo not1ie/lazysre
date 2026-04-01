@@ -120,10 +120,12 @@ class WorkflowEngine:
                 if node.tool_binding and tools and tool_executor:
                     tool = tools.get(node.tool_binding)
                     if tool:
-                        tool_query = ""
+                        tool_query = node.tool_query or ""
                         tool_queries = run.input.get("tool_queries")
                         if isinstance(tool_queries, dict):
-                            tool_query = str(tool_queries.get(node.id, ""))
+                            from_input = str(tool_queries.get(node.id, "")).strip()
+                            if from_input:
+                                tool_query = from_input
                         tool_context = await tool_executor(tool, tool_query, run.input)
                         run.events.append(
                             RunEvent(
@@ -225,4 +227,3 @@ def _has_approved_node(run: WorkflowRun, node_id: str) -> bool:
         if approval.node_id == node_id and approval.action == "approve":
             return True
     return False
-

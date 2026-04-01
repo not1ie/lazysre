@@ -31,6 +31,7 @@ class WorkflowNode(BaseModel):
     agent_id: str
     instruction: str = Field(min_length=1, max_length=4000)
     tool_binding: str | None = None
+    tool_query: str | None = None
     required_permission: str = "read"
     requires_approval: bool = False
     approval_reason: str | None = None
@@ -165,6 +166,22 @@ class ToolProbeRequest(BaseModel):
 class ToolProbeResult(BaseModel):
     ok: bool
     preview: str
+
+
+class EnvironmentBootstrapRequest(BaseModel):
+    monitoring_ip: str = "92.168.69.176"
+    monitoring_port: int = 9090
+    k8s_api_url: str = "https://192.168.10.1:6443"
+    k8s_verify_tls: bool = False
+    create_mission_workflow: bool = True
+    workflow_name: str = "Prod Autonomous Incident"
+
+
+class EnvironmentBootstrapResult(BaseModel):
+    tools: list[OpsToolDefinition] = Field(default_factory=list)
+    primary_tool_id: str | None = None
+    workflow: WorkflowDefinition | None = None
+    probe_results: dict[str, str] = Field(default_factory=dict)
 
 
 class RunApprovalRequest(BaseModel):
