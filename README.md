@@ -114,6 +114,7 @@ curl -X POST http://127.0.0.1:8000/v1/platform/tools \
     "name":"Prometheus Prod",
     "kind":"prometheus",
     "base_url":"http://prometheus:9090",
+    "verify_tls":true,
     "default_query":"up",
     "required_permission":"read"
   }'

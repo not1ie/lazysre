@@ -123,11 +123,13 @@ async def test_tool_registry_and_probe_unknown(tmp_path: Path) -> None:
             name="Mock Prom",
             kind="prometheus",
             base_url="http://127.0.0.1:9090",
+            verify_tls=False,
             default_query="up",
             required_permission="read",
         )
     )
     assert tool.name == "Mock Prom"
+    assert tool.verify_tls is False
     tools = await service.list_tools()
     assert any(t.id == tool.id for t in tools)
 

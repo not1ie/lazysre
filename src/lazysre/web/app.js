@@ -23,6 +23,7 @@ const els = {
   toolKind: $("tool-kind"),
   toolBaseUrl: $("tool-base-url"),
   toolDefaultQuery: $("tool-default-query"),
+  toolVerifyTls: $("tool-verify-tls"),
   toolPermission: $("tool-permission"),
   toolList: $("tool-list"),
   refreshAll: $("refresh-all"),
@@ -386,6 +387,7 @@ async function createTool() {
     kind: els.toolKind.value,
     base_url: els.toolBaseUrl.value.trim(),
     default_query: els.toolDefaultQuery.value.trim(),
+    verify_tls: els.toolVerifyTls.value === "true",
     required_permission: els.toolPermission.value,
   };
   if (!payload.name || !payload.base_url) {
@@ -543,4 +545,3 @@ refreshAll().catch((err) => {
   console.error(err);
   setSummary(`初始化失败: ${err.message}`);
 });
-

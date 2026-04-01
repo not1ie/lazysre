@@ -78,6 +78,7 @@ class PlatformService:
             kind=req.kind,
             base_url=req.base_url.rstrip("/"),
             headers=req.headers,
+            verify_tls=req.verify_tls,
             default_query=req.default_query,
             required_permission=_normalize_permission(req.required_permission),
         )
@@ -409,7 +410,11 @@ class PlatformService:
         headers = dict(tool.headers or {})
         timeout = max(1.0, min(timeout_sec, 30.0))
 
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            verify=tool.verify_tls,
+        ) as client:
             if tool.kind == OpsToolKind.prometheus:
                 url = f"{tool.base_url}/api/v1/query"
                 params = {"query": q or "up"}

@@ -141,6 +141,7 @@ class OpsToolDefinition(BaseModel):
     kind: OpsToolKind
     base_url: str = Field(min_length=4, max_length=2000)
     headers: dict[str, str] = Field(default_factory=dict)
+    verify_tls: bool = True
     default_query: str = ""
     required_permission: str = "read"
     created_at: datetime = Field(default_factory=utcnow)
@@ -151,6 +152,7 @@ class ToolCreateRequest(BaseModel):
     kind: OpsToolKind
     base_url: str
     headers: dict[str, str] = Field(default_factory=dict)
+    verify_tls: bool = True
     default_query: str = ""
     required_permission: str = "read"
 
