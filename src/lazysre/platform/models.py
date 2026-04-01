@@ -202,6 +202,7 @@ class IncidentBriefing(BaseModel):
     tool_snapshot: list[ToolHealthItem] = Field(default_factory=list)
     recent_runs: list[dict[str, str]] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+    artifact_path: str | None = None
 
 
 class RunReport(BaseModel):

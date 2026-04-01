@@ -320,6 +320,9 @@ function formatBriefing(briefing) {
   const lines = [];
   lines.push(`[${new Date(briefing.generated_at).toLocaleString("zh-CN")}] severity=${briefing.severity}`);
   lines.push(briefing.headline || "");
+  if (briefing.artifact_path) {
+    lines.push(`artifact: ${briefing.artifact_path}`);
+  }
   lines.push("");
   lines.push("Recommendations:");
   for (const item of briefing.recommendations || []) {

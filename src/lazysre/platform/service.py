@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -48,6 +49,7 @@ from lazysre.providers.openai_provider import OpenAIProvider
 class PlatformService:
     def __init__(self, store_path: str | None = None) -> None:
         path = store_path or str(Path(settings.data_dir) / settings.platform_store_file)
+        self._artifact_dir = Path(path).resolve().parent / "artifacts"
         self._store = FilePlatformStore(path)
         self._state = self._store.load()
         self._lock = asyncio.Lock()
@@ -328,13 +330,18 @@ class PlatformService:
             for r in recent_runs
         ]
 
-        return IncidentBriefing(
+        briefing = IncidentBriefing(
             severity=severity,
             headline=headline,
             tool_snapshot=tools_health[:8],
             recent_runs=run_view,
             recommendations=recommendations,
         )
+        try:
+            briefing.artifact_path = self._write_incident_briefing_artifact(briefing, workflow_id)
+        except Exception:
+            briefing.artifact_path = None
+        return briefing
 
     async def cancel_run(self, run_id: str) -> WorkflowRun | None:
         async with self._lock:
@@ -590,7 +597,30 @@ class PlatformService:
             tool_executor=self._execute_tool,
         )
 
+        postmortem_path: str | None = None
+        postmortem_error: str | None = None
+        if run.status in (RunStatus.completed, RunStatus.failed, RunStatus.canceled):
+            try:
+                postmortem_path = self._write_run_postmortem_artifact(run, workflow)
+            except Exception as exc:
+                postmortem_error = str(exc)
+
         async with self._lock:
+            if postmortem_path:
+                run.events.append(
+                    RunEvent(
+                        kind="postmortem_generated",
+                        message="已生成复盘草稿",
+                        data={"path": postmortem_path},
+                    )
+                )
+            elif postmortem_error:
+                run.events.append(
+                    RunEvent(
+                        kind="postmortem_failed",
+                        message=f"复盘草稿生成失败: {postmortem_error}",
+                    )
+                )
             self._running.pop(run_id, None)
             if run.status != RunStatus.waiting_approval:
                 self._cancel_flags.discard(run_id)
@@ -626,6 +656,99 @@ class PlatformService:
                 latency_ms=latency_ms,
                 error=str(exc)[:320],
             )
+
+    def _ensure_artifact_dir(self, subdir: str) -> Path:
+        path = self._artifact_dir / subdir
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _write_incident_briefing_artifact(
+        self, briefing: IncidentBriefing, workflow_id: str | None
+    ) -> str:
+        scope = (workflow_id or "all")[:8]
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        out_dir = self._ensure_artifact_dir("briefings")
+        md_path = out_dir / f"briefing-{scope}-{stamp}.md"
+        json_path = out_dir / f"briefing-{scope}-{stamp}.json"
+
+        lines = [
+            "# LazySRE Incident Briefing",
+            "",
+            f"- Generated At: {briefing.generated_at.isoformat()}",
+            f"- Severity: {briefing.severity}",
+            f"- Headline: {briefing.headline}",
+            "",
+            "## Recommendations",
+        ]
+        for item in briefing.recommendations:
+            lines.append(f"- {item}")
+        lines.extend(["", "## Tool Snapshot"])
+        for item in briefing.tool_snapshot:
+            status = "ok" if item.ok else "error"
+            tail = "" if item.ok else f" error={item.error or '-'}"
+            lines.append(
+                f"- {item.name} ({item.kind.value}) status={status} latency={item.latency_ms}ms{tail}"
+            )
+        lines.extend(["", "## Recent Runs"])
+        for item in briefing.recent_runs:
+            lines.append(
+                f"- {item.get('run_id', '-')[:8]} status={item.get('status', '-')} wf={item.get('workflow_id', '-')[:8]}"
+            )
+
+        md_path.write_text("\n".join(lines), encoding="utf-8")
+        json_path.write_text(
+            json.dumps(briefing.model_dump(mode="json"), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return str(md_path)
+
+    def _write_run_postmortem_artifact(
+        self, run: WorkflowRun, workflow: WorkflowDefinition
+    ) -> str:
+        out_dir = self._ensure_artifact_dir("postmortems")
+        md_path = out_dir / f"run-{run.id}-postmortem.md"
+        md_path.write_text(self._render_run_postmortem_markdown(run, workflow), encoding="utf-8")
+        return str(md_path)
+
+    def _render_run_postmortem_markdown(self, run: WorkflowRun, workflow: WorkflowDefinition) -> str:
+        tool_failures = [e for e in run.events if e.kind == "tool_failed"]
+        lines = [
+            f"# Postmortem Draft: {run.id}",
+            "",
+            "## Context",
+            f"- Workflow: {workflow.name} ({workflow.id})",
+            f"- Objective: {workflow.objective}",
+            f"- Status: {run.status.value}",
+            f"- Created At: {run.created_at.isoformat()}",
+            f"- Started At: {run.started_at.isoformat() if run.started_at else '-'}",
+            f"- Finished At: {run.finished_at.isoformat() if run.finished_at else '-'}",
+            "",
+            "## Incident Summary",
+            run.summary or "（待补充：总结此次事件影响范围、根因、处置动作）",
+        ]
+
+        if run.error:
+            lines.extend(["", "## Error", run.error])
+
+        lines.extend(["", "## Timeline (Recent Events)"])
+        for evt in run.events[-40:]:
+            lines.append(f"- {evt.timestamp.isoformat()} [{evt.kind}] {evt.message}")
+
+        lines.extend(["", "## Node Outputs"])
+        if run.outputs:
+            for node_id, content in run.outputs.items():
+                lines.extend(["", f"### {node_id}", content[:1800]])
+        else:
+            lines.append("- 无节点输出")
+
+        lines.extend(["", "## Action Items (Draft)"])
+        if tool_failures:
+            lines.append("1. 排查 tool_failed 相关目标的网络、认证和 TLS 配置。")
+        else:
+            lines.append("1. 将当前 run 的关键证据固化到工单与知识库。")
+        lines.append("2. 补充自动化监控与告警阈值，避免同类故障再次发生。")
+        lines.append("3. 校验审批门策略，确保变更动作有清晰 owner 与回滚预案。")
+        return "\n".join(lines)
 
     async def _execute_tool(
         self,

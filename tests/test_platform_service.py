@@ -374,12 +374,21 @@ async def test_incident_briefing_and_run_report_export(tmp_path: Path) -> None:
     assert run is not None
     status = await _wait_run(service, run.id)
     assert status == RunStatus.completed
+    loaded = await service.get_run(run.id)
+    assert loaded is not None
+    pm_evt = next((e for e in loaded.events if e.kind == "postmortem_generated"), None)
+    assert pm_evt is not None
+    pm_path = pm_evt.data.get("path", "")
+    assert pm_path
+    assert Path(pm_path).exists()
 
     briefing = await service.generate_incident_briefing(workflow_id=wf.id, timeout_sec=1.5)
     assert briefing.severity in {"low", "medium", "high", "critical"}
     assert briefing.headline
     assert len(briefing.recent_runs) >= 1
     assert briefing.recommendations
+    assert briefing.artifact_path
+    assert Path(briefing.artifact_path).exists()
 
     report = await service.get_run_report(run.id)
     assert report is not None

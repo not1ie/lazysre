@@ -106,6 +106,11 @@ curl http://127.0.0.1:8000/v1/platform/templates
 curl "http://127.0.0.1:8000/v1/platform/briefing?timeout_sec=4"
 ```
 
+说明：
+
+- 调用 `briefing` 会自动将简报写入 `artifacts/briefings/*.md|*.json`
+- 每个 Run 在结束（completed/failed/canceled）后会自动写入 `artifacts/postmortems/run-<run_id>-postmortem.md`
+
 目标环境一键引导（推荐，自动创建/更新 Prom + K8s 工具并生成生产故障流程）：
 
 ```bash
