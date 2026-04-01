@@ -173,6 +173,7 @@ class EnvironmentBootstrapRequest(BaseModel):
     monitoring_port: int = 9090
     k8s_api_url: str = "https://192.168.10.1:6443"
     k8s_verify_tls: bool = False
+    k8s_bearer_token: str = ""
     create_mission_workflow: bool = True
     workflow_name: str = "Prod Autonomous Incident"
 

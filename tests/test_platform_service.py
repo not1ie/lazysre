@@ -197,6 +197,7 @@ async def test_environment_bootstrap_with_monitoring_fallback(tmp_path: Path) ->
             monitoring_port=9090,
             k8s_api_url="https://192.168.10.1:6443",
             k8s_verify_tls=False,
+            k8s_bearer_token="test-token-1",
             create_mission_workflow=True,
             workflow_name="Prod Autonomous Incident",
         )
@@ -206,10 +207,28 @@ async def test_environment_bootstrap_with_monitoring_fallback(tmp_path: Path) ->
     assert any("error:" in x for x in boot.probe_results.values())
     assert any("ok:" in x for x in boot.probe_results.values())
     assert any(t.base_url == "http://192.168.69.176:9090" for t in boot.tools)
+    k8s_tool = next((t for t in boot.tools if t.kind == "kubernetes"), None)
+    assert k8s_tool is not None
+    assert k8s_tool.headers.get("Authorization") == "Bearer test-token-1"
 
     triage = next((n for n in boot.workflow.nodes if n.id == "triage_signal"), None)
     assert triage is not None
     assert triage.tool_query == "sum(up) by (job)"
+
+    # 再次引导但不带 token，应保留已有认证头，避免误清空导致 403。
+    boot2 = await service.bootstrap_environment(
+        EnvironmentBootstrapRequest(
+            monitoring_ip="92.168.69.176",
+            monitoring_port=9090,
+            k8s_api_url="https://192.168.10.1:6443",
+            k8s_verify_tls=False,
+            k8s_bearer_token="",
+            create_mission_workflow=False,
+        )
+    )
+    k8s_tool2 = next((t for t in boot2.tools if t.kind == "kubernetes"), None)
+    assert k8s_tool2 is not None
+    assert k8s_tool2.headers.get("Authorization") == "Bearer test-token-1"
 
     run = await service.create_run(
         workflow_id=boot.workflow.id,

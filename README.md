@@ -115,6 +115,7 @@ curl -X POST http://127.0.0.1:8000/v1/platform/bootstrap/environment \
     "monitoring_port":9090,
     "k8s_api_url":"https://192.168.10.1:6443",
     "k8s_verify_tls":false,
+    "k8s_bearer_token":"<k8s-service-account-token>",
     "create_mission_workflow":true,
     "workflow_name":"Prod Autonomous Incident"
   }'
@@ -129,6 +130,7 @@ curl -X POST http://127.0.0.1:8000/v1/platform/tools \
     "name":"Prometheus Prod",
     "kind":"prometheus",
     "base_url":"http://prometheus:9090",
+    "headers":{"X-Scope-OrgID":"prod"},
     "verify_tls":true,
     "default_query":"up",
     "required_permission":"read"

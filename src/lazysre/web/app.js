@@ -23,11 +23,13 @@ const els = {
   envMonitoringPort: $("env-monitoring-port"),
   envK8sUrl: $("env-k8s-url"),
   envK8sVerifyTls: $("env-k8s-verify-tls"),
+  envK8sToken: $("env-k8s-token"),
   toolForm: $("tool-form"),
   toolName: $("tool-name"),
   toolKind: $("tool-kind"),
   toolBaseUrl: $("tool-base-url"),
   toolDefaultQuery: $("tool-default-query"),
+  toolHeadersJson: $("tool-headers-json"),
   toolVerifyTls: $("tool-verify-tls"),
   toolPermission: $("tool-permission"),
   toolList: $("tool-list"),
@@ -118,11 +120,12 @@ function renderTemplateOptions() {
 function renderTools() {
   els.toolList.innerHTML = "";
   for (const tool of state.tools) {
+    const headerCount = Object.keys(tool.headers || {}).length;
     const row = document.createElement("div");
     row.className = "row-item";
     row.innerHTML = `
       <div class="title">${escapeHtml(tool.name)}</div>
-      <div class="meta">${escapeHtml(tool.kind)} · perm=${escapeHtml(tool.required_permission)}</div>
+      <div class="meta">${escapeHtml(tool.kind)} · perm=${escapeHtml(tool.required_permission)} · headers=${headerCount}</div>
     `;
     els.toolList.appendChild(row);
   }
@@ -387,10 +390,22 @@ async function createWorkflowFromMission() {
 }
 
 async function createTool() {
+  let headers = {};
+  try {
+    headers = JSON.parse(els.toolHeadersJson.value || "{}");
+  } catch {
+    alert("Headers JSON 格式错误");
+    return;
+  }
+  if (headers && typeof headers !== "object") {
+    alert("Headers JSON 必须是对象");
+    return;
+  }
   const payload = {
     name: els.toolName.value.trim(),
     kind: els.toolKind.value,
     base_url: els.toolBaseUrl.value.trim(),
+    headers,
     default_query: els.toolDefaultQuery.value.trim(),
     verify_tls: els.toolVerifyTls.value === "true",
     required_permission: els.toolPermission.value,
@@ -412,6 +427,7 @@ async function bootstrapEnvironment() {
   const monitoringPort = Number.parseInt(els.envMonitoringPort.value.trim(), 10);
   const k8sApiUrl = els.envK8sUrl.value.trim();
   const k8sVerifyTls = els.envK8sVerifyTls.value === "true";
+  const k8sToken = els.envK8sToken.value.trim();
   if (!monitoringIp || !k8sApiUrl || Number.isNaN(monitoringPort)) {
     alert("请完整填写监控与 K8s 环境参数");
     return;
@@ -424,6 +440,7 @@ async function bootstrapEnvironment() {
       monitoring_port: monitoringPort,
       k8s_api_url: k8sApiUrl,
       k8s_verify_tls: k8sVerifyTls,
+      k8s_bearer_token: k8sToken,
       create_mission_workflow: true,
       workflow_name: "Prod Autonomous Incident",
     }),

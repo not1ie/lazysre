@@ -350,6 +350,10 @@ button.danger {
   min-height: 72px;
 }
 
+#tool-headers-json {
+  min-height: 72px;
+}
+
 .approval-form {
   margin-top: 10px;
   border: 1px dashed rgba(251, 124, 43, 0.45);

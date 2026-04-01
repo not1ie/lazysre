@@ -118,7 +118,8 @@ class PlatformService:
                     base_url=base_url,
                     default_query="up",
                     required_permission="read",
-                )
+                ),
+                preserve_headers_if_empty=True,
             )
             created_tools.append(tool)
             try:
@@ -131,15 +132,21 @@ class PlatformService:
             except Exception as exc:
                 probe_results[tool.id] = f"error: {exc}"
 
+        k8s_headers: dict[str, str] = {}
+        if req.k8s_bearer_token.strip():
+            k8s_headers["Authorization"] = f"Bearer {req.k8s_bearer_token.strip()}"
+
         k8s_tool = await self._upsert_tool(
             ToolCreateRequest(
                 name="K8s API Primary",
                 kind=OpsToolKind.kubernetes,
                 base_url=req.k8s_api_url.rstrip("/"),
+                headers=k8s_headers,
                 verify_tls=req.k8s_verify_tls,
                 default_query="/version",
                 required_permission="read",
-            )
+            ),
+            preserve_headers_if_empty=True,
         )
         created_tools.append(k8s_tool)
         try:
@@ -512,14 +519,22 @@ class PlatformService:
                 body = " ".join(resp.text.split())
             return body[:1500]
 
-    async def _upsert_tool(self, req: ToolCreateRequest) -> OpsToolDefinition:
+    async def _upsert_tool(
+        self, req: ToolCreateRequest, preserve_headers_if_empty: bool = False
+    ) -> OpsToolDefinition:
         normalized_url = req.base_url.rstrip("/")
         req_perm = _normalize_permission(req.required_permission)
+        sanitized_headers = {
+            str(k).strip(): str(v).strip()
+            for k, v in (req.headers or {}).items()
+            if str(k).strip()
+        }
         async with self._lock:
             for tool in self._state.tools.values():
                 if tool.kind == req.kind and tool.base_url.rstrip("/") == normalized_url:
                     tool.name = req.name
-                    tool.headers = req.headers
+                    if sanitized_headers or not preserve_headers_if_empty:
+                        tool.headers = sanitized_headers
                     tool.verify_tls = req.verify_tls
                     tool.default_query = req.default_query
                     tool.required_permission = req_perm
@@ -530,7 +545,7 @@ class PlatformService:
                 name=req.name,
                 kind=req.kind,
                 base_url=normalized_url,
-                headers=req.headers,
+                headers=sanitized_headers,
                 verify_tls=req.verify_tls,
                 default_query=req.default_query,
                 required_permission=req_perm,

@@ -92,6 +92,10 @@
                 <option value="true">verify on</option>
               </select>
             </label>
+            <label>
+              K8s Bearer Token (可选)
+              <input id="env-k8s-token" type="password" placeholder="eyJhbGciOi..." />
+            </label>
             <button type="submit">一键引导环境</button>
           </form>
           <hr />
@@ -117,6 +121,10 @@
             <label>
               默认查询
               <input id="tool-default-query" value="up" />
+            </label>
+            <label>
+              Headers JSON (可选)
+              <textarea id="tool-headers-json">{}</textarea>
             </label>
             <label>
               TLS 校验
