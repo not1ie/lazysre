@@ -2,11 +2,7 @@ version: "3.9"
 
 services:
   lazysre:
-    image: python:3.13-slim
-    command: >
-      sh -c "pip install --no-cache-dir fastapi httpx pydantic pydantic-settings uvicorn &&
-      pip install --no-cache-dir --no-deps https://codeload.github.com/not1ie/lazysre/tar.gz/refs/heads/main &&
-      uvicorn lazysre.main:app --host 0.0.0.0 --port 8000"
+    image: ${LAZYSRE_IMAGE:-lazysre:latest}
     environment:
       LAZYSRE_MODEL_MODE: heuristic
       LAZYSRE_DATA_DIR: /data

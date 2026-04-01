@@ -226,11 +226,18 @@ Swarm Stack 文件：
 
 - `deploy/swarm/lazysre-stack.yml`
 
-远程部署脚本：
+远程部署脚本（预构建镜像，推荐）：
 
 ```bash
 ./scripts/deploy_remote_swarm.sh root@<swarm-manager-ip>
 ```
+
+说明：
+
+1. 脚本会先把当前仓库源码打包上传到远端临时目录
+2. 在远端执行 `docker build` 生成镜像（默认 tag 为时间戳）
+3. 用该镜像执行 `docker stack deploy`
+4. 容器启动阶段不再执行在线 `pip install`
 
 默认发布端口：
 
