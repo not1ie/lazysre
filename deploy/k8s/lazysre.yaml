@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lazysre
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lazysre
+  namespace: lazysre
+  labels:
+    app: lazysre
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lazysre
+  template:
+    metadata:
+      labels:
+        app: lazysre
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: k8s-master-1
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: lazysre
+          image: python:3.13-slim
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: LAZYSRE_MODEL_MODE
+              value: "heuristic"
+            - name: LAZYSRE_DATA_DIR
+              value: "/data"
+            - name: LAZYSRE_TASK_STORE_FILE
+              value: "tasks.json"
+            - name: LAZYSRE_PLATFORM_STORE_FILE
+              value: "platform.json"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir "git+https://github.com/not1ie/lazysre.git@main"
+              uvicorn lazysre.main:app --host 0.0.0.0 --port 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 40
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lazysre
+  namespace: lazysre
+spec:
+  type: ClusterIP
+  selector:
+    app: lazysre
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8000

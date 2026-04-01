@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  lazysre:
+    image: python:3.13-slim
+    command: >
+      sh -c "pip install --no-cache-dir fastapi httpx pydantic pydantic-settings uvicorn &&
+      pip install --no-cache-dir --no-deps https://codeload.github.com/not1ie/lazysre/tar.gz/refs/heads/main &&
+      uvicorn lazysre.main:app --host 0.0.0.0 --port 8000"
+    environment:
+      LAZYSRE_MODEL_MODE: heuristic
+      LAZYSRE_DATA_DIR: /data
+      LAZYSRE_TASK_STORE_FILE: tasks.json
+      LAZYSRE_PLATFORM_STORE_FILE: platform.json
+    ports:
+      - "32080:8000"
+    volumes:
+      - lazysre_data:/data
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      update_config:
+        parallelism: 1
+        order: start-first
+
+volumes:
+  lazysre_data:

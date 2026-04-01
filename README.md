@@ -129,6 +129,44 @@ curl http://127.0.0.1:8000/v1/platform/runs/<run_id>/events
 curl -N http://127.0.0.1:8000/v1/platform/runs/<run_id>/stream
 ```
 
+## 部署到 Kubernetes
+
+示例清单：
+
+- `deploy/k8s/lazysre.yaml`
+
+一键远程部署脚本（需要目标机已配置 `kubectl`）：
+
+```bash
+./scripts/deploy_remote_k8s.sh root@<master-ip>
+```
+
+默认会创建：
+
+1. Namespace: `lazysre`
+2. Deployment: `lazysre`（1 副本）
+3. Service: NodePort `32080`
+
+部署后访问：
+
+- `http://<任意集群节点IP>:32080/`
+
+## 部署到 Docker Swarm
+
+Swarm Stack 文件：
+
+- `deploy/swarm/lazysre-stack.yml`
+
+远程部署脚本：
+
+```bash
+./scripts/deploy_remote_swarm.sh root@<swarm-manager-ip>
+```
+
+默认发布端口：
+
+- `32080`
+
 ## 下一步建议
 
 1. 接入真实 SRE 工具（K8s、Prometheus、日志系统）
