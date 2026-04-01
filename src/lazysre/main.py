@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
@@ -27,7 +28,6 @@ from lazysre.platform.models import (
     WorkflowCreateRequest,
     WorkflowDefinition,
     WorkflowRun,
-    RunReport,
 )
 from lazysre.platform.service import PlatformService
 from lazysre.services.task_service import TaskService
@@ -212,8 +212,8 @@ async def get_run(run_id: str) -> WorkflowRun:
     return run
 
 
-@app.get("/v1/platform/runs/{run_id}/report")
-async def get_run_report(run_id: str, format: str = "markdown") -> RunReport | PlainTextResponse:
+@app.get("/v1/platform/runs/{run_id}/report", response_model=None)
+async def get_run_report(run_id: str, format: str = "markdown") -> Any:
     fmt = format.strip().lower()
     if fmt not in {"markdown", "json"}:
         raise HTTPException(status_code=400, detail="format must be markdown or json")
