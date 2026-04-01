@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 
-from lazysre.platform.models import QuickstartRequest, RunCreateRequest, RunStatus
+from lazysre.platform.models import AutoDesignRequest, QuickstartRequest, RunCreateRequest, RunStatus
 from lazysre.platform.service import PlatformService
 
 
@@ -49,3 +49,35 @@ async def test_run_executes_workflow(tmp_path: Path) -> None:
     assert loaded.summary
     assert any(evt.kind == "run_completed" for evt in loaded.events)
 
+
+async def test_template_catalog_and_autodesign(tmp_path: Path) -> None:
+    service = PlatformService(store_path=str(tmp_path / "platform.json"))
+    templates = await service.list_templates()
+    assert any(t.slug == "incident-response" for t in templates)
+
+    wf = await service.auto_design(
+        AutoDesignRequest(
+            objective="评估发布风险并给出上线策略",
+            template_slug="release-guardian",
+            name="Release Mission",
+        )
+    )
+    assert wf.name == "Release Mission"
+    assert len(wf.nodes) >= 3
+    assert wf.start_node in {n.id for n in wf.nodes}
+
+
+async def test_platform_overview_metrics(tmp_path: Path) -> None:
+    service = PlatformService(store_path=str(tmp_path / "platform.json"))
+    wf = await service.quickstart(
+        QuickstartRequest(name="Overview Flow", objective="检查可用性抖动")
+    )
+    run = await service.create_run(workflow_id=wf.id, req=RunCreateRequest(input={}))
+    assert run is not None
+    status = await _wait_run(service, run.id)
+    assert status in (RunStatus.completed, RunStatus.failed, RunStatus.canceled)
+
+    overview = await service.get_overview()
+    assert overview.total_workflows >= 1
+    assert overview.total_runs >= 1
+    assert 0.0 <= overview.success_rate <= 1.0

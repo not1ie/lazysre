@@ -10,6 +10,9 @@ from lazysre.models import MemorySearchResponse, TaskCreateRequest, TaskRecord
 from lazysre.platform.models import (
     AgentCreateRequest,
     AgentDefinition,
+    AutoDesignRequest,
+    PlatformOverview,
+    PlatformTemplate,
     QuickstartRequest,
     RunCreateRequest,
     WorkflowCreateRequest,
@@ -93,6 +96,16 @@ async def list_agents() -> list[AgentDefinition]:
     return await platform_service.list_agents()
 
 
+@app.get("/v1/platform/templates", response_model=list[PlatformTemplate])
+async def list_templates() -> list[PlatformTemplate]:
+    return await platform_service.list_templates()
+
+
+@app.get("/v1/platform/overview", response_model=PlatformOverview)
+async def platform_overview() -> PlatformOverview:
+    return await platform_service.get_overview()
+
+
 @app.post("/v1/platform/workflows", response_model=WorkflowDefinition)
 async def create_workflow(req: WorkflowCreateRequest) -> WorkflowDefinition:
     try:
@@ -109,6 +122,14 @@ async def list_workflows() -> list[WorkflowDefinition]:
 @app.post("/v1/platform/quickstart", response_model=WorkflowDefinition)
 async def quickstart(req: QuickstartRequest) -> WorkflowDefinition:
     return await platform_service.quickstart(req)
+
+
+@app.post("/v1/platform/autodesign", response_model=WorkflowDefinition)
+async def auto_design(req: AutoDesignRequest) -> WorkflowDefinition:
+    try:
+        return await platform_service.auto_design(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/v1/platform/workflows/{workflow_id}/runs", response_model=WorkflowRun)

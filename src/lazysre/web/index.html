@@ -3,95 +3,106 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>LazySRE Console</title>
+    <title>LazySRE Ops Brain</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=Space+Mono:wght@400;700&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/web/styles.css" />
   </head>
   <body>
-    <div class="bg-orb orb-a"></div>
-    <div class="bg-orb orb-b"></div>
-    <main class="shell">
-      <header class="hero card">
-        <p class="eyebrow">LAZYSRE PLATFORM</p>
-        <h1>纯 AI 智能体编排控制台</h1>
-        <p class="subtitle">
-          在一个界面完成 Quickstart、Workflow Run、实时事件流观测。
-        </p>
-        <div class="hero-stats">
-          <div><span id="agents-count">0</span><label>Agents</label></div>
-          <div><span id="workflows-count">0</span><label>Workflows</label></div>
-          <div><span id="runs-count">0</span><label>Runs</label></div>
+    <div class="noise"></div>
+    <main class="app">
+      <header class="topbar">
+        <div class="brand">
+          <p class="label">LAZYSRE</p>
+          <h1>Ops Brain Control Deck</h1>
+          <p class="tagline">纯 AI 驱动运维平台: 目标输入 -> 自动编排 -> 实时执行观测</p>
+        </div>
+        <div class="kpis">
+          <article>
+            <span id="agents-count">0</span>
+            <label>Agents</label>
+          </article>
+          <article>
+            <span id="workflows-count">0</span>
+            <label>Workflows</label>
+          </article>
+          <article>
+            <span id="runs-count">0</span>
+            <label>Runs</label>
+          </article>
+          <article>
+            <span id="success-rate">0%</span>
+            <label>Success Rate</label>
+          </article>
         </div>
       </header>
 
-      <section class="layout">
-        <aside class="left-col">
-          <section class="card">
-            <h2>Quickstart</h2>
-            <form id="quickstart-form" class="stack">
-              <label>
-                Flow 名称
-                <input id="flow-name" value="Prod Incident Flow" required />
-              </label>
-              <label>
-                目标 Objective
-                <textarea
-                  id="flow-objective"
-                  required
-                >定位并修复 gateway 5xx 异常，输出回滚与验证步骤</textarea>
-              </label>
-              <button type="submit">创建默认多智能体流程</button>
-            </form>
-          </section>
-
-          <section class="card">
-            <div class="row-head">
-              <h2>Workflows</h2>
-              <button id="refresh-workflows" class="ghost">刷新</button>
-            </div>
-            <div id="workflow-list" class="list"></div>
-          </section>
+      <section class="grid">
+        <aside class="mission card">
+          <div class="card-head">
+            <h2>Mission Studio</h2>
+            <button id="refresh-all" class="ghost">刷新</button>
+          </div>
+          <form id="mission-form" class="stack">
+            <label>
+              平台目标
+              <textarea id="mission-objective">定位并缓解 gateway 5xx 抖动，输出修复和回滚步骤</textarea>
+            </label>
+            <label>
+              生成模式
+              <select id="mission-mode">
+                <option value="autodesign">AI Auto-Design (推荐)</option>
+                <option value="quickstart">Quickstart</option>
+                <option value="template">Template Blueprint</option>
+              </select>
+            </label>
+            <label>
+              模板
+              <select id="template-select"></select>
+            </label>
+            <label>
+              Workflow 名称
+              <input id="workflow-name" value="Prod Mission Flow" />
+            </label>
+            <button type="submit">生成 Workflow</button>
+          </form>
+          <p id="active-summary" class="status-line">就绪，等待新任务。</p>
         </aside>
 
-        <section class="right-col">
-          <section class="card">
-            <h2>Run Launcher</h2>
-            <form id="run-form" class="stack">
-              <label>
-                Input JSON
-                <textarea id="run-input">{"service":"gateway","cluster":"prod-sh"}</textarea>
-              </label>
-              <div class="actions">
-                <button type="submit">启动 Run</button>
-                <button type="button" id="cancel-run-btn" class="danger">取消当前 Run</button>
-              </div>
-            </form>
-            <p id="active-summary" class="meta">尚未选择 Workflow。</p>
-          </section>
-
-          <section class="card">
-            <div class="row-head">
-              <h2>Runs</h2>
-              <button id="refresh-runs" class="ghost">刷新</button>
+        <section class="canvas card">
+          <div class="card-head">
+            <h2>Workflow Canvas</h2>
+            <div class="inline-actions">
+              <button id="refresh-workflows" class="ghost">刷新 Workflows</button>
             </div>
-            <div id="run-list" class="list"></div>
-          </section>
-
-          <section class="card">
-            <h2>Live Event Stream</h2>
-            <pre id="event-log" class="log"></pre>
-          </section>
-
-          <section class="card">
-            <h2>Node Outputs</h2>
-            <div id="outputs-grid" class="outputs"></div>
-          </section>
+          </div>
+          <div id="workflow-list" class="workflow-list"></div>
+          <div id="workflow-canvas" class="flow-canvas"></div>
         </section>
+
+        <aside class="telemetry card">
+          <div class="card-head">
+            <h2>Run Telemetry</h2>
+            <button id="refresh-runs" class="ghost">刷新 Runs</button>
+          </div>
+          <form id="run-form" class="stack run-form">
+            <label>
+              Run Input JSON
+              <textarea id="run-input">{"service":"gateway","cluster":"prod-sh","severity":"high"}</textarea>
+            </label>
+            <div class="inline-actions">
+              <button type="submit">启动 Run</button>
+              <button type="button" id="cancel-run-btn" class="danger">取消 Run</button>
+            </div>
+          </form>
+          <div id="run-list" class="run-list"></div>
+          <pre id="event-log" class="event-log"></pre>
+          <div id="outputs-grid" class="outputs-grid"></div>
+        </aside>
       </section>
     </main>
     <script type="module" src="/web/app.js"></script>

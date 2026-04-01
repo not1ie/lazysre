@@ -93,3 +93,27 @@ class QuickstartRequest(BaseModel):
     name: str = "Default SRE Flow"
     objective: str = Field(min_length=3, max_length=2000)
 
+
+class PlatformTemplate(BaseModel):
+    slug: str
+    name: str
+    description: str
+    recommended_objective: str
+    stages: list[str] = Field(default_factory=list)
+
+
+class AutoDesignRequest(BaseModel):
+    objective: str = Field(min_length=3, max_length=2000)
+    name: str | None = None
+    template_slug: str | None = None
+
+
+class PlatformOverview(BaseModel):
+    total_agents: int
+    total_workflows: int
+    total_runs: int
+    active_runs: int
+    completed_runs: int
+    failed_runs: int
+    canceled_runs: int
+    success_rate: float

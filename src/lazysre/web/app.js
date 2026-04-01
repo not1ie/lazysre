@@ -1,4 +1,5 @@
 const state = {
+  templates: [],
   agents: [],
   workflows: [],
   runs: [],
@@ -11,22 +12,27 @@ const state = {
 const $ = (id) => document.getElementById(id);
 
 const els = {
-  formQuickstart: $("quickstart-form"),
-  flowName: $("flow-name"),
-  flowObjective: $("flow-objective"),
-  workflowList: $("workflow-list"),
+  missionForm: $("mission-form"),
+  missionObjective: $("mission-objective"),
+  missionMode: $("mission-mode"),
+  templateSelect: $("template-select"),
+  workflowName: $("workflow-name"),
+  refreshAll: $("refresh-all"),
   refreshWorkflows: $("refresh-workflows"),
+  refreshRuns: $("refresh-runs"),
+  workflowList: $("workflow-list"),
+  workflowCanvas: $("workflow-canvas"),
   runForm: $("run-form"),
   runInput: $("run-input"),
-  runList: $("run-list"),
-  refreshRuns: $("refresh-runs"),
   cancelRunBtn: $("cancel-run-btn"),
-  activeSummary: $("active-summary"),
+  runList: $("run-list"),
   eventLog: $("event-log"),
   outputsGrid: $("outputs-grid"),
+  activeSummary: $("active-summary"),
   agentsCount: $("agents-count"),
   workflowsCount: $("workflows-count"),
   runsCount: $("runs-count"),
+  successRate: $("success-rate"),
 };
 
 async function api(path, options = {}) {
@@ -35,92 +41,133 @@ async function api(path, options = {}) {
     ...options,
   });
   if (!resp.ok) {
-    let detail = `${resp.status}`;
+    let msg = String(resp.status);
     try {
       const body = await resp.json();
-      detail = body.detail || JSON.stringify(body);
+      msg = body.detail || JSON.stringify(body);
     } catch {
-      detail = await resp.text();
+      msg = await resp.text();
     }
-    throw new Error(detail);
+    throw new Error(msg);
   }
-  const ctype = resp.headers.get("content-type") || "";
-  if (ctype.includes("application/json")) {
+  const ct = resp.headers.get("content-type") || "";
+  if (ct.includes("application/json")) {
     return await resp.json();
   }
   return await resp.text();
 }
 
-function stamp() {
+function ts() {
   return new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }
 
-function logLine(line) {
-  els.eventLog.textContent += `${line}\n`;
+function log(msg) {
+  els.eventLog.textContent += `${msg}\n`;
   els.eventLog.scrollTop = els.eventLog.scrollHeight;
+}
+
+function escapeHtml(v) {
+  return String(v)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function statusText(status) {
+  if (status === "completed") return "color:#1b8877";
+  if (status === "failed") return "color:#bd3b2f";
+  if (status === "canceled") return "color:#a55e16";
+  if (status === "running") return "color:#237593";
+  return "color:#60737a";
 }
 
 function setSummary(text) {
   els.activeSummary.textContent = text;
 }
 
-function renderCounters() {
-  els.agentsCount.textContent = String(state.agents.length);
-  els.workflowsCount.textContent = String(state.workflows.length);
-  els.runsCount.textContent = String(state.runs.length);
+function renderCounters(overview) {
+  els.agentsCount.textContent = String(overview.total_agents);
+  els.workflowsCount.textContent = String(overview.total_workflows);
+  els.runsCount.textContent = String(overview.total_runs);
+  els.successRate.textContent = `${Math.round((overview.success_rate || 0) * 100)}%`;
+}
+
+function renderTemplateOptions() {
+  const mode = els.missionMode.value;
+  els.templateSelect.innerHTML = "";
+  for (const tpl of state.templates) {
+    const opt = document.createElement("option");
+    opt.value = tpl.slug;
+    opt.textContent = `${tpl.name} · ${tpl.description}`;
+    els.templateSelect.appendChild(opt);
+  }
+  els.templateSelect.disabled = mode !== "template";
 }
 
 function renderWorkflows() {
   els.workflowList.innerHTML = "";
   for (const wf of state.workflows) {
-    const item = document.createElement("div");
-    item.className = `item ${wf.id === state.selectedWorkflowId ? "active" : ""}`;
-    item.innerHTML = `
+    const row = document.createElement("div");
+    row.className = `row-item ${wf.id === state.selectedWorkflowId ? "active" : ""}`;
+    row.innerHTML = `
       <div class="title">${escapeHtml(wf.name)}</div>
       <div class="meta">${escapeHtml(wf.id.slice(0, 8))} · ${wf.nodes.length} nodes</div>
     `;
-    item.onclick = async () => {
-      closeStream();
-      stopRunPoller();
+    row.onclick = async () => {
       state.selectedWorkflowId = wf.id;
       state.selectedRunId = null;
-      setSummary(`已选择 Workflow: ${wf.name}`);
-      await refreshRuns();
+      closeStream();
+      stopRunPoller();
       renderWorkflows();
+      renderCanvas(wf);
+      await refreshRuns();
+      setSummary(`已选择 workflow: ${wf.name}`);
     };
-    els.workflowList.appendChild(item);
+    els.workflowList.appendChild(row);
   }
   if (!state.workflows.length) {
-    els.workflowList.innerHTML = `<div class="meta">暂无 workflow，可先运行 Quickstart。</div>`;
+    els.workflowList.innerHTML = `<div class="row-item"><div class="meta">暂无 workflow，请先创建。</div></div>`;
   }
 }
 
-function statusColor(status) {
-  if (status === "completed") return "color:#0f8a74";
-  if (status === "failed") return "color:#be3a2e";
-  if (status === "canceled") return "color:#9f5f10";
-  return "color:#5f6f6c";
+function renderCanvas(workflow) {
+  if (!workflow) {
+    els.workflowCanvas.innerHTML = `<div class="meta">等待工作流...</div>`;
+    return;
+  }
+  els.workflowCanvas.innerHTML = "";
+  for (const node of workflow.nodes) {
+    const div = document.createElement("article");
+    div.className = "node-card";
+    div.innerHTML = `
+      <h3>${escapeHtml(node.id)}</h3>
+      <p>${escapeHtml(node.instruction)}</p>
+      <div class="pipe">next: ${escapeHtml((node.next_nodes || []).join(", ") || "end")}</div>
+    `;
+    els.workflowCanvas.appendChild(div);
+  }
 }
 
 function renderRuns() {
   els.runList.innerHTML = "";
   for (const run of state.runs) {
-    const item = document.createElement("div");
-    item.className = `item ${run.id === state.selectedRunId ? "active" : ""}`;
-    item.innerHTML = `
+    const row = document.createElement("div");
+    row.className = `row-item ${run.id === state.selectedRunId ? "active" : ""}`;
+    row.innerHTML = `
       <div class="title">${escapeHtml(run.id.slice(0, 8))}</div>
-      <div class="meta" style="${statusColor(run.status)}">${escapeHtml(run.status)}</div>
+      <div class="meta" style="${statusText(run.status)}">${escapeHtml(run.status)}</div>
     `;
-    item.onclick = async () => {
+    row.onclick = async () => {
       state.selectedRunId = run.id;
+      renderRuns();
       await loadRunDetail(run.id);
       openStream(run.id);
-      renderRuns();
     };
-    els.runList.appendChild(item);
+    els.runList.appendChild(row);
   }
   if (!state.runs.length) {
-    els.runList.innerHTML = `<div class="meta">当前 workflow 还没有 run。</div>`;
+    els.runList.innerHTML = `<div class="row-item"><div class="meta">暂无 run</div></div>`;
   }
 }
 
@@ -128,18 +175,28 @@ function renderOutputs(outputs) {
   els.outputsGrid.innerHTML = "";
   const entries = Object.entries(outputs || {});
   if (!entries.length) {
-    els.outputsGrid.innerHTML = `<div class="meta">暂无节点输出。</div>`;
+    els.outputsGrid.innerHTML = `<div class="row-item"><div class="meta">暂无节点输出</div></div>`;
     return;
   }
-  for (const [nodeId, text] of entries) {
-    const div = document.createElement("div");
-    div.className = "output-card";
-    div.innerHTML = `
-      <h3>${escapeHtml(nodeId)}</h3>
-      <p>${escapeHtml(String(text).slice(0, 480))}</p>
+  for (const [node, out] of entries) {
+    const card = document.createElement("article");
+    card.className = "output-card";
+    card.innerHTML = `
+      <h4>${escapeHtml(node)}</h4>
+      <p>${escapeHtml(String(out).slice(0, 360))}</p>
     `;
-    els.outputsGrid.appendChild(div);
+    els.outputsGrid.appendChild(card);
   }
+}
+
+async function loadOverview() {
+  const overview = await api("/v1/platform/overview");
+  renderCounters(overview);
+}
+
+async function loadTemplates() {
+  state.templates = await api("/v1/platform/templates");
+  renderTemplateOptions();
 }
 
 async function loadAgents() {
@@ -161,22 +218,16 @@ async function refreshRuns() {
   if (!state.runs.find((x) => x.id === state.selectedRunId)) {
     state.selectedRunId = state.runs[0]?.id || null;
   }
-  if (!state.selectedRunId) {
-    closeStream();
-    stopRunPoller();
-    renderOutputs({});
-  }
   renderRuns();
-  renderCounters();
 }
 
 async function loadRunDetail(runId) {
   const run = await api(`/v1/platform/runs/${runId}`);
   renderOutputs(run.outputs || {});
   setSummary(
-    `Run ${run.id.slice(0, 8)} · ${run.status} · workflow=${run.workflow_id.slice(0, 8)}`
+    `run=${run.id.slice(0, 8)} status=${run.status} workflow=${run.workflow_id.slice(0, 8)}`
   );
-  if (run.status === "completed" || run.status === "failed" || run.status === "canceled") {
+  if (["completed", "failed", "canceled"].includes(run.status)) {
     stopRunPoller();
   } else {
     startRunPoller();
@@ -193,26 +244,27 @@ function closeStream() {
 function openStream(runId) {
   closeStream();
   els.eventLog.textContent = "";
-  logLine(`[${stamp()}] streaming run ${runId.slice(0, 8)}...`);
+  log(`[${ts()}] subscribe run=${runId.slice(0, 8)}`);
   const es = new EventSource(`/v1/platform/runs/${runId}/stream`);
   state.eventSource = es;
 
   es.onmessage = (evt) => {
     try {
       const data = JSON.parse(evt.data);
-      const t = data.timestamp ? new Date(data.timestamp).toLocaleTimeString("zh-CN") : stamp();
-      logLine(`[${t}] ${data.kind}: ${data.message}`);
+      const t = data.timestamp ? new Date(data.timestamp).toLocaleTimeString("zh-CN") : ts();
+      log(`[${t}] ${data.kind}: ${data.message}`);
     } catch {
-      logLine(`[${stamp()}] ${evt.data}`);
+      log(`[${ts()}] ${evt.data}`);
     }
   };
   es.addEventListener("end", () => {
-    logLine(`[${stamp()}] stream ended`);
+    log(`[${ts()}] stream closed`);
     closeStream();
     refreshRuns();
+    loadOverview();
   });
   es.onerror = () => {
-    logLine(`[${stamp()}] stream disconnected`);
+    log(`[${ts()}] stream disconnected`);
     closeStream();
   };
 }
@@ -220,10 +272,12 @@ function openStream(runId) {
 function startRunPoller() {
   if (state.runPoller) return;
   state.runPoller = window.setInterval(async () => {
-    if (!state.selectedRunId) return;
     try {
-      await loadRunDetail(state.selectedRunId);
+      if (state.selectedRunId) {
+        await loadRunDetail(state.selectedRunId);
+      }
       await refreshRuns();
+      await loadOverview();
     } catch (err) {
       console.error(err);
     }
@@ -236,59 +290,84 @@ function stopRunPoller() {
   state.runPoller = null;
 }
 
-function escapeHtml(v) {
-  return String(v)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
+async function createWorkflowFromMission() {
+  const objective = els.missionObjective.value.trim();
+  const name = els.workflowName.value.trim();
+  const mode = els.missionMode.value;
+  if (!objective) {
+    alert("请输入目标");
+    return;
+  }
 
-async function refreshAll() {
+  let workflow;
+  if (mode === "quickstart") {
+    workflow = await api("/v1/platform/quickstart", {
+      method: "POST",
+      body: JSON.stringify({ objective, name: name || "Quickstart Mission" }),
+    });
+  } else if (mode === "template") {
+    workflow = await api("/v1/platform/autodesign", {
+      method: "POST",
+      body: JSON.stringify({
+        objective,
+        name: name || undefined,
+        template_slug: els.templateSelect.value || undefined,
+      }),
+    });
+  } else {
+    workflow = await api("/v1/platform/autodesign", {
+      method: "POST",
+      body: JSON.stringify({ objective, name: name || undefined }),
+    });
+  }
+
+  state.selectedWorkflowId = workflow.id;
   await loadAgents();
   await loadWorkflows();
   renderWorkflows();
+  renderCanvas(workflow);
   await refreshRuns();
-  renderCounters();
-  if (state.selectedRunId) {
-    await loadRunDetail(state.selectedRunId);
-  }
+  await loadOverview();
+  setSummary(`workflow created: ${workflow.name}`);
 }
 
-els.formQuickstart.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const payload = {
-    name: els.flowName.value.trim(),
-    objective: els.flowObjective.value.trim(),
-  };
-  try {
-    const wf = await api("/v1/platform/quickstart", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    await loadAgents();
-    await loadWorkflows();
+async function refreshAll() {
+  await Promise.all([loadOverview(), loadTemplates(), loadAgents(), loadWorkflows()]);
+  renderWorkflows();
+  const wf = state.workflows.find((x) => x.id === state.selectedWorkflowId) || state.workflows[0];
+  if (wf) {
     state.selectedWorkflowId = wf.id;
-    renderWorkflows();
-    await refreshRuns();
-    renderCounters();
-    setSummary(`Quickstart 成功，workflow=${wf.id.slice(0, 8)}`);
+    renderCanvas(wf);
+  } else {
+    renderCanvas(null);
+  }
+  await refreshRuns();
+}
+
+els.missionMode.addEventListener("change", () => {
+  renderTemplateOptions();
+});
+
+els.missionForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await createWorkflowFromMission();
   } catch (err) {
-    alert(`Quickstart 失败: ${err.message}`);
+    alert(`创建 workflow 失败: ${err.message}`);
   }
 });
 
 els.runForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   if (!state.selectedWorkflowId) {
-    alert("请先选择一个 workflow");
+    alert("请先创建或选择 workflow");
     return;
   }
   let input = {};
   try {
     input = JSON.parse(els.runInput.value || "{}");
   } catch {
-    alert("Input JSON 格式不正确");
+    alert("Run Input JSON 格式错误");
     return;
   }
   try {
@@ -298,37 +377,46 @@ els.runForm.addEventListener("submit", async (e) => {
     });
     state.selectedRunId = run.id;
     await refreshRuns();
+    await loadOverview();
     await loadRunDetail(run.id);
     openStream(run.id);
   } catch (err) {
-    alert(`启动 run 失败: ${err.message}`);
+    alert(`启动失败: ${err.message}`);
   }
 });
 
 els.cancelRunBtn.addEventListener("click", async () => {
   if (!state.selectedRunId) {
-    alert("没有可取消的 run");
+    alert("当前没有选中的 run");
     return;
   }
   try {
     await api(`/v1/platform/runs/${state.selectedRunId}/cancel`, { method: "POST" });
-    logLine(`[${stamp()}] cancel requested`);
+    log(`[${ts()}] cancel requested`);
     await refreshRuns();
+    await loadOverview();
   } catch (err) {
     alert(`取消失败: ${err.message}`);
   }
 });
 
+els.refreshAll.addEventListener("click", async () => {
+  await refreshAll();
+  setSummary("数据已刷新");
+});
+
 els.refreshWorkflows.addEventListener("click", async () => {
-  await loadAgents();
   await loadWorkflows();
   renderWorkflows();
-  renderCounters();
+  const wf = state.workflows.find((x) => x.id === state.selectedWorkflowId) || state.workflows[0];
+  renderCanvas(wf || null);
 });
 
 els.refreshRuns.addEventListener("click", async () => {
   await refreshRuns();
-  if (state.selectedRunId) await loadRunDetail(state.selectedRunId);
+  if (state.selectedRunId) {
+    await loadRunDetail(state.selectedRunId);
+  }
 });
 
 window.addEventListener("beforeunload", () => {
@@ -340,3 +428,4 @@ refreshAll().catch((err) => {
   console.error(err);
   setSummary(`初始化失败: ${err.message}`);
 });
+

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
+from time import perf_counter
 
 from lazysre.platform.models import AgentDefinition, RunEvent, RunStatus, WorkflowDefinition, WorkflowRun
 from lazysre.providers.base import LLMProvider
@@ -56,17 +57,24 @@ class WorkflowEngine:
                 )
 
                 prompt = self._build_prompt(workflow, run, node.instruction, node_id)
+                started = perf_counter()
                 output = await self._provider.complete(
                     system_prompt=agent.system_prompt,
                     user_prompt=prompt,
                     model=agent.model,
                 )
+                elapsed_ms = int((perf_counter() - started) * 1000)
                 run.outputs[node.id] = output
                 run.events.append(
                     RunEvent(
                         kind="node_finished",
                         message=f"节点执行完成: {node.id}",
-                        data={"node_id": node.id},
+                        data={
+                            "node_id": node.id,
+                            "agent_id": agent.id,
+                            "duration_ms": elapsed_ms,
+                            "output_preview": output[:180],
+                        },
                     )
                 )
                 for nxt in node.next_nodes:
@@ -106,4 +114,3 @@ class WorkflowEngine:
             if node.id in run.outputs:
                 lines.append(f"- {node.id}: {run.outputs[node.id][:280]}")
         return "\n".join(lines)
-
