@@ -5,6 +5,8 @@ const state = {
   agents: [],
   workflows: [],
   runs: [],
+  artifacts: [],
+  selectedArtifact: null,
   selectedWorkflowId: null,
   selectedRunId: null,
   eventSource: null,
@@ -52,6 +54,11 @@ const els = {
   rejectBtn: $("reject-btn"),
   generateBriefingBtn: $("generate-briefing-btn"),
   exportReportBtn: $("export-report-btn"),
+  artifactKind: $("artifact-kind"),
+  refreshArtifacts: $("refresh-artifacts"),
+  downloadArtifactBtn: $("download-artifact-btn"),
+  artifactList: $("artifact-list"),
+  artifactPreview: $("artifact-preview"),
   runList: $("run-list"),
   briefingLog: $("briefing-log"),
   eventLog: $("event-log"),
@@ -78,6 +85,7 @@ async function api(path, options = {}) {
     }
     throw new Error(msg);
   }
+  if (options.rawText) return await resp.text();
   const ct = resp.headers.get("content-type") || "";
   if (ct.includes("application/json")) return await resp.json();
   return await resp.text();
@@ -107,6 +115,11 @@ function setBriefing(text) {
 
 function setSummary(text) {
   els.activeSummary.textContent = text;
+}
+
+function setArtifactPreview(text) {
+  els.artifactPreview.textContent = text;
+  els.artifactPreview.scrollTop = 0;
 }
 
 function renderCounters(overview) {
@@ -227,6 +240,36 @@ function renderRuns() {
   }
 }
 
+function artifactApiPath(item) {
+  return `/v1/platform/artifacts/${encodeURIComponent(item.kind)}/${encodeURIComponent(item.name)}`;
+}
+
+function renderArtifacts() {
+  els.artifactList.innerHTML = "";
+  for (const item of state.artifacts) {
+    const key = `${item.kind}/${item.name}`;
+    const active = state.selectedArtifact && state.selectedArtifact.key === key;
+    const row = document.createElement("div");
+    row.className = `row-item ${active ? "active" : ""}`;
+    const modified = new Date(item.modified_at).toLocaleString("zh-CN");
+    row.innerHTML = `
+      <div class="title">${escapeHtml(item.name)}</div>
+      <div class="meta">${escapeHtml(item.kind)} · ${escapeHtml(modified)} · ${escapeHtml(String(item.size_bytes))} bytes</div>
+    `;
+    row.onclick = async () => {
+      state.selectedArtifact = { key, ...item };
+      renderArtifacts();
+      await loadArtifactContent(item);
+    };
+    els.artifactList.appendChild(row);
+  }
+  if (!state.artifacts.length) {
+    els.artifactList.innerHTML = `<div class="row-item"><div class="meta">暂无 artifacts，先执行 run 或生成简报。</div></div>`;
+    state.selectedArtifact = null;
+    setArtifactPreview("");
+  }
+}
+
 function renderOutputs(outputs) {
   els.outputsGrid.innerHTML = "";
   const entries = Object.entries(outputs || {});
@@ -301,6 +344,33 @@ async function refreshRuns() {
   renderRuns();
 }
 
+async function loadArtifacts() {
+  const kind = els.artifactKind.value || "all";
+  const q = `?kind=${encodeURIComponent(kind)}&limit=60`;
+  state.artifacts = await api(`/v1/platform/artifacts${q}`);
+  const exists =
+    state.selectedArtifact &&
+    state.artifacts.find(
+      (x) => `${x.kind}/${x.name}` === state.selectedArtifact.key
+    );
+  if (!exists) {
+    state.selectedArtifact = state.artifacts[0]
+      ? { key: `${state.artifacts[0].kind}/${state.artifacts[0].name}`, ...state.artifacts[0] }
+      : null;
+  }
+  renderArtifacts();
+  if (state.selectedArtifact) {
+    await loadArtifactContent(state.selectedArtifact);
+  }
+}
+
+async function loadArtifactContent(item) {
+  const content = await api(artifactApiPath(item), { rawText: true });
+  setArtifactPreview(
+    `# ${item.kind}/${item.name}\n\n${content}`.slice(0, 14000)
+  );
+}
+
 async function loadRunDetail(runId) {
   const run = await api(`/v1/platform/runs/${runId}`);
   renderOutputs(run.outputs || {});
@@ -351,6 +421,7 @@ async function generateBriefing() {
     : "?timeout_sec=4";
   const briefing = await api(`/v1/platform/briefing${q}`);
   setBriefing(formatBriefing(briefing));
+  await loadArtifacts();
   setSummary(`故障简报已生成: severity=${briefing.severity}`);
 }
 
@@ -371,6 +442,27 @@ async function exportRunReport() {
   a.remove();
   URL.revokeObjectURL(url);
   setSummary(`run ${state.selectedRunId.slice(0, 8)} 报告已导出`);
+}
+
+async function downloadSelectedArtifact() {
+  if (!state.selectedArtifact) {
+    alert("请先选择 artifact");
+    return;
+  }
+  const item = state.selectedArtifact;
+  const content = await api(artifactApiPath(item), { rawText: true });
+  const ext = item.name.includes(".") ? item.name.split(".").pop() : "txt";
+  const mime = ext === "json" ? "application/json;charset=utf-8" : "text/plain;charset=utf-8";
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = item.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  setSummary(`artifact 已下载: ${item.name}`);
 }
 
 function closeStream() {
@@ -576,6 +668,7 @@ async function refreshAll() {
     loadToolHealth(),
     loadAgents(),
     loadWorkflows(),
+    loadArtifacts(),
   ]);
   renderWorkflows();
   const wf = state.workflows.find((x) => x.id === state.selectedWorkflowId) || state.workflows[0];
@@ -700,6 +793,32 @@ els.refreshRuns.addEventListener("click", async () => {
   await refreshRuns();
   if (state.selectedRunId) {
     await loadRunDetail(state.selectedRunId);
+  }
+});
+
+els.artifactKind.addEventListener("change", async () => {
+  try {
+    await loadArtifacts();
+    setSummary(`artifact 列表已切换到 ${els.artifactKind.value}`);
+  } catch (err) {
+    alert(`加载 artifacts 失败: ${err.message}`);
+  }
+});
+
+els.refreshArtifacts.addEventListener("click", async () => {
+  try {
+    await loadArtifacts();
+    setSummary("artifact 列表已刷新");
+  } catch (err) {
+    alert(`刷新 artifacts 失败: ${err.message}`);
+  }
+});
+
+els.downloadArtifactBtn.addEventListener("click", async () => {
+  try {
+    await downloadSelectedArtifact();
+  } catch (err) {
+    alert(`下载 artifact 失败: ${err.message}`);
   }
 });
 

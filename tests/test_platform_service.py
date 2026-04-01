@@ -404,3 +404,30 @@ async def test_incident_briefing_and_run_report_export(tmp_path: Path) -> None:
 
     missing_md = await service.export_run_report_markdown("missing")
     assert missing_md is None
+
+    all_items = await service.list_artifacts(kind="all", limit=50)
+    assert all_items
+    assert any(x.kind == "briefings" for x in all_items)
+    assert any(x.kind == "postmortems" for x in all_items)
+
+    briefing_items = await service.list_artifacts(kind="briefings", limit=20)
+    assert briefing_items
+    assert all(x.kind == "briefings" for x in briefing_items)
+
+    target = briefing_items[0]
+    loaded = await service.read_artifact(kind=target.kind, name=target.name)
+    assert loaded is not None
+    _, artifact_content = loaded
+    assert "LazySRE Incident Briefing" in artifact_content or '"severity"' in artifact_content
+
+    missing_artifact = await service.read_artifact(
+        kind="briefings",
+        name="missing-file.md",
+    )
+    assert missing_artifact is None
+
+    try:
+        await service.list_artifacts(kind="bad-kind", limit=10)
+        assert False, "invalid kind should raise"
+    except ValueError:
+        assert True

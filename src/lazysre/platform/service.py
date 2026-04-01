@@ -16,6 +16,7 @@ from lazysre.platform.models import (
     AgentCreateRequest,
     AgentDefinition,
     AgentRole,
+    ArtifactItem,
     AutoDesignRequest,
     EnvironmentBootstrapRequest,
     EnvironmentBootstrapResult,
@@ -257,6 +258,51 @@ class PlatformService:
             summary=run.summary,
             error=run.error,
         )
+
+    async def list_artifacts(self, kind: str = "all", limit: int = 40) -> list[ArtifactItem]:
+        norm_kind = kind.strip().lower() or "all"
+        if norm_kind not in {"all", "briefings", "postmortems"}:
+            raise ValueError("kind must be one of all/briefings/postmortems")
+
+        max_items = max(1, min(limit, 200))
+        target_kinds = ["briefings", "postmortems"] if norm_kind == "all" else [norm_kind]
+
+        items: list[ArtifactItem] = []
+        for entry_kind in target_kinds:
+            base_dir = self._artifact_dir / entry_kind
+            if not base_dir.exists():
+                continue
+            for file_path in sorted(base_dir.glob("*")):
+                if not file_path.is_file():
+                    continue
+                stat = file_path.stat()
+                items.append(
+                    ArtifactItem(
+                        kind=entry_kind,
+                        name=file_path.name,
+                        path=str(file_path),
+                        size_bytes=stat.st_size,
+                        modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+                    )
+                )
+
+        items.sort(key=lambda x: x.modified_at, reverse=True)
+        return items[:max_items]
+
+    async def read_artifact(self, kind: str, name: str) -> tuple[Path, str] | None:
+        norm_kind = kind.strip().lower()
+        if norm_kind not in {"briefings", "postmortems"}:
+            raise ValueError("kind must be briefings or postmortems")
+        if not name or name != Path(name).name:
+            raise ValueError("invalid artifact name")
+
+        base_dir = (self._artifact_dir / norm_kind).resolve()
+        target = (base_dir / name).resolve()
+        if not target.is_relative_to(base_dir):
+            raise ValueError("invalid artifact path")
+        if not target.exists() or not target.is_file():
+            return None
+        return target, target.read_text(encoding="utf-8", errors="replace")
 
     async def export_run_report_markdown(self, run_id: str) -> str | None:
         report = await self.get_run_report(run_id)

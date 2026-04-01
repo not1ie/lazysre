@@ -241,6 +241,24 @@ button.danger {
   margin-top: 10px;
 }
 
+.artifact-panel {
+  margin: 10px 0;
+}
+
+.artifact-list {
+  display: grid;
+  gap: 8px;
+  max-height: 160px;
+  overflow: auto;
+}
+
+.artifact-preview {
+  min-height: 120px;
+  max-height: 200px;
+  background: #f6f8ff;
+  border-color: rgba(35, 117, 147, 0.24);
+}
+
 .row-item {
   border: 1px solid var(--line);
   border-radius: 12px;

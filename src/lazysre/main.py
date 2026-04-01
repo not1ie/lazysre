@@ -11,6 +11,7 @@ from lazysre.models import MemorySearchResponse, TaskCreateRequest, TaskRecord
 from lazysre.platform.models import (
     AgentCreateRequest,
     AgentDefinition,
+    ArtifactItem,
     AutoDesignRequest,
     EnvironmentBootstrapRequest,
     EnvironmentBootstrapResult,
@@ -163,6 +164,33 @@ async def incident_briefing(
     return await platform_service.generate_incident_briefing(
         workflow_id=workflow_id, timeout_sec=timeout
     )
+
+
+@app.get("/v1/platform/artifacts", response_model=list[ArtifactItem])
+async def list_artifacts(kind: str = "all", limit: int = 40) -> list[ArtifactItem]:
+    try:
+        return await platform_service.list_artifacts(kind=kind, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/platform/artifacts/{kind}/{name}")
+async def read_artifact(kind: str, name: str) -> PlainTextResponse:
+    try:
+        loaded = await platform_service.read_artifact(kind=kind, name=name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not loaded:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    path, content = loaded
+    media_type = (
+        "application/json; charset=utf-8"
+        if path.suffix.lower() == ".json"
+        else "text/markdown; charset=utf-8"
+        if path.suffix.lower() == ".md"
+        else "text/plain; charset=utf-8"
+    )
+    return PlainTextResponse(content, media_type=media_type)
 
 
 @app.post("/v1/platform/workflows", response_model=WorkflowDefinition)

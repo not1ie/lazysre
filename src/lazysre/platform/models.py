@@ -220,6 +220,14 @@ class RunReport(BaseModel):
     error: str | None = None
 
 
+class ArtifactItem(BaseModel):
+    kind: str
+    name: str
+    path: str
+    size_bytes: int
+    modified_at: datetime
+
+
 class RunApprovalRequest(BaseModel):
     action: str = Field(pattern="^(approve|reject)$")
     approver: str = Field(min_length=1, max_length=120)

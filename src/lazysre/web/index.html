@@ -208,6 +208,20 @@
             <button type="button" id="export-report-btn" class="ghost">导出Run报告</button>
           </div>
           <pre id="briefing-log" class="event-log briefing-log"></pre>
+          <div class="artifact-panel">
+            <div class="inline-actions">
+              <h3>Artifacts</h3>
+              <select id="artifact-kind">
+                <option value="all" selected>all</option>
+                <option value="briefings">briefings</option>
+                <option value="postmortems">postmortems</option>
+              </select>
+              <button type="button" id="refresh-artifacts" class="ghost">刷新</button>
+              <button type="button" id="download-artifact-btn" class="ghost">下载</button>
+            </div>
+            <div id="artifact-list" class="artifact-list"></div>
+            <pre id="artifact-preview" class="event-log artifact-preview"></pre>
+          </div>
           <div id="run-list" class="run-list"></div>
           <pre id="event-log" class="event-log"></pre>
           <div id="outputs-grid" class="outputs-grid"></div>
