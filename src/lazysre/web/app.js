@@ -1,6 +1,7 @@
 const state = {
   templates: [],
   tools: [],
+  toolHealth: {},
   agents: [],
   workflows: [],
   runs: [],
@@ -32,6 +33,7 @@ const els = {
   toolHeadersJson: $("tool-headers-json"),
   toolVerifyTls: $("tool-verify-tls"),
   toolPermission: $("tool-permission"),
+  refreshToolHealth: $("refresh-tool-health"),
   toolList: $("tool-list"),
   refreshAll: $("refresh-all"),
   refreshWorkflows: $("refresh-workflows"),
@@ -121,11 +123,17 @@ function renderTools() {
   els.toolList.innerHTML = "";
   for (const tool of state.tools) {
     const headerCount = Object.keys(tool.headers || {}).length;
+    const health = state.toolHealth[tool.id];
+    const healthText = health
+      ? health.ok
+        ? `ok ${health.latency_ms}ms`
+        : `error ${health.latency_ms}ms`
+      : "unknown";
     const row = document.createElement("div");
     row.className = "row-item";
     row.innerHTML = `
       <div class="title">${escapeHtml(tool.name)}</div>
-      <div class="meta">${escapeHtml(tool.kind)} · perm=${escapeHtml(tool.required_permission)} · headers=${headerCount}</div>
+      <div class="meta">${escapeHtml(tool.kind)} · perm=${escapeHtml(tool.required_permission)} · headers=${headerCount} · health=${escapeHtml(healthText)}</div>
     `;
     els.toolList.appendChild(row);
   }
@@ -250,6 +258,16 @@ async function loadTemplates() {
 
 async function loadTools() {
   state.tools = await api("/v1/platform/tools");
+  renderTools();
+}
+
+async function loadToolHealth() {
+  const healths = await api("/v1/platform/tools/health");
+  const map = {};
+  for (const item of healths || []) {
+    map[item.tool_id] = item;
+  }
+  state.toolHealth = map;
   renderTools();
 }
 
@@ -419,6 +437,7 @@ async function createTool() {
     body: JSON.stringify(payload),
   });
   await loadTools();
+  await loadToolHealth();
   setSummary(`tool registered: ${payload.name}`);
 }
 
@@ -485,7 +504,14 @@ async function approveOrReject(action) {
 }
 
 async function refreshAll() {
-  await Promise.all([loadOverview(), loadTemplates(), loadTools(), loadAgents(), loadWorkflows()]);
+  await Promise.all([
+    loadOverview(),
+    loadTemplates(),
+    loadTools(),
+    loadToolHealth(),
+    loadAgents(),
+    loadWorkflows(),
+  ]);
   renderWorkflows();
   const wf = state.workflows.find((x) => x.id === state.selectedWorkflowId) || state.workflows[0];
   if (wf) {
@@ -587,6 +613,15 @@ els.rejectBtn.addEventListener("click", () => approveOrReject("reject"));
 els.refreshAll.addEventListener("click", async () => {
   await refreshAll();
   setSummary("数据已刷新");
+});
+
+els.refreshToolHealth.addEventListener("click", async () => {
+  try {
+    await loadToolHealth();
+    setSummary("工具健康探测已完成");
+  } catch (err) {
+    alert(`探测失败: ${err.message}`);
+  }
 });
 
 els.refreshWorkflows.addEventListener("click", async () => {

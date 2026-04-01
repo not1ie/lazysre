@@ -185,7 +185,7 @@ async def test_environment_bootstrap_with_monitoring_fallback(tmp_path: Path) ->
     service = PlatformService(store_path=str(tmp_path / "platform.json"))
 
     async def fake_execute_tool(tool, query, context, timeout_sec=10.0):  # type: ignore[no-untyped-def]
-        if "92.168.69.176" in tool.base_url:
+        if tool.base_url.startswith("http://92.168.69.176"):
             raise RuntimeError("connect timeout")
         return f'{{"tool":"{tool.kind.value}","query":"{query}"}}'
 
@@ -204,8 +204,8 @@ async def test_environment_bootstrap_with_monitoring_fallback(tmp_path: Path) ->
     )
     assert boot.workflow is not None
     assert boot.primary_tool_id is not None
-    assert any("error:" in x for x in boot.probe_results.values())
-    assert any("ok:" in x for x in boot.probe_results.values())
+    assert any(x.startswith("error(") for x in boot.probe_results.values())
+    assert any(x.startswith("ok(") for x in boot.probe_results.values())
     assert any(t.base_url == "http://192.168.69.176:9090" for t in boot.tools)
     k8s_tool = next((t for t in boot.tools if t.kind == "kubernetes"), None)
     assert k8s_tool is not None
@@ -301,3 +301,39 @@ async def test_tool_failure_is_soft_error_and_run_continues(tmp_path: Path) -> N
     loaded = await service.get_run(run.id)
     assert loaded is not None
     assert any(evt.kind == "tool_failed" for evt in loaded.events)
+
+
+async def test_tool_health_and_bootstrap_pick_lower_latency(tmp_path: Path) -> None:
+    service = PlatformService(store_path=str(tmp_path / "platform.json"))
+
+    async def fake_execute_tool(tool, query, context, timeout_sec=10.0):  # type: ignore[no-untyped-def]
+        if tool.base_url.startswith("http://92.168.69.176"):
+            await asyncio.sleep(0.03)
+            return '{"status":"success","candidate":"slow"}'
+        if tool.base_url.startswith("http://192.168.69.176"):
+            await asyncio.sleep(0.002)
+            return '{"status":"success","candidate":"fast"}'
+        return '{"major":"1","minor":"28"}'
+
+    service._execute_tool = fake_execute_tool  # type: ignore[method-assign]
+
+    boot = await service.bootstrap_environment(
+        EnvironmentBootstrapRequest(
+            monitoring_ip="92.168.69.176",
+            monitoring_port=9090,
+            k8s_api_url="https://192.168.10.1:6443",
+            k8s_verify_tls=False,
+            create_mission_workflow=False,
+        )
+    )
+    assert boot.primary_tool_id is not None
+    assert "ok(" in boot.probe_results[boot.primary_tool_id]
+
+    primary = next((t for t in boot.tools if t.id == boot.primary_tool_id), None)
+    assert primary is not None
+    assert primary.base_url == "http://192.168.69.176:9090"
+
+    health = await service.list_tools_health(timeout_sec=2.0)
+    assert len(health) >= 3
+    assert any(h.ok for h in health)
+    assert any(h.kind == "kubernetes" for h in health)

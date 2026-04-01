@@ -137,6 +137,7 @@ curl -X POST http://127.0.0.1:8000/v1/platform/tools \
   }'
 
 curl http://127.0.0.1:8000/v1/platform/tools
+curl "http://127.0.0.1:8000/v1/platform/tools/health?timeout_sec=6"
 curl -X POST http://127.0.0.1:8000/v1/platform/tools/<tool_id>/probe \
   -H "Content-Type: application/json" \
   -d '{"query":"up"}'

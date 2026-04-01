@@ -20,6 +20,7 @@ from lazysre.platform.models import (
     RunApprovalRequest,
     RunCreateRequest,
     ToolCreateRequest,
+    ToolHealthItem,
     ToolProbeRequest,
     ToolProbeResult,
     WorkflowCreateRequest,
@@ -114,6 +115,12 @@ async def create_tool(req: ToolCreateRequest) -> OpsToolDefinition:
 @app.get("/v1/platform/tools", response_model=list[OpsToolDefinition])
 async def list_tools() -> list[OpsToolDefinition]:
     return await platform_service.list_tools()
+
+
+@app.get("/v1/platform/tools/health", response_model=list[ToolHealthItem])
+async def list_tools_health(timeout_sec: float = 6.0) -> list[ToolHealthItem]:
+    timeout = max(1.0, min(timeout_sec, 20.0))
+    return await platform_service.list_tools_health(timeout_sec=timeout)
 
 
 @app.post("/v1/platform/bootstrap/environment", response_model=EnvironmentBootstrapResult)

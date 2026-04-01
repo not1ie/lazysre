@@ -168,6 +168,16 @@ class ToolProbeResult(BaseModel):
     preview: str
 
 
+class ToolHealthItem(BaseModel):
+    tool_id: str
+    name: str
+    kind: OpsToolKind
+    ok: bool
+    latency_ms: int
+    preview: str = ""
+    error: str = ""
+
+
 class EnvironmentBootstrapRequest(BaseModel):
     monitoring_ip: str = "92.168.69.176"
     monitoring_port: int = 9090

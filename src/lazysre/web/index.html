@@ -100,7 +100,10 @@
           </form>
           <hr />
           <form id="tool-form" class="stack">
-            <h3>Tool Hub</h3>
+            <div class="inline-actions">
+              <h3>Tool Hub</h3>
+              <button type="button" id="refresh-tool-health" class="ghost">全量探测</button>
+            </div>
             <label>
               Tool 名称
               <input id="tool-name" value="Prometheus Prod" />

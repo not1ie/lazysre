@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import httpx
@@ -28,6 +29,7 @@ from lazysre.platform.models import (
     RunEvent,
     RunStatus,
     ToolCreateRequest,
+    ToolHealthItem,
     ToolProbeRequest,
     ToolProbeResult,
     WorkflowCreateRequest,
@@ -84,13 +86,33 @@ class PlatformService:
         tool = self._state.tools.get(tool_id)
         if not tool:
             raise ValueError("tool not found")
-        preview = await self._execute_tool(
+        health = await self._probe_tool_with_metrics(
             tool=tool,
-            query=req.query or tool.default_query,
-            context={},
+            query=req.query,
             timeout_sec=req.timeout_sec,
         )
-        return ToolProbeResult(ok=True, preview=preview[:1200])
+        if not health.ok:
+            raise RuntimeError(health.error or "tool probe failed")
+        return ToolProbeResult(ok=True, preview=health.preview[:1200])
+
+    async def list_tools_health(self, timeout_sec: float = 6.0) -> list[ToolHealthItem]:
+        tools = await self.list_tools()
+        if not tools:
+            return []
+        checks = await asyncio.gather(
+            *[
+                self._probe_tool_with_metrics(
+                    tool=t,
+                    query=t.default_query,
+                    timeout_sec=timeout_sec,
+                )
+                for t in tools
+            ]
+        )
+        return sorted(
+            checks,
+            key=lambda x: (not x.ok, x.latency_ms, x.name.lower()),
+        )
 
     async def list_templates(self) -> list[PlatformTemplate]:
         return list(self._templates.values())
@@ -105,6 +127,7 @@ class PlatformService:
         created_tools: list[OpsToolDefinition] = []
         probe_results: dict[str, str] = {}
         primary_prometheus_id: str | None = None
+        best_prom_latency: int | None = None
 
         for idx, base_url in enumerate(monitoring_urls, start=1):
             tool = await self._upsert_tool(
@@ -122,15 +145,14 @@ class PlatformService:
                 preserve_headers_if_empty=True,
             )
             created_tools.append(tool)
-            try:
-                probe = await self.probe_tool(
-                    tool.id, ToolProbeRequest(query=tool.default_query, timeout_sec=5.0)
-                )
-                probe_results[tool.id] = f"ok: {probe.preview[:180]}"
-                if primary_prometheus_id is None:
+            probe = await self._probe_tool_with_metrics(tool, timeout_sec=5.0)
+            if probe.ok:
+                probe_results[tool.id] = f"ok({probe.latency_ms}ms): {probe.preview[:160]}"
+                if best_prom_latency is None or probe.latency_ms < best_prom_latency:
+                    best_prom_latency = probe.latency_ms
                     primary_prometheus_id = tool.id
-            except Exception as exc:
-                probe_results[tool.id] = f"error: {exc}"
+            else:
+                probe_results[tool.id] = f"error({probe.latency_ms}ms): {probe.error}"
 
         k8s_headers: dict[str, str] = {}
         if req.k8s_bearer_token.strip():
@@ -149,13 +171,11 @@ class PlatformService:
             preserve_headers_if_empty=True,
         )
         created_tools.append(k8s_tool)
-        try:
-            probe = await self.probe_tool(
-                k8s_tool.id, ToolProbeRequest(query=k8s_tool.default_query, timeout_sec=5.0)
-            )
-            probe_results[k8s_tool.id] = f"ok: {probe.preview[:180]}"
-        except Exception as exc:
-            probe_results[k8s_tool.id] = f"error: {exc}"
+        probe = await self._probe_tool_with_metrics(k8s_tool, timeout_sec=5.0)
+        if probe.ok:
+            probe_results[k8s_tool.id] = f"ok({probe.latency_ms}ms): {probe.preview[:160]}"
+        else:
+            probe_results[k8s_tool.id] = f"error({probe.latency_ms}ms): {probe.error}"
 
         workflow: WorkflowDefinition | None = None
         if req.create_mission_workflow:
@@ -473,6 +493,37 @@ class PlatformService:
             if run.status != RunStatus.waiting_approval:
                 self._cancel_flags.discard(run_id)
             self._persist_unlocked()
+
+    async def _probe_tool_with_metrics(
+        self, tool: OpsToolDefinition, query: str = "", timeout_sec: float = 8.0
+    ) -> ToolHealthItem:
+        started = perf_counter()
+        try:
+            preview = await self._execute_tool(
+                tool=tool,
+                query=query or tool.default_query,
+                context={},
+                timeout_sec=timeout_sec,
+            )
+            latency_ms = int((perf_counter() - started) * 1000)
+            return ToolHealthItem(
+                tool_id=tool.id,
+                name=tool.name,
+                kind=tool.kind,
+                ok=True,
+                latency_ms=latency_ms,
+                preview=preview[:220],
+            )
+        except Exception as exc:
+            latency_ms = int((perf_counter() - started) * 1000)
+            return ToolHealthItem(
+                tool_id=tool.id,
+                name=tool.name,
+                kind=tool.kind,
+                ok=False,
+                latency_ms=latency_ms,
+                error=str(exc)[:320],
+            )
 
     async def _execute_tool(
         self,
