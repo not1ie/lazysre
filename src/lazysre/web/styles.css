@@ -140,6 +140,17 @@ h1 {
   gap: 10px;
 }
 
+hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 12px 0;
+}
+
+h3 {
+  margin: 2px 0 0;
+  font-size: 16px;
+}
+
 label {
   display: grid;
   gap: 6px;
@@ -220,6 +231,14 @@ button.danger {
   max-height: 200px;
   overflow: auto;
   margin-bottom: 10px;
+}
+
+.tool-list {
+  display: grid;
+  gap: 8px;
+  max-height: 165px;
+  overflow: auto;
+  margin-top: 10px;
 }
 
 .row-item {
@@ -331,6 +350,14 @@ button.danger {
   min-height: 72px;
 }
 
+.approval-form {
+  margin-top: 10px;
+  border: 1px dashed rgba(251, 124, 43, 0.45);
+  border-radius: 12px;
+  padding: 10px;
+  background: rgba(255, 247, 239, 0.65);
+}
+
 @keyframes reveal {
   from {
     opacity: 0;
@@ -365,4 +392,3 @@ button.danger {
     grid-template-columns: 1fr;
   }
 }
-

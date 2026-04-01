@@ -30,6 +30,10 @@ class WorkflowNode(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     agent_id: str
     instruction: str = Field(min_length=1, max_length=4000)
+    tool_binding: str | None = None
+    required_permission: str = "read"
+    requires_approval: bool = False
+    approval_reason: str | None = None
     next_nodes: list[str] = Field(default_factory=list)
 
 
@@ -45,6 +49,7 @@ class WorkflowDefinition(BaseModel):
 class RunStatus(str, Enum):
     pending = "pending"
     running = "running"
+    waiting_approval = "waiting_approval"
     completed = "completed"
     failed = "failed"
     canceled = "canceled"
@@ -66,6 +71,10 @@ class WorkflowRun(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     events: list[RunEvent] = Field(default_factory=list)
+    queue: list[str] = Field(default_factory=list)
+    visited: list[str] = Field(default_factory=list)
+    pending_node_id: str | None = None
+    approvals: list["RunApprovalRecord"] = Field(default_factory=list)
     outputs: dict[str, str] = Field(default_factory=dict)
     summary: str | None = None
     error: str | None = None
@@ -117,3 +126,57 @@ class PlatformOverview(BaseModel):
     failed_runs: int
     canceled_runs: int
     success_rate: float
+
+
+class OpsToolKind(str, Enum):
+    prometheus = "prometheus"
+    kubernetes = "kubernetes"
+    logs = "logs"
+    generic_http = "generic_http"
+
+
+class OpsToolDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    name: str = Field(min_length=2, max_length=128)
+    kind: OpsToolKind
+    base_url: str = Field(min_length=4, max_length=2000)
+    headers: dict[str, str] = Field(default_factory=dict)
+    default_query: str = ""
+    required_permission: str = "read"
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class ToolCreateRequest(BaseModel):
+    name: str
+    kind: OpsToolKind
+    base_url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    default_query: str = ""
+    required_permission: str = "read"
+
+
+class ToolProbeRequest(BaseModel):
+    query: str = ""
+    timeout_sec: float = 8.0
+
+
+class ToolProbeResult(BaseModel):
+    ok: bool
+    preview: str
+
+
+class RunApprovalRequest(BaseModel):
+    action: str = Field(pattern="^(approve|reject)$")
+    approver: str = Field(min_length=1, max_length=120)
+    comment: str = ""
+
+
+class RunApprovalRecord(BaseModel):
+    node_id: str
+    action: str
+    approver: str
+    comment: str = ""
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+WorkflowRun.model_rebuild()

@@ -1,5 +1,6 @@
 const state = {
   templates: [],
+  tools: [],
   agents: [],
   workflows: [],
   runs: [],
@@ -17,14 +18,28 @@ const els = {
   missionMode: $("mission-mode"),
   templateSelect: $("template-select"),
   workflowName: $("workflow-name"),
+  toolForm: $("tool-form"),
+  toolName: $("tool-name"),
+  toolKind: $("tool-kind"),
+  toolBaseUrl: $("tool-base-url"),
+  toolDefaultQuery: $("tool-default-query"),
+  toolPermission: $("tool-permission"),
+  toolList: $("tool-list"),
   refreshAll: $("refresh-all"),
   refreshWorkflows: $("refresh-workflows"),
   refreshRuns: $("refresh-runs"),
   workflowList: $("workflow-list"),
   workflowCanvas: $("workflow-canvas"),
   runForm: $("run-form"),
+  actorPermission: $("actor-permission"),
   runInput: $("run-input"),
+  toolQueriesInput: $("tool-queries-input"),
   cancelRunBtn: $("cancel-run-btn"),
+  approvalForm: $("approval-form"),
+  approverName: $("approver-name"),
+  approvalComment: $("approval-comment"),
+  approveBtn: $("approve-btn"),
+  rejectBtn: $("reject-btn"),
   runList: $("run-list"),
   eventLog: $("event-log"),
   outputsGrid: $("outputs-grid"),
@@ -51,19 +66,8 @@ async function api(path, options = {}) {
     throw new Error(msg);
   }
   const ct = resp.headers.get("content-type") || "";
-  if (ct.includes("application/json")) {
-    return await resp.json();
-  }
+  if (ct.includes("application/json")) return await resp.json();
   return await resp.text();
-}
-
-function ts() {
-  return new Date().toLocaleTimeString("zh-CN", { hour12: false });
-}
-
-function log(msg) {
-  els.eventLog.textContent += `${msg}\n`;
-  els.eventLog.scrollTop = els.eventLog.scrollHeight;
 }
 
 function escapeHtml(v) {
@@ -74,12 +78,13 @@ function escapeHtml(v) {
     .replaceAll('"', "&quot;");
 }
 
-function statusText(status) {
-  if (status === "completed") return "color:#1b8877";
-  if (status === "failed") return "color:#bd3b2f";
-  if (status === "canceled") return "color:#a55e16";
-  if (status === "running") return "color:#237593";
-  return "color:#60737a";
+function ts() {
+  return new Date().toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function log(msg) {
+  els.eventLog.textContent += `${msg}\n`;
+  els.eventLog.scrollTop = els.eventLog.scrollHeight;
 }
 
 function setSummary(text) {
@@ -94,7 +99,6 @@ function renderCounters(overview) {
 }
 
 function renderTemplateOptions() {
-  const mode = els.missionMode.value;
   els.templateSelect.innerHTML = "";
   for (const tpl of state.templates) {
     const opt = document.createElement("option");
@@ -102,7 +106,23 @@ function renderTemplateOptions() {
     opt.textContent = `${tpl.name} · ${tpl.description}`;
     els.templateSelect.appendChild(opt);
   }
-  els.templateSelect.disabled = mode !== "template";
+  els.templateSelect.disabled = els.missionMode.value !== "template";
+}
+
+function renderTools() {
+  els.toolList.innerHTML = "";
+  for (const tool of state.tools) {
+    const row = document.createElement("div");
+    row.className = "row-item";
+    row.innerHTML = `
+      <div class="title">${escapeHtml(tool.name)}</div>
+      <div class="meta">${escapeHtml(tool.kind)} · perm=${escapeHtml(tool.required_permission)}</div>
+    `;
+    els.toolList.appendChild(row);
+  }
+  if (!state.tools.length) {
+    els.toolList.innerHTML = `<div class="row-item"><div class="meta">暂无工具，可先注册 Prometheus/K8s/日志工具。</div></div>`;
+  }
 }
 
 function renderWorkflows() {
@@ -122,31 +142,42 @@ function renderWorkflows() {
       renderWorkflows();
       renderCanvas(wf);
       await refreshRuns();
+      updateApprovalForm(null);
       setSummary(`已选择 workflow: ${wf.name}`);
     };
     els.workflowList.appendChild(row);
   }
   if (!state.workflows.length) {
-    els.workflowList.innerHTML = `<div class="row-item"><div class="meta">暂无 workflow，请先创建。</div></div>`;
+    els.workflowList.innerHTML = `<div class="row-item"><div class="meta">暂无 workflow</div></div>`;
   }
 }
 
 function renderCanvas(workflow) {
   if (!workflow) {
-    els.workflowCanvas.innerHTML = `<div class="meta">等待工作流...</div>`;
+    els.workflowCanvas.innerHTML = `<div class="row-item"><div class="meta">等待工作流...</div></div>`;
     return;
   }
   els.workflowCanvas.innerHTML = "";
   for (const node of workflow.nodes) {
-    const div = document.createElement("article");
-    div.className = "node-card";
-    div.innerHTML = `
+    const row = document.createElement("article");
+    row.className = "node-card";
+    row.innerHTML = `
       <h3>${escapeHtml(node.id)}</h3>
       <p>${escapeHtml(node.instruction)}</p>
+      <div class="pipe">tool=${escapeHtml(node.tool_binding || "none")} | perm=${escapeHtml(node.required_permission)} | approval=${node.requires_approval ? "yes" : "no"}</div>
       <div class="pipe">next: ${escapeHtml((node.next_nodes || []).join(", ") || "end")}</div>
     `;
-    els.workflowCanvas.appendChild(div);
+    els.workflowCanvas.appendChild(row);
   }
+}
+
+function statusColor(status) {
+  if (status === "completed") return "color:#1b8877";
+  if (status === "failed") return "color:#bd3b2f";
+  if (status === "canceled") return "color:#a55e16";
+  if (status === "waiting_approval") return "color:#d47f1a";
+  if (status === "running") return "color:#237593";
+  return "color:#60737a";
 }
 
 function renderRuns() {
@@ -156,7 +187,7 @@ function renderRuns() {
     row.className = `row-item ${run.id === state.selectedRunId ? "active" : ""}`;
     row.innerHTML = `
       <div class="title">${escapeHtml(run.id.slice(0, 8))}</div>
-      <div class="meta" style="${statusText(run.status)}">${escapeHtml(run.status)}</div>
+      <div class="meta" style="${statusColor(run.status)}">${escapeHtml(run.status)}</div>
     `;
     row.onclick = async () => {
       state.selectedRunId = run.id;
@@ -189,6 +220,15 @@ function renderOutputs(outputs) {
   }
 }
 
+function updateApprovalForm(run) {
+  const waiting = run && run.status === "waiting_approval";
+  els.approvalForm.style.display = waiting ? "grid" : "none";
+  if (waiting) {
+    const node = run.pending_node_id || "-";
+    setSummary(`run ${run.id.slice(0, 8)} 等待审批: node=${node}`);
+  }
+}
+
 async function loadOverview() {
   const overview = await api("/v1/platform/overview");
   renderCounters(overview);
@@ -197,6 +237,11 @@ async function loadOverview() {
 async function loadTemplates() {
   state.templates = await api("/v1/platform/templates");
   renderTemplateOptions();
+}
+
+async function loadTools() {
+  state.tools = await api("/v1/platform/tools");
+  renderTools();
 }
 
 async function loadAgents() {
@@ -224,6 +269,7 @@ async function refreshRuns() {
 async function loadRunDetail(runId) {
   const run = await api(`/v1/platform/runs/${runId}`);
   renderOutputs(run.outputs || {});
+  updateApprovalForm(run);
   setSummary(
     `run=${run.id.slice(0, 8)} status=${run.status} workflow=${run.workflow_id.slice(0, 8)}`
   );
@@ -232,6 +278,7 @@ async function loadRunDetail(runId) {
   } else {
     startRunPoller();
   }
+  return run;
 }
 
 function closeStream() {
@@ -257,12 +304,14 @@ function openStream(runId) {
       log(`[${ts()}] ${evt.data}`);
     }
   };
+
   es.addEventListener("end", () => {
     log(`[${ts()}] stream closed`);
     closeStream();
     refreshRuns();
     loadOverview();
   });
+
   es.onerror = () => {
     log(`[${ts()}] stream disconnected`);
     closeStream();
@@ -281,7 +330,7 @@ function startRunPoller() {
     } catch (err) {
       console.error(err);
     }
-  }, 2200);
+  }, 2400);
 }
 
 function stopRunPoller() {
@@ -331,8 +380,52 @@ async function createWorkflowFromMission() {
   setSummary(`workflow created: ${workflow.name}`);
 }
 
+async function createTool() {
+  const payload = {
+    name: els.toolName.value.trim(),
+    kind: els.toolKind.value,
+    base_url: els.toolBaseUrl.value.trim(),
+    default_query: els.toolDefaultQuery.value.trim(),
+    required_permission: els.toolPermission.value,
+  };
+  if (!payload.name || !payload.base_url) {
+    alert("Tool 名称和 URL 必填");
+    return;
+  }
+  await api("/v1/platform/tools", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  await loadTools();
+  setSummary(`tool registered: ${payload.name}`);
+}
+
+async function approveOrReject(action) {
+  if (!state.selectedRunId) {
+    alert("请先选择 run");
+    return;
+  }
+  try {
+    await api(`/v1/platform/runs/${state.selectedRunId}/approval`, {
+      method: "POST",
+      body: JSON.stringify({
+        action,
+        approver: els.approverName.value.trim() || "oncall",
+        comment: els.approvalComment.value.trim(),
+      }),
+    });
+    log(`[${ts()}] approval action=${action}`);
+    await refreshRuns();
+    await loadOverview();
+    await loadRunDetail(state.selectedRunId);
+    openStream(state.selectedRunId);
+  } catch (err) {
+    alert(`审批失败: ${err.message}`);
+  }
+}
+
 async function refreshAll() {
-  await Promise.all([loadOverview(), loadTemplates(), loadAgents(), loadWorkflows()]);
+  await Promise.all([loadOverview(), loadTemplates(), loadTools(), loadAgents(), loadWorkflows()]);
   renderWorkflows();
   const wf = state.workflows.find((x) => x.id === state.selectedWorkflowId) || state.workflows[0];
   if (wf) {
@@ -342,11 +435,10 @@ async function refreshAll() {
     renderCanvas(null);
   }
   await refreshRuns();
+  updateApprovalForm(null);
 }
 
-els.missionMode.addEventListener("change", () => {
-  renderTemplateOptions();
-});
+els.missionMode.addEventListener("change", renderTemplateOptions);
 
 els.missionForm.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -357,6 +449,15 @@ els.missionForm.addEventListener("submit", async (e) => {
   }
 });
 
+els.toolForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await createTool();
+  } catch (err) {
+    alert(`注册 tool 失败: ${err.message}`);
+  }
+});
+
 els.runForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   if (!state.selectedWorkflowId) {
@@ -364,12 +465,23 @@ els.runForm.addEventListener("submit", async (e) => {
     return;
   }
   let input = {};
+  let toolQueries = {};
   try {
     input = JSON.parse(els.runInput.value || "{}");
   } catch {
     alert("Run Input JSON 格式错误");
     return;
   }
+  try {
+    toolQueries = JSON.parse(els.toolQueriesInput.value || "{}");
+  } catch {
+    alert("Tool Queries JSON 格式错误");
+    return;
+  }
+
+  input.actor_permission = els.actorPermission.value;
+  input.tool_queries = toolQueries;
+
   try {
     const run = await api(`/v1/platform/workflows/${state.selectedWorkflowId}/runs`, {
       method: "POST",
@@ -399,6 +511,9 @@ els.cancelRunBtn.addEventListener("click", async () => {
     alert(`取消失败: ${err.message}`);
   }
 });
+
+els.approveBtn.addEventListener("click", () => approveOrReject("approve"));
+els.rejectBtn.addEventListener("click", () => approveOrReject("reject"));
 
 els.refreshAll.addEventListener("click", async () => {
   await refreshAll();

@@ -11,10 +11,15 @@ from lazysre.platform.models import (
     AgentCreateRequest,
     AgentDefinition,
     AutoDesignRequest,
+    OpsToolDefinition,
     PlatformOverview,
     PlatformTemplate,
     QuickstartRequest,
+    RunApprovalRequest,
     RunCreateRequest,
+    ToolCreateRequest,
+    ToolProbeRequest,
+    ToolProbeResult,
     WorkflowCreateRequest,
     WorkflowDefinition,
     WorkflowRun,
@@ -96,6 +101,29 @@ async def list_agents() -> list[AgentDefinition]:
     return await platform_service.list_agents()
 
 
+@app.post("/v1/platform/tools", response_model=OpsToolDefinition)
+async def create_tool(req: ToolCreateRequest) -> OpsToolDefinition:
+    try:
+        return await platform_service.create_tool(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/platform/tools", response_model=list[OpsToolDefinition])
+async def list_tools() -> list[OpsToolDefinition]:
+    return await platform_service.list_tools()
+
+
+@app.post("/v1/platform/tools/{tool_id}/probe", response_model=ToolProbeResult)
+async def probe_tool(tool_id: str, req: ToolProbeRequest) -> ToolProbeResult:
+    try:
+        return await platform_service.probe_tool(tool_id, req)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"tool probe failed: {exc}") from exc
+
+
 @app.get("/v1/platform/templates", response_model=list[PlatformTemplate])
 async def list_templates() -> list[PlatformTemplate]:
     return await platform_service.list_templates()
@@ -156,6 +184,17 @@ async def get_run(run_id: str) -> WorkflowRun:
 @app.post("/v1/platform/runs/{run_id}/cancel", response_model=WorkflowRun)
 async def cancel_run(run_id: str) -> WorkflowRun:
     run = await platform_service.cancel_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
+
+
+@app.post("/v1/platform/runs/{run_id}/approval", response_model=WorkflowRun)
+async def run_approval(run_id: str, req: RunApprovalRequest) -> WorkflowRun:
+    try:
+        run = await platform_service.approve_run(run_id, req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not run:
         raise HTTPException(status_code=404, detail="run not found")
     return run

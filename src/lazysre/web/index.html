@@ -70,6 +70,41 @@
             </label>
             <button type="submit">生成 Workflow</button>
           </form>
+          <hr />
+          <form id="tool-form" class="stack">
+            <h3>Tool Hub</h3>
+            <label>
+              Tool 名称
+              <input id="tool-name" value="Prometheus Prod" />
+            </label>
+            <label>
+              Tool 类型
+              <select id="tool-kind">
+                <option value="prometheus">prometheus</option>
+                <option value="kubernetes">kubernetes</option>
+                <option value="logs">logs</option>
+                <option value="generic_http">generic_http</option>
+              </select>
+            </label>
+            <label>
+              Base URL
+              <input id="tool-base-url" value="http://prometheus:9090" />
+            </label>
+            <label>
+              默认查询
+              <input id="tool-default-query" value="up" />
+            </label>
+            <label>
+              权限级别
+              <select id="tool-permission">
+                <option value="read">read</option>
+                <option value="write">write</option>
+                <option value="admin">admin</option>
+              </select>
+            </label>
+            <button type="submit">注册 Tool</button>
+          </form>
+          <div id="tool-list" class="tool-list"></div>
           <p id="active-summary" class="status-line">就绪，等待新任务。</p>
         </aside>
 
@@ -91,12 +126,39 @@
           </div>
           <form id="run-form" class="stack run-form">
             <label>
+              Actor Permission
+              <select id="actor-permission">
+                <option value="read">read</option>
+                <option value="write" selected>write</option>
+                <option value="admin">admin</option>
+              </select>
+            </label>
+            <label>
               Run Input JSON
               <textarea id="run-input">{"service":"gateway","cluster":"prod-sh","severity":"high"}</textarea>
+            </label>
+            <label>
+              Tool Queries JSON (按 node id)
+              <textarea id="tool-queries-input">{"execute":"up"}</textarea>
             </label>
             <div class="inline-actions">
               <button type="submit">启动 Run</button>
               <button type="button" id="cancel-run-btn" class="danger">取消 Run</button>
+            </div>
+          </form>
+          <form id="approval-form" class="stack approval-form">
+            <h3>Approval Gate</h3>
+            <label>
+              Approver
+              <input id="approver-name" value="oncall.lead" />
+            </label>
+            <label>
+              Comment
+              <input id="approval-comment" value="风险可控，批准执行" />
+            </label>
+            <div class="inline-actions">
+              <button type="button" id="approve-btn">Approve</button>
+              <button type="button" id="reject-btn" class="danger">Reject</button>
             </div>
           </form>
           <div id="run-list" class="run-list"></div>
@@ -108,4 +170,3 @@
     <script type="module" src="/web/app.js"></script>
   </body>
 </html>
-
