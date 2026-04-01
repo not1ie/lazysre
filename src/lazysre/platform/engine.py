@@ -126,19 +126,34 @@ class WorkflowEngine:
                             from_input = str(tool_queries.get(node.id, "")).strip()
                             if from_input:
                                 tool_query = from_input
-                        tool_context = await tool_executor(tool, tool_query, run.input)
-                        run.events.append(
-                            RunEvent(
-                                kind="tool_executed",
-                                message=f"工具执行完成: {tool.name}",
-                                data={
-                                    "node_id": node.id,
-                                    "tool_id": tool.id,
-                                    "tool_kind": tool.kind.value,
-                                    "preview": tool_context[:180],
-                                },
+                        try:
+                            tool_context = await tool_executor(tool, tool_query, run.input)
+                            run.events.append(
+                                RunEvent(
+                                    kind="tool_executed",
+                                    message=f"工具执行完成: {tool.name}",
+                                    data={
+                                        "node_id": node.id,
+                                        "tool_id": tool.id,
+                                        "tool_kind": tool.kind.value,
+                                        "preview": tool_context[:180],
+                                    },
+                                )
                             )
-                        )
+                        except Exception as exc:
+                            tool_context = f"tool execution failed: {exc}"
+                            run.events.append(
+                                RunEvent(
+                                    kind="tool_failed",
+                                    message=f"工具执行失败: {tool.name}",
+                                    data={
+                                        "node_id": node.id,
+                                        "tool_id": tool.id,
+                                        "tool_kind": tool.kind.value,
+                                        "error": str(exc),
+                                    },
+                                )
+                            )
 
                 prompt = self._build_prompt(workflow, run, node.instruction, node_id, tool_context)
                 started = perf_counter()

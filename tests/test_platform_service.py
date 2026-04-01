@@ -224,3 +224,61 @@ async def test_environment_bootstrap_with_monitoring_fallback(tmp_path: Path) ->
     assert run is not None
     status = await _wait_run(service, run.id)
     assert status in (RunStatus.waiting_approval, RunStatus.completed)
+
+
+async def test_tool_failure_is_soft_error_and_run_continues(tmp_path: Path) -> None:
+    service = PlatformService(store_path=str(tmp_path / "platform.json"))
+
+    async def fake_execute_tool(tool, query, context, timeout_sec=10.0):  # type: ignore[no-untyped-def]
+        raise RuntimeError("403 forbidden")
+
+    service._execute_tool = fake_execute_tool  # type: ignore[method-assign]
+
+    agent = await service.create_agent(
+        AgentCreateRequest(
+            name="Worker",
+            role="worker",
+            system_prompt="执行诊断并汇总结果",
+            model="gpt-5.4-mini",
+        )
+    )
+    tool = await service.create_tool(
+        ToolCreateRequest(
+            name="K8s",
+            kind="kubernetes",
+            base_url="https://192.168.10.1:6443",
+            verify_tls=False,
+            default_query="/version",
+            required_permission="read",
+        )
+    )
+    wf = await service.create_workflow(
+        WorkflowCreateRequest(
+            name="Soft Error Flow",
+            objective="验证工具失败软降级",
+            start_node="collect",
+            nodes=[
+                WorkflowNode(
+                    id="collect",
+                    agent_id=agent.id,
+                    instruction="拉取集群状态并输出判断",
+                    tool_binding=tool.id,
+                    tool_query="/api/v1/nodes",
+                    required_permission="read",
+                    requires_approval=False,
+                    next_nodes=[],
+                )
+            ],
+        )
+    )
+
+    run = await service.create_run(
+        workflow_id=wf.id,
+        req=RunCreateRequest(input={"actor_permission": "read"}),
+    )
+    assert run is not None
+    status = await _wait_run(service, run.id)
+    assert status == RunStatus.completed
+    loaded = await service.get_run(run.id)
+    assert loaded is not None
+    assert any(evt.kind == "tool_failed" for evt in loaded.events)
