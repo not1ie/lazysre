@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from lazysre.models import MemorySearchResponse, TaskCreateRequest, TaskRecord
@@ -13,6 +13,7 @@ from lazysre.platform.models import (
     AutoDesignRequest,
     EnvironmentBootstrapRequest,
     EnvironmentBootstrapResult,
+    IncidentBriefing,
     OpsToolDefinition,
     PlatformOverview,
     PlatformTemplate,
@@ -26,6 +27,7 @@ from lazysre.platform.models import (
     WorkflowCreateRequest,
     WorkflowDefinition,
     WorkflowRun,
+    RunReport,
 )
 from lazysre.platform.service import PlatformService
 from lazysre.services.task_service import TaskService
@@ -153,6 +155,16 @@ async def platform_overview() -> PlatformOverview:
     return await platform_service.get_overview()
 
 
+@app.get("/v1/platform/briefing", response_model=IncidentBriefing)
+async def incident_briefing(
+    workflow_id: str | None = None, timeout_sec: float = 4.0
+) -> IncidentBriefing:
+    timeout = max(1.0, min(timeout_sec, 20.0))
+    return await platform_service.generate_incident_briefing(
+        workflow_id=workflow_id, timeout_sec=timeout
+    )
+
+
 @app.post("/v1/platform/workflows", response_model=WorkflowDefinition)
 async def create_workflow(req: WorkflowCreateRequest) -> WorkflowDefinition:
     try:
@@ -198,6 +210,24 @@ async def get_run(run_id: str) -> WorkflowRun:
     if not run:
         raise HTTPException(status_code=404, detail="run not found")
     return run
+
+
+@app.get("/v1/platform/runs/{run_id}/report")
+async def get_run_report(run_id: str, format: str = "markdown") -> RunReport | PlainTextResponse:
+    fmt = format.strip().lower()
+    if fmt not in {"markdown", "json"}:
+        raise HTTPException(status_code=400, detail="format must be markdown or json")
+
+    if fmt == "json":
+        report = await platform_service.get_run_report(run_id)
+        if not report:
+            raise HTTPException(status_code=404, detail="run not found")
+        return report
+
+    content = await platform_service.export_run_report_markdown(run_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return PlainTextResponse(content, media_type="text/markdown; charset=utf-8")
 
 
 @app.post("/v1/platform/runs/{run_id}/cancel", response_model=WorkflowRun)

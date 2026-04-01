@@ -337,3 +337,61 @@ async def test_tool_health_and_bootstrap_pick_lower_latency(tmp_path: Path) -> N
     assert len(health) >= 3
     assert any(h.ok for h in health)
     assert any(h.kind == "kubernetes" for h in health)
+
+
+async def test_incident_briefing_and_run_report_export(tmp_path: Path) -> None:
+    service = PlatformService(store_path=str(tmp_path / "platform.json"))
+
+    agent = await service.create_agent(
+        AgentCreateRequest(
+            name="Reporter Worker",
+            role="worker",
+            system_prompt="输出简洁诊断结论",
+            model="gpt-5.4-mini",
+        )
+    )
+    wf = await service.create_workflow(
+        WorkflowCreateRequest(
+            name="Report Flow",
+            objective="验证简报与报告导出",
+            start_node="collect",
+            nodes=[
+                WorkflowNode(
+                    id="collect",
+                    agent_id=agent.id,
+                    instruction="收集当前状态并输出摘要",
+                    required_permission="read",
+                    requires_approval=False,
+                    next_nodes=[],
+                )
+            ],
+        )
+    )
+    run = await service.create_run(
+        workflow_id=wf.id,
+        req=RunCreateRequest(input={"actor_permission": "read"}),
+    )
+    assert run is not None
+    status = await _wait_run(service, run.id)
+    assert status == RunStatus.completed
+
+    briefing = await service.generate_incident_briefing(workflow_id=wf.id, timeout_sec=1.5)
+    assert briefing.severity in {"low", "medium", "high", "critical"}
+    assert briefing.headline
+    assert len(briefing.recent_runs) >= 1
+    assert briefing.recommendations
+
+    report = await service.get_run_report(run.id)
+    assert report is not None
+    assert report.run_id == run.id
+    assert report.workflow_id == wf.id
+    assert report.workflow_name == wf.name
+
+    md = await service.export_run_report_markdown(run.id)
+    assert md is not None
+    assert run.id in md
+    assert wf.name in md
+    assert "# LazySRE Run Report" in md
+
+    missing_md = await service.export_run_report_markdown("missing")
+    assert missing_md is None

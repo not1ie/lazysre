@@ -322,6 +322,13 @@ button.danger {
   line-height: 1.55;
 }
 
+.briefing-log {
+  min-height: 130px;
+  max-height: 190px;
+  background: #f9fbf4;
+  border-color: rgba(251, 124, 43, 0.25);
+}
+
 .outputs-grid {
   display: grid;
   gap: 8px;

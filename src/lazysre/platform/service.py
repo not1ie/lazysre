@@ -18,6 +18,7 @@ from lazysre.platform.models import (
     AutoDesignRequest,
     EnvironmentBootstrapRequest,
     EnvironmentBootstrapResult,
+    IncidentBriefing,
     OpsToolDefinition,
     OpsToolKind,
     PlatformOverview,
@@ -27,6 +28,7 @@ from lazysre.platform.models import (
     RunApprovalRequest,
     RunCreateRequest,
     RunEvent,
+    RunReport,
     RunStatus,
     ToolCreateRequest,
     ToolHealthItem,
@@ -233,6 +235,106 @@ class PlatformService:
 
     async def get_run(self, run_id: str) -> WorkflowRun | None:
         return self._state.runs.get(run_id)
+
+    async def get_run_report(self, run_id: str) -> RunReport | None:
+        run = self._state.runs.get(run_id)
+        if not run:
+            return None
+        workflow = self._state.workflows.get(run.workflow_id)
+        return RunReport(
+            run_id=run.id,
+            workflow_id=run.workflow_id,
+            workflow_name=workflow.name if workflow else "unknown",
+            status=run.status.value,
+            created_at=run.created_at,
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            event_count=len(run.events),
+            approvals=list(run.approvals),
+            outputs=dict(run.outputs),
+            summary=run.summary,
+            error=run.error,
+        )
+
+    async def export_run_report_markdown(self, run_id: str) -> str | None:
+        report = await self.get_run_report(run_id)
+        if not report:
+            return None
+        lines = [
+            f"# LazySRE Run Report: {report.run_id}",
+            "",
+            "## Meta",
+            f"- Workflow: {report.workflow_name} ({report.workflow_id})",
+            f"- Status: {report.status}",
+            f"- Created At: {report.created_at.isoformat()}",
+            f"- Started At: {report.started_at.isoformat() if report.started_at else '-'}",
+            f"- Finished At: {report.finished_at.isoformat() if report.finished_at else '-'}",
+            f"- Event Count: {report.event_count}",
+        ]
+        if report.error:
+            lines.extend(["", "## Error", report.error])
+        if report.approvals:
+            lines.append("")
+            lines.append("## Approvals")
+            for item in report.approvals:
+                lines.append(
+                    f"- node={item.node_id} action={item.action} approver={item.approver} at={item.created_at.isoformat()} comment={item.comment or '-'}"
+                )
+        if report.outputs:
+            lines.append("")
+            lines.append("## Outputs")
+            for node_id, content in report.outputs.items():
+                lines.append("")
+                lines.append(f"### {node_id}")
+                lines.append(content[:1800])
+        if report.summary:
+            lines.extend(["", "## Summary", report.summary])
+        return "\n".join(lines)
+
+    async def generate_incident_briefing(
+        self, workflow_id: str | None = None, timeout_sec: float = 4.0
+    ) -> IncidentBriefing:
+        tools_health = await self.list_tools_health(timeout_sec=timeout_sec)
+        runs = await self.list_runs(workflow_id=workflow_id)
+        recent_runs = runs[:6]
+
+        severity = _derive_incident_severity(tools_health, recent_runs)
+        failed_tools = [t for t in tools_health if not t.ok]
+        failed_runs = [r for r in recent_runs if r.status == RunStatus.failed]
+        waiting_runs = [r for r in recent_runs if r.status == RunStatus.waiting_approval]
+
+        headline = (
+            f"[{severity}] tools_ok={len(tools_health) - len(failed_tools)}/{len(tools_health)} "
+            f"failed_runs={len(failed_runs)} waiting_approval={len(waiting_runs)}"
+        )
+
+        recommendations: list[str] = []
+        if failed_tools:
+            recommendations.append("优先修复不可达工具，避免排障链路中断（先看网络、证书与认证头）。")
+        if waiting_runs:
+            recommendations.append("存在等待审批的运行，建议 oncall 负责人尽快处理审批门。")
+        if failed_runs:
+            recommendations.append("检查最近失败 run 的 tool_failed 与 run_failed 事件，补充回滚与重试策略。")
+        if not recommendations:
+            recommendations.append("当前状态稳定，建议按班次继续巡检并导出 run 报告归档。")
+
+        run_view = [
+            {
+                "run_id": r.id,
+                "status": r.status.value,
+                "workflow_id": r.workflow_id,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in recent_runs
+        ]
+
+        return IncidentBriefing(
+            severity=severity,
+            headline=headline,
+            tool_snapshot=tools_health[:8],
+            recent_runs=run_view,
+            recommendations=recommendations,
+        )
 
     async def cancel_run(self, run_id: str) -> WorkflowRun | None:
         async with self._lock:
@@ -775,6 +877,21 @@ def _is_risky_instruction(instruction: str) -> bool:
     lowered = instruction.lower()
     risky_keywords = ("delete", "restart", "scale", "rollback", "drain", "kill", "升级")
     return any(word in lowered for word in risky_keywords)
+
+
+def _derive_incident_severity(tools: list[ToolHealthItem], runs: list[WorkflowRun]) -> str:
+    failed_tools = [t for t in tools if not t.ok]
+    failed_runs = [r for r in runs if r.status == RunStatus.failed]
+    waiting_runs = [r for r in runs if r.status == RunStatus.waiting_approval]
+
+    critical_tool_down = any(t.kind in (OpsToolKind.prometheus, OpsToolKind.kubernetes) for t in failed_tools)
+    if failed_runs and critical_tool_down:
+        return "critical"
+    if failed_runs or critical_tool_down:
+        return "high"
+    if waiting_runs or failed_tools:
+        return "medium"
+    return "low"
 
 
 def _build_monitoring_url_candidates(ip_or_url: str, port: int) -> list[str]:

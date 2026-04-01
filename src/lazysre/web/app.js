@@ -50,7 +50,10 @@ const els = {
   approvalComment: $("approval-comment"),
   approveBtn: $("approve-btn"),
   rejectBtn: $("reject-btn"),
+  generateBriefingBtn: $("generate-briefing-btn"),
+  exportReportBtn: $("export-report-btn"),
   runList: $("run-list"),
+  briefingLog: $("briefing-log"),
   eventLog: $("event-log"),
   outputsGrid: $("outputs-grid"),
   activeSummary: $("active-summary"),
@@ -95,6 +98,11 @@ function ts() {
 function log(msg) {
   els.eventLog.textContent += `${msg}\n`;
   els.eventLog.scrollTop = els.eventLog.scrollHeight;
+}
+
+function setBriefing(text) {
+  els.briefingLog.textContent = text;
+  els.briefingLog.scrollTop = 0;
 }
 
 function setSummary(text) {
@@ -306,6 +314,60 @@ async function loadRunDetail(runId) {
     startRunPoller();
   }
   return run;
+}
+
+function formatBriefing(briefing) {
+  const lines = [];
+  lines.push(`[${new Date(briefing.generated_at).toLocaleString("zh-CN")}] severity=${briefing.severity}`);
+  lines.push(briefing.headline || "");
+  lines.push("");
+  lines.push("Recommendations:");
+  for (const item of briefing.recommendations || []) {
+    lines.push(`- ${item}`);
+  }
+  lines.push("");
+  lines.push("Tool Snapshot:");
+  for (const t of briefing.tool_snapshot || []) {
+    lines.push(
+      `- ${t.name} (${t.kind}) status=${t.ok ? "ok" : "error"} latency=${t.latency_ms}ms ${
+        t.ok ? "" : `error=${t.error || "-"}`
+      }`
+    );
+  }
+  lines.push("");
+  lines.push("Recent Runs:");
+  for (const r of briefing.recent_runs || []) {
+    lines.push(`- ${r.run_id.slice(0, 8)} status=${r.status} wf=${r.workflow_id.slice(0, 8)}`);
+  }
+  return lines.join("\n");
+}
+
+async function generateBriefing() {
+  const q = state.selectedWorkflowId
+    ? `?workflow_id=${encodeURIComponent(state.selectedWorkflowId)}&timeout_sec=4`
+    : "?timeout_sec=4";
+  const briefing = await api(`/v1/platform/briefing${q}`);
+  setBriefing(formatBriefing(briefing));
+  setSummary(`故障简报已生成: severity=${briefing.severity}`);
+}
+
+async function exportRunReport() {
+  if (!state.selectedRunId) {
+    alert("请先选择 run");
+    return;
+  }
+  const content = await api(`/v1/platform/runs/${state.selectedRunId}/report?format=markdown`);
+  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const stamp = new Date().toISOString().slice(0, 19).replaceAll(":", "").replaceAll("-", "");
+  a.href = url;
+  a.download = `lazysre-run-${state.selectedRunId.slice(0, 8)}-${stamp}.md`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  setSummary(`run ${state.selectedRunId.slice(0, 8)} 报告已导出`);
 }
 
 function closeStream() {
@@ -635,6 +697,22 @@ els.refreshRuns.addEventListener("click", async () => {
   await refreshRuns();
   if (state.selectedRunId) {
     await loadRunDetail(state.selectedRunId);
+  }
+});
+
+els.generateBriefingBtn.addEventListener("click", async () => {
+  try {
+    await generateBriefing();
+  } catch (err) {
+    alert(`生成简报失败: ${err.message}`);
+  }
+});
+
+els.exportReportBtn.addEventListener("click", async () => {
+  try {
+    await exportRunReport();
+  } catch (err) {
+    alert(`导出报告失败: ${err.message}`);
   }
 });
 

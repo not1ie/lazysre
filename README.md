@@ -103,6 +103,7 @@ curl "http://127.0.0.1:8000/v1/memory/search?q=5xx&limit=5"
 ```bash
 curl http://127.0.0.1:8000/v1/platform/overview
 curl http://127.0.0.1:8000/v1/platform/templates
+curl "http://127.0.0.1:8000/v1/platform/briefing?timeout_sec=4"
 ```
 
 目标环境一键引导（推荐，自动创建/更新 Prom + K8s 工具并生成生产故障流程）：
@@ -183,6 +184,8 @@ curl -X POST http://127.0.0.1:8000/v1/platform/workflows/<workflow_id>/runs \
 ```bash
 curl http://127.0.0.1:8000/v1/platform/runs/<run_id>
 curl http://127.0.0.1:8000/v1/platform/runs/<run_id>/events
+curl "http://127.0.0.1:8000/v1/platform/runs/<run_id>/report?format=json"
+curl "http://127.0.0.1:8000/v1/platform/runs/<run_id>/report?format=markdown"
 ```
 
 实时订阅 Run 事件（SSE）：

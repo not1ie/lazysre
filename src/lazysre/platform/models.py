@@ -195,6 +195,30 @@ class EnvironmentBootstrapResult(BaseModel):
     probe_results: dict[str, str] = Field(default_factory=dict)
 
 
+class IncidentBriefing(BaseModel):
+    generated_at: datetime = Field(default_factory=utcnow)
+    severity: str
+    headline: str
+    tool_snapshot: list[ToolHealthItem] = Field(default_factory=list)
+    recent_runs: list[dict[str, str]] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+
+
+class RunReport(BaseModel):
+    run_id: str
+    workflow_id: str
+    workflow_name: str
+    status: str
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    event_count: int
+    approvals: list["RunApprovalRecord"] = Field(default_factory=list)
+    outputs: dict[str, str] = Field(default_factory=dict)
+    summary: str | None = None
+    error: str | None = None
+
+
 class RunApprovalRequest(BaseModel):
     action: str = Field(pattern="^(approve|reject)$")
     approver: str = Field(min_length=1, max_length=120)
