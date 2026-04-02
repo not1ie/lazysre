@@ -235,7 +235,27 @@ Swarm Stack 文件：
 
 - `deploy/swarm/lazysre-stack.yml`
 
-远程部署脚本（预构建镜像，推荐）：
+推荐流程（镜像仓库模式，远端只拉取）：
+
+1. 本地构建并推送镜像（默认仓库为阿里云 `lazyops/lazyopsatest`）：
+
+```bash
+./scripts/build_push_registry.sh
+```
+
+也可以显式指定 tag：
+
+```bash
+./scripts/build_push_registry.sh crpi-iihofxt94xlrdrvd.cn-shanghai.personal.cr.aliyuncs.com/lazyops/lazyopsatest 20260402120000
+```
+
+2. 远端 Swarm 拉取并部署：
+
+```bash
+./scripts/deploy_remote_swarm_registry.sh root@<swarm-manager-ip> crpi-iihofxt94xlrdrvd.cn-shanghai.personal.cr.aliyuncs.com/lazyops/lazyopsatest:<tag>
+```
+
+兼容旧流程（在远端构建镜像）：
 
 ```bash
 ./scripts/deploy_remote_swarm.sh root@<swarm-manager-ip>
@@ -243,9 +263,9 @@ Swarm Stack 文件：
 
 说明：
 
-1. 脚本会先把当前仓库源码打包上传到远端临时目录
-2. 在远端执行 `docker build` 生成镜像（默认 tag 为时间戳）
-3. 用该镜像执行 `docker stack deploy`
+1. 仓库模式下，服务端只执行 `docker pull + docker stack deploy`
+2. 远端构建模式下，脚本会上传源码并在远端 `docker build`
+3. 若镜像仓库是私有仓库，请先在本地和目标服务器执行 `docker login`
 4. 容器启动阶段不再执行在线 `pip install`
 
 默认发布端口：
