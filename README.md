@@ -60,6 +60,8 @@ lsre --provider mock "重启异常容器"
 lsre --execute --approval-mode balanced --approve --provider mock "重启异常容器"
 lsre --execute --interactive-approval --provider mock "为什么支付服务响应变慢了？"
 lsre chat --stream-output
+lsre fix "为什么支付服务响应变慢了？"
+lsre fix "为什么支付服务响应变慢了？" --apply --execute
 lsre target show
 lsre target set --prometheus-url http://92.168.69.176:9090 --k8s-api-url https://192.168.10.1:6443 --k8s-skip-tls-verify
 lsre target probe --timeout-sec 8
@@ -91,6 +93,8 @@ lsre --tool-pack locked:your_pack "执行锁定版本工具包任务"
 13. 支持流式 token 输出（`--stream-output`）和执行时间线（LLM 轮次 + 工具耗时）。
 14. 支持 `target probe` 一键检测 Prometheus/Kubernetes/Docker 连通性并输出报告。
 15. 支持 `history` 子命令管理会话历史（show/clear/export）。
+16. 支持 `fix` 自动修复模式：生成 Root Cause/Fix Plan/Apply Commands/Rollback Commands，并可 `--apply` 分步确认执行。
+17. `fix --apply --execute` 会在每一步执行前展示风险报告并等待 `y/n` 确认。
 
 ## 环境变量
 

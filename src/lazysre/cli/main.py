@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 import sys
 from pathlib import Path
 from typing import Annotated
@@ -11,9 +12,10 @@ import typer
 from lazysre.cli.audit import AuditLogger
 from lazysre.cli.dispatcher import Dispatcher
 from lazysre.cli.executor import SafeExecutor
+from lazysre.cli.fix_mode import FixPlan, compose_fix_instruction, extract_fix_plan
 from lazysre.cli.llm import MockFunctionCallingLLM, OpenAIResponsesLLM
 from lazysre.cli.permissions import ToolPermissionContext
-from lazysre.cli.policy import PolicyDecision, build_risk_report
+from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.session import SessionStore
 from lazysre.cli.target import TargetEnvStore, probe_target_environment
 from lazysre.cli.tools import build_default_registry
@@ -201,6 +203,68 @@ def chat(
         )
 
 
+@app.command("fix")
+def fix_instruction(
+    ctx: typer.Context,
+    instruction: Annotated[str, typer.Argument(help='Incident instruction, e.g. lsre fix "payment service slow"')],
+    apply: Annotated[bool, typer.Option("--apply", help="Apply suggested commands step-by-step with confirmations.")] = False,
+    max_apply_steps: Annotated[int, typer.Option("--max-apply-steps", help="Max number of suggested commands to execute.")] = 6,
+    execute: Annotated[bool | None, typer.Option("--execute", help="Override execution mode for apply steps.")] = None,
+    approve: Annotated[bool | None, typer.Option("--approve", help="Override approval gate acknowledgement for diagnosis phase.")] = None,
+    interactive_approval: Annotated[bool | None, typer.Option("--interactive-approval/--no-interactive-approval", help="Override interactive approval prompt for diagnosis phase.")] = None,
+    stream_output: Annotated[bool | None, typer.Option("--stream-output/--no-stream-output", help="Override token streaming mode.")] = None,
+    approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
+    audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
+    lock_file: Annotated[str | None, typer.Option(help="Override tool pack lock file path.")] = None,
+    session_file: Annotated[str | None, typer.Option(help="Override session memory file path.")] = None,
+    deny_tool: Annotated[list[str] | None, typer.Option("--deny-tool", help="Override deny tool names.")] = None,
+    deny_prefix: Annotated[list[str] | None, typer.Option("--deny-prefix", help="Override deny tool prefixes.")] = None,
+    tool_pack: Annotated[list[str] | None, typer.Option("--tool-pack", help="Override tool packs.")] = None,
+    remote_gateway: Annotated[list[str] | None, typer.Option("--remote-gateway", help="Override remote gateways.")] = None,
+    model: Annotated[str | None, typer.Option(help="Override model.")] = None,
+    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+    max_steps: Annotated[int | None, typer.Option(help="Override max function-calling iterations.")] = None,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=execute,
+        approve=approve,
+        interactive_approval=interactive_approval,
+        stream_output=stream_output,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        lock_file=lock_file,
+        session_file=session_file,
+        deny_tool=deny_tool,
+        deny_prefix=deny_prefix,
+        tool_pack=tool_pack,
+        remote_gateway=remote_gateway,
+        model=model,
+        provider=provider,
+        max_steps=max_steps,
+    )
+    _run_fix(
+        instruction=instruction,
+        apply=apply,
+        max_apply_steps=max(1, min(max_apply_steps, 30)),
+        execute=bool(options["execute"]),
+        approve=bool(options["approve"]),
+        interactive_approval=bool(options["interactive_approval"]),
+        stream_output=bool(options["stream_output"]),
+        approval_mode=str(options["approval_mode"]),
+        audit_log=str(options["audit_log"]),
+        lock_file=str(options["lock_file"]),
+        session_file=str(options["session_file"]),
+        deny_tool=list(options["deny_tool"]),
+        deny_prefix=list(options["deny_prefix"]),
+        tool_pack=list(options["tool_pack"]),
+        remote_gateway=list(options["remote_gateway"]),
+        model=str(options["model"]),
+        provider=str(options["provider"]),
+        max_steps=int(options["max_steps"]),
+    )
+
+
 def _merged_options(
     ctx: typer.Context,
     *,
@@ -377,6 +441,138 @@ def _run_once(
             _console.print(result.final_text)
     else:
         typer.echo(result.final_text)
+
+
+def _run_fix(
+    *,
+    instruction: str,
+    apply: bool,
+    max_apply_steps: int,
+    execute: bool,
+    approve: bool,
+    interactive_approval: bool,
+    stream_output: bool,
+    approval_mode: str,
+    audit_log: str,
+    lock_file: str,
+    session_file: str,
+    deny_tool: list[str],
+    deny_prefix: list[str],
+    tool_pack: list[str],
+    remote_gateway: list[str],
+    model: str,
+    provider: str,
+    max_steps: int,
+) -> None:
+    session = SessionStore(Path(session_file))
+    session_hint = session.build_context_hint(instruction)
+    prompt = compose_fix_instruction(instruction)
+    if session_hint:
+        prompt = f"{prompt}\n\n[session]\n{session_hint}"
+
+    streamed_chunks: list[str] = []
+    stream_enabled = bool(_console and stream_output)
+
+    def _stream_text(delta: str) -> None:
+        if not _console:
+            return
+        streamed_chunks.append(delta)
+        _console.print(delta, end="")
+
+    if _console and (not stream_enabled):
+        with _console.status("[bold cyan]AI 生成修复计划中...[/]"):
+            result = asyncio.run(
+                _dispatch(
+                    instruction=prompt,
+                    execute=execute,
+                    approve=approve,
+                    interactive_approval=interactive_approval,
+                    approval_mode=approval_mode,
+                    audit_log=audit_log,
+                    lock_file=lock_file,
+                    deny_tool=deny_tool,
+                    deny_prefix=deny_prefix,
+                    tool_pack=tool_pack,
+                    remote_gateway=remote_gateway,
+                    model=model,
+                    provider=provider,
+                    max_steps=max_steps,
+                    text_stream=None,
+                )
+            )
+    else:
+        result = asyncio.run(
+            _dispatch(
+                instruction=prompt,
+                execute=execute,
+                approve=approve,
+                interactive_approval=interactive_approval,
+                approval_mode=approval_mode,
+                audit_log=audit_log,
+                lock_file=lock_file,
+                deny_tool=deny_tool,
+                deny_prefix=deny_prefix,
+                tool_pack=tool_pack,
+                remote_gateway=remote_gateway,
+                model=model,
+                provider=provider,
+                max_steps=max_steps,
+                text_stream=_stream_text if stream_enabled else None,
+            )
+        )
+    if _console and streamed_chunks:
+        _console.print("")
+    session.append_turn(user_input=f"[fix] {instruction}", result=result)
+
+    if _console:
+        _render_timeline(result.events)
+        if Markdown and (not streamed_chunks):
+            _console.print(Panel(Markdown(result.final_text), title="Fix Plan", border_style="magenta"))
+        elif (not streamed_chunks):
+            _console.print(result.final_text)
+    else:
+        typer.echo(result.final_text)
+
+    plan = extract_fix_plan(result.final_text)
+    _render_fix_summary(plan, max_apply_steps=max_apply_steps)
+
+    if not apply:
+        typer.echo("计划已生成。若需分步执行，请加 --apply。")
+        return
+    if not plan.apply_commands:
+        typer.echo("未从计划中识别到可执行命令，已跳过执行。")
+        return
+
+    executor = SafeExecutor(
+        dry_run=(not execute),
+        approval_mode=approval_mode,
+        approval_granted=True,  # step-level y/n confirmation already enforced below
+        audit_logger=AuditLogger(Path(audit_log)),
+    )
+    selected = plan.apply_commands[:max_apply_steps]
+    total = len(selected)
+    for idx, command_text in enumerate(selected, 1):
+        try:
+            command = shlex.split(command_text)
+        except ValueError as exc:
+            typer.echo(f"[step {idx}/{total}] 无法解析命令，跳过: {command_text} ({exc})")
+            continue
+        if not command:
+            continue
+        decision = assess_command(command, approval_mode=approval_mode)
+        report = build_risk_report(command, decision)
+        _render_step_risk(idx, total, command_text, report)
+        if not typer.confirm(f"[step {idx}/{total}] 是否执行该步骤？", default=False):
+            continue
+        result_exec = asyncio.run(executor.run(command))
+        _render_step_result(idx, total, result_exec)
+        if (not result_exec.ok) and (not typer.confirm("步骤失败，是否继续后续步骤？", default=False)):
+            break
+
+    if plan.rollback_commands:
+        typer.echo("\n可回滚命令：")
+        for cmd in plan.rollback_commands:
+            typer.echo(f"- {cmd}")
 
 
 async def _dispatch(
@@ -738,6 +934,69 @@ def _render_probe_report(report: dict[str, object]) -> None:
     _console.print(table)
 
 
+def _render_fix_summary(plan: FixPlan, *, max_apply_steps: int) -> None:
+    apply_preview = plan.apply_commands[:max_apply_steps]
+    if _console and Table:
+        table = Table(title="Fix Commands")
+        table.add_column("#", style="cyan", no_wrap=True)
+        table.add_column("Apply", style="white")
+        table.add_column("Rollback", style="green")
+        length = max(len(apply_preview), len(plan.rollback_commands), 1)
+        for idx in range(length):
+            apply = apply_preview[idx] if idx < len(apply_preview) else ""
+            rollback = plan.rollback_commands[idx] if idx < len(plan.rollback_commands) else ""
+            table.add_row(str(idx + 1), apply, rollback)
+        _console.print(table)
+        return
+    typer.echo("Apply commands:")
+    for cmd in apply_preview:
+        typer.echo(f"- {cmd}")
+    if plan.rollback_commands:
+        typer.echo("Rollback commands:")
+        for cmd in plan.rollback_commands:
+            typer.echo(f"- {cmd}")
+
+
+def _render_step_risk(
+    step_index: int,
+    total_steps: int,
+    command_text: str,
+    risk_report: dict[str, object],
+) -> None:
+    lines = [
+        f"Step {step_index}/{total_steps}",
+        f"- 命令: {command_text}",
+        f"- 风险等级: {risk_report.get('risk_level', '-')}",
+        f"- 风险分值: {risk_report.get('risk_score', '-')}",
+        f"- 影响范围: {risk_report.get('impact_scope', '-')}",
+        f"- 爆炸半径: {risk_report.get('blast_radius', '-')}",
+        f"- 回滚建议: {risk_report.get('rollback', '-')}",
+    ]
+    text = "\n".join(lines)
+    if _console and Panel:
+        _console.print(Panel(text, border_style="yellow"))
+    else:
+        typer.echo(text)
+
+
+def _render_step_result(step_index: int, total_steps: int, result) -> None:
+    status = "ok" if result.ok else "failed"
+    lines = [
+        f"Step {step_index}/{total_steps} result: {status}",
+        f"- exit_code: {result.exit_code}",
+    ]
+    if result.stdout.strip():
+        lines.append(f"- stdout: {result.stdout[:300]}")
+    if result.stderr.strip():
+        lines.append(f"- stderr: {result.stderr[:300]}")
+    text = "\n".join(lines)
+    if _console and Panel:
+        border = "green" if result.ok else "red"
+        _console.print(Panel(text, border_style=border))
+    else:
+        typer.echo(text)
+
+
 def _resolve_session_file(ctx: typer.Context, session_file: str | None) -> Path:
     if session_file and session_file.strip():
         return Path(session_file)
@@ -754,7 +1013,7 @@ def main() -> None:
 def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     if len(argv) <= 1:
         return
-    commands = {"run", "chat", "pack", "target", "history", "--help", "-h"}
+    commands = {"run", "chat", "fix", "pack", "target", "history", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",

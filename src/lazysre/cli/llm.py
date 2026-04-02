@@ -129,14 +129,16 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
             )
 
         if previous_response_id == "mock-react-2" and tool_outputs:
-            lines = [f"[mock:{model}] 初步诊断完成："]
+            lines = [f"[mock:{model}] 初步诊断完成：", "", "## Root Cause", "payment 服务实例可能出现抖动或资源争抢。", "", "## Fix Plan", "1. 重启 payment 部署滚动恢复。", "2. 持续观察 pods 与错误日志。", "", "## Apply Commands", "```bash"]
             for item in tool_outputs:
-                lines.append(f"- call={item.call_id}: {item.output[:200]}")
-            lines.append("")
-            lines.append("建议先在 dry-run 校验以下修复命令：")
-            lines.append("```bash")
+                lines.append(f"# call={item.call_id}: {item.output[:120]}")
             lines.append("kubectl -n default rollout restart deploy/payment")
             lines.append("kubectl -n default get pods -l app=payment -w")
+            lines.append("```")
+            lines.append("")
+            lines.append("## Rollback Commands")
+            lines.append("```bash")
+            lines.append("kubectl -n default rollout undo deploy/payment")
             lines.append("```")
             rendered = "\n".join(lines)
             if text_stream:
@@ -145,9 +147,28 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
             return LLMTurn(response_id="mock-final", text=rendered, tool_calls=[])
 
         if previous_response_id and tool_outputs:
-            lines = [f"[mock:{model}] 工具执行结果汇总："]
+            lines = [
+                f"[mock:{model}] 工具执行结果汇总：",
+                "",
+                "## Root Cause",
+                "需结合工具结果进一步确认。",
+                "",
+                "## Fix Plan",
+                "1. 先按建议命令进行安全修复。",
+                "",
+                "## Apply Commands",
+                "```bash",
+            ]
             for item in tool_outputs:
-                lines.append(f"- call={item.call_id}: {item.output[:220]}")
+                lines.append(f"# call={item.call_id}: {item.output[:120]}")
+            lines.append("kubectl get pods -A")
+            lines.append("```")
+            lines.append("")
+            lines.append("## Rollback Commands")
+            lines.append("```bash")
+            lines.append("# no-op")
+            lines.append("```")
+            lines.append("")
             lines.append("建议：先 dry-run 验证，再执行线上动作。")
             rendered = "\n".join(lines)
             if text_stream:

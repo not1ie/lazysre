@@ -35,3 +35,9 @@ def test_rewrite_argv_preserves_history_subcommand() -> None:
     argv = ["lsre", "history", "show", "--limit", "5"]
     _rewrite_argv_for_default_run(argv)
     assert argv == ["lsre", "history", "show", "--limit", "5"]
+
+
+def test_rewrite_argv_preserves_fix_subcommand() -> None:
+    argv = ["lsre", "fix", "支付服务变慢", "--apply"]
+    _rewrite_argv_for_default_run(argv)
+    assert argv == ["lsre", "fix", "支付服务变慢", "--apply"]
