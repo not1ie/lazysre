@@ -344,6 +344,14 @@ Swarm Stack 文件：
 ./scripts/build_push_cli_registry.sh crpi-iihofxt94xlrdrvd.cn-shanghai.personal.cr.aliyuncs.com/lazyops/lazyopsatest cli-20260402180000
 ```
 
+## 联系方式
+
+有工作推荐请联系：`slpsz1774190386@gmail.com`
+
+微信二维码：
+
+![微信二维码](https://raw.githubusercontent.com/not1ie/lazy_aiops/main/docs/wechat-qrcode.png)
+
 ## 下一步建议
 
 1. 接入真实 SRE 工具（K8s、Prometheus、日志系统）
