@@ -1,0 +1,2 @@
+"""LazySRE CLI package."""
+
