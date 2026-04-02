@@ -18,6 +18,7 @@ LazySRE 是一个纯 AI 驱动的 SRE/运维 CLI 工具。
 
 ```bash
 # 对话与诊断
+lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 
@@ -39,6 +40,9 @@ lsre target probe --json
 lsre history show --limit 10
 lsre history export --output .data/lsre-session-history.md
 ```
+
+说明：直接运行 `lsre` 会进入自然语言助手模式。  
+在对话中你可以直接说“修复 xxx”来生成计划，说“执行修复计划”来执行最近一次修复计划。
 
 ## 联系方式
 

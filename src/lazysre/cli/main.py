@@ -52,7 +52,7 @@ app = typer.Typer(
     name="lsre",
     help="LazySRE AI-native CLI for operations workflows.",
     add_completion=False,
-    no_args_is_help=True,
+    no_args_is_help=False,
 )
 pack_app = typer.Typer(help="Tool pack marketplace and lock management.")
 target_app = typer.Typer(help="Target environment profile management.")
@@ -95,6 +95,27 @@ def root(
         "provider": provider,
         "max_steps": max(1, min(max_steps, 12)),
     }
+    if ctx.invoked_subcommand is None and len(sys.argv) <= 1:
+        options = _merged_options(
+            ctx,
+            execute=None,
+            approve=None,
+            interactive_approval=None,
+            stream_output=None,
+            approval_mode=None,
+            audit_log=None,
+            lock_file=None,
+            session_file=None,
+            deny_tool=None,
+            deny_prefix=None,
+            tool_pack=None,
+            remote_gateway=None,
+            model=None,
+            provider=None,
+            max_steps=None,
+        )
+        _assistant_chat_loop(options)
+        raise typer.Exit()
 
 
 @app.command("run")
@@ -177,36 +198,7 @@ def chat(
         provider=provider,
         max_steps=max_steps,
     )
-    typer.echo("LazySRE chat started. Type 'exit' or 'quit' to leave.")
-    while True:
-        try:
-            line = typer.prompt("lsre")
-        except (EOFError, KeyboardInterrupt):
-            typer.echo("")
-            break
-        text = line.strip()
-        if not text:
-            continue
-        if text.lower() in {"exit", "quit"}:
-            break
-        _run_once(
-            instruction=text,
-            execute=bool(options["execute"]),
-            approve=bool(options["approve"]),
-            interactive_approval=bool(options["interactive_approval"]),
-            stream_output=bool(options["stream_output"]),
-            approval_mode=str(options["approval_mode"]),
-            audit_log=str(options["audit_log"]),
-            lock_file=str(options["lock_file"]),
-            session_file=str(options["session_file"]),
-            deny_tool=list(options["deny_tool"]),
-            deny_prefix=list(options["deny_prefix"]),
-            tool_pack=list(options["tool_pack"]),
-            remote_gateway=list(options["remote_gateway"]),
-            model=str(options["model"]),
-            provider=str(options["provider"]),
-            max_steps=int(options["max_steps"]),
-        )
+    _assistant_chat_loop(options)
 
 
 @app.command("fix")
@@ -576,46 +568,15 @@ def _run_fix(
         typer.echo("未从计划中识别到可执行命令，已跳过执行。")
         return
 
-    executor = SafeExecutor(
-        dry_run=(not execute),
+    _execute_fix_plan_steps(
+        plan=plan,
+        max_apply_steps=max_apply_steps,
+        execute=execute,
         approval_mode=approval_mode,
-        approval_granted=True,  # step-level y/n confirmation already enforced below
-        audit_logger=AuditLogger(Path(audit_log)),
+        audit_log=audit_log,
+        allow_high_risk=allow_high_risk,
+        auto_approve_low_risk=auto_approve_low_risk,
     )
-    selected = selected_preview
-    total = len(selected)
-    skipped_high_risk = 0
-    for idx, command_text in enumerate(selected, 1):
-        try:
-            command = shlex.split(command_text)
-        except ValueError as exc:
-            typer.echo(f"[step {idx}/{total}] 无法解析命令，跳过: {command_text} ({exc})")
-            continue
-        if not command:
-            continue
-        decision = assess_command(command, approval_mode=approval_mode)
-        report = build_risk_report(command, decision)
-        _render_step_risk(idx, total, command_text, report)
-        allow_execute, need_confirm = evaluate_apply_guardrail(
-            risk_level=str(report.get("risk_level", "low")),
-            allow_high_risk=allow_high_risk,
-            auto_approve_low_risk=auto_approve_low_risk,
-        )
-        if not allow_execute:
-            skipped_high_risk += 1
-            typer.echo(f"[step {idx}/{total}] 已跳过高风险步骤（如需执行请加 --allow-high-risk）")
-            continue
-        if need_confirm and (not typer.confirm(f"[step {idx}/{total}] 是否执行该步骤？", default=False)):
-            continue
-        if (not need_confirm) and auto_approve_low_risk:
-            typer.echo(f"[step {idx}/{total}] low-risk 自动通过确认")
-        result_exec = asyncio.run(executor.run(command))
-        _render_step_result(idx, total, result_exec)
-        if (not result_exec.ok) and (not typer.confirm("步骤失败，是否继续后续步骤？", default=False)):
-            break
-
-    if skipped_high_risk:
-        typer.echo(f"共跳过 {skipped_high_risk} 个高风险步骤。")
 
     if plan.rollback_commands:
         typer.echo("\n可回滚命令：")
@@ -1043,6 +1004,212 @@ def _render_step_result(step_index: int, total_steps: int, result) -> None:
         _console.print(Panel(text, border_style=border))
     else:
         typer.echo(text)
+
+
+def _assistant_chat_loop(options: dict[str, object]) -> None:
+    typer.echo("LazySRE 自然语言助手已启动。直接输入问题即可，输入 exit/quit 退出。")
+    typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
+    while True:
+        try:
+            line = typer.prompt("lsre")
+        except (EOFError, KeyboardInterrupt):
+            typer.echo("")
+            break
+        text = line.strip()
+        if not text:
+            continue
+        if text.lower() in {"exit", "quit"}:
+            break
+
+        if _looks_like_apply_request(text):
+            _apply_last_fix_plan(
+                max_apply_steps=6,
+                execute=bool(options["execute"]),
+                approval_mode=str(options["approval_mode"]),
+                audit_log=str(options["audit_log"]),
+            )
+            continue
+
+        if _looks_like_fix_request(text):
+            _run_fix(
+                instruction=text,
+                apply=False,
+                max_apply_steps=6,
+                allow_high_risk=False,
+                auto_approve_low_risk=False,
+                export_plan_md="",
+                export_plan_json="",
+                execute=bool(options["execute"]),
+                approve=bool(options["approve"]),
+                interactive_approval=bool(options["interactive_approval"]),
+                stream_output=bool(options["stream_output"]),
+                approval_mode=str(options["approval_mode"]),
+                audit_log=str(options["audit_log"]),
+                lock_file=str(options["lock_file"]),
+                session_file=str(options["session_file"]),
+                deny_tool=list(options["deny_tool"]),
+                deny_prefix=list(options["deny_prefix"]),
+                tool_pack=list(options["tool_pack"]),
+                remote_gateway=list(options["remote_gateway"]),
+                model=str(options["model"]),
+                provider=str(options["provider"]),
+                max_steps=int(options["max_steps"]),
+            )
+            continue
+
+        _run_once(
+            instruction=text,
+            execute=bool(options["execute"]),
+            approve=bool(options["approve"]),
+            interactive_approval=bool(options["interactive_approval"]),
+            stream_output=bool(options["stream_output"]),
+            approval_mode=str(options["approval_mode"]),
+            audit_log=str(options["audit_log"]),
+            lock_file=str(options["lock_file"]),
+            session_file=str(options["session_file"]),
+            deny_tool=list(options["deny_tool"]),
+            deny_prefix=list(options["deny_prefix"]),
+            tool_pack=list(options["tool_pack"]),
+            remote_gateway=list(options["remote_gateway"]),
+            model=str(options["model"]),
+            provider=str(options["provider"]),
+            max_steps=int(options["max_steps"]),
+        )
+
+
+def _execute_fix_plan_steps(
+    *,
+    plan: FixPlan,
+    max_apply_steps: int,
+    execute: bool,
+    approval_mode: str,
+    audit_log: str,
+    allow_high_risk: bool,
+    auto_approve_low_risk: bool,
+) -> None:
+    executor = SafeExecutor(
+        dry_run=(not execute),
+        approval_mode=approval_mode,
+        approval_granted=True,  # step-level y/n confirmation already enforced below
+        audit_logger=AuditLogger(Path(audit_log)),
+    )
+    selected = plan.apply_commands[:max_apply_steps]
+    total = len(selected)
+    skipped_high_risk = 0
+    for idx, command_text in enumerate(selected, 1):
+        try:
+            command = shlex.split(command_text)
+        except ValueError as exc:
+            typer.echo(f"[step {idx}/{total}] 无法解析命令，跳过: {command_text} ({exc})")
+            continue
+        if not command:
+            continue
+        decision = assess_command(command, approval_mode=approval_mode)
+        report = build_risk_report(command, decision)
+        _render_step_risk(idx, total, command_text, report)
+        allow_execute, need_confirm = evaluate_apply_guardrail(
+            risk_level=str(report.get("risk_level", "low")),
+            allow_high_risk=allow_high_risk,
+            auto_approve_low_risk=auto_approve_low_risk,
+        )
+        if not allow_execute:
+            skipped_high_risk += 1
+            typer.echo(f"[step {idx}/{total}] 已跳过高风险步骤（如需执行请加 --allow-high-risk）")
+            continue
+        if need_confirm and (not typer.confirm(f"[step {idx}/{total}] 是否执行该步骤？", default=False)):
+            continue
+        if (not need_confirm) and auto_approve_low_risk:
+            typer.echo(f"[step {idx}/{total}] low-risk 自动通过确认")
+        result_exec = asyncio.run(executor.run(command))
+        _render_step_result(idx, total, result_exec)
+        if (not result_exec.ok) and (not typer.confirm("步骤失败，是否继续后续步骤？", default=False)):
+            break
+    if skipped_high_risk:
+        typer.echo(f"共跳过 {skipped_high_risk} 个高风险步骤。")
+
+
+def _apply_last_fix_plan(
+    *,
+    max_apply_steps: int,
+    execute: bool,
+    approval_mode: str,
+    audit_log: str,
+) -> None:
+    path = Path(".data/lsre-fix-last.json")
+    if not path.exists():
+        typer.echo("未找到最近修复计划（.data/lsre-fix-last.json）。先说“修复 xxx”生成计划。")
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        typer.echo("最近修复计划文件损坏，无法读取。")
+        return
+    if not isinstance(payload, dict):
+        typer.echo("最近修复计划格式无效。")
+        return
+    plan_obj = payload.get("plan", {})
+    if not isinstance(plan_obj, dict):
+        typer.echo("最近修复计划缺少 plan 字段。")
+        return
+    selected = payload.get("selected_apply_commands", [])
+    if not isinstance(selected, list):
+        selected = []
+    apply_commands = [str(x).strip() for x in selected if str(x).strip()]
+    if not apply_commands:
+        apply_commands = [str(x).strip() for x in plan_obj.get("apply_commands", []) if str(x).strip()]
+    rollback_commands = [str(x).strip() for x in plan_obj.get("rollback_commands", []) if str(x).strip()]
+    plan = FixPlan(apply_commands=apply_commands, rollback_commands=rollback_commands)
+    if not plan.apply_commands:
+        typer.echo("最近修复计划没有可执行命令。")
+        return
+    _render_fix_summary(plan, max_apply_steps=max_apply_steps)
+    _execute_fix_plan_steps(
+        plan=plan,
+        max_apply_steps=max_apply_steps,
+        execute=execute,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        allow_high_risk=False,
+        auto_approve_low_risk=False,
+    )
+    if plan.rollback_commands:
+        typer.echo("\n可回滚命令：")
+        for cmd in plan.rollback_commands:
+            typer.echo(f"- {cmd}")
+
+
+def _looks_like_fix_request(text: str) -> bool:
+    lowered = text.lower()
+    if _looks_like_apply_request(text):
+        return False
+    return any(
+        keyword in lowered
+        for keyword in [
+            "fix",
+            "repair",
+            "recover",
+            "mitigate",
+            "修复",
+            "恢复",
+            "缓解",
+            "处理故障",
+        ]
+    )
+
+
+def _looks_like_apply_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(
+        keyword in lowered
+        for keyword in [
+            "执行修复计划",
+            "应用修复计划",
+            "执行刚才修复",
+            "执行计划",
+            "apply plan",
+            "apply fix",
+        ]
+    )
 
 
 def _write_text_file(path: Path, content: str) -> None:

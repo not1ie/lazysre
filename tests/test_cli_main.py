@@ -1,4 +1,8 @@
-from lazysre.cli.main import _rewrite_argv_for_default_run
+from lazysre.cli.main import (
+    _looks_like_apply_request,
+    _looks_like_fix_request,
+    _rewrite_argv_for_default_run,
+)
 
 
 def test_rewrite_argv_default_run_simple_instruction() -> None:
@@ -41,3 +45,11 @@ def test_rewrite_argv_preserves_fix_subcommand() -> None:
     argv = ["lsre", "fix", "支付服务变慢", "--apply"]
     _rewrite_argv_for_default_run(argv)
     assert argv == ["lsre", "fix", "支付服务变慢", "--apply"]
+
+
+def test_detect_fix_and_apply_intent() -> None:
+    assert _looks_like_fix_request("请帮我修复支付服务")
+    assert _looks_like_fix_request("fix payment service latency")
+    assert _looks_like_apply_request("执行修复计划")
+    assert _looks_like_apply_request("apply fix")
+    assert _looks_like_fix_request("执行修复计划") is False
