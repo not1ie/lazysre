@@ -53,6 +53,13 @@ class SafeExecutor:
             return None, result, approved
 
         decision = assess_command(command, approval_mode=self.approval_mode)
+        destructive = _contains_destructive_action(command)
+        if destructive:
+            decision.requires_approval = True
+            if decision.risk_level in {"low", "medium"}:
+                decision.risk_level = "high"
+            if "destructive keyword detected, force confirm mode" not in decision.reasons:
+                decision.reasons.append("destructive keyword detected, force confirm mode")
         risk_report = build_risk_report(command, decision)
         if decision.blocked:
             result = ExecResult(
@@ -72,7 +79,7 @@ class SafeExecutor:
             return decision, result, approved
 
         if (not self.dry_run) and (not approved):
-            interactive_gate = decision.risk_level in {"high", "critical"}
+            interactive_gate = decision.risk_level in {"high", "critical"} or destructive
             if interactive_gate and self.approval_callback:
                 if self.approval_callback(safe_command, decision):
                     approved = True
@@ -231,3 +238,21 @@ def _sanitize_command(command: list[str]) -> list[str]:
         out.append(token)
         idx += 1
     return out
+
+
+def _contains_destructive_action(command: list[str]) -> bool:
+    if not command:
+        return False
+    text = " ".join(command).lower()
+    keywords = [
+        " delete ",
+        " patch ",
+        " restart ",
+        " scale ",
+        " rollout restart",
+        " rm ",
+        " rmi ",
+        " prune",
+    ]
+    padded = f" {text} "
+    return any(key in padded for key in keywords)

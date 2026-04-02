@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 
+from lazysre.cli.context_window import ContextWindowManager
 from lazysre.cli.executor import SafeExecutor
 from lazysre.cli.llm import FunctionCallingLLM
 from lazysre.cli.registry import ToolRegistry
@@ -18,6 +20,7 @@ class Dispatcher:
     model: str
     max_steps: int = 6
     text_stream: Callable[[str], None] | None = None
+    context_window: ContextWindowManager = field(default_factory=ContextWindowManager)
     system_prompt: str = (
         "You are LazySRE CLI orchestrator with ReAct behavior. "
         "When user asks incident/root-cause questions, do not guess. "
@@ -70,6 +73,7 @@ class Dispatcher:
                 return DispatchResult(final_text=final_text, events=events)
 
             outputs: list[ToolOutput] = []
+            failed_calls: list[str] = []
             for call in turn.tool_calls:
                 events.append(
                     DispatchEvent(
@@ -80,14 +84,17 @@ class Dispatcher:
                 )
                 tool_start = perf_counter()
                 output = await self.registry.execute(call, self.executor)
-                outputs.append(ToolOutput(call_id=call.call_id, output=output))
+                compact = self.context_window.fit_tool_output_json(output)
+                outputs.append(ToolOutput(call_id=call.call_id, output=compact))
+                if _tool_output_failed(compact):
+                    failed_calls.append(call.name)
                 events.append(
                     DispatchEvent(
                         kind="tool_output",
                         message=f"{call.name} returned",
                         data={
                             "call_id": call.call_id,
-                            "output_preview": output[:220],
+                            "output_preview": compact[:220],
                             "duration_ms": round((perf_counter() - tool_start) * 1000, 2),
                             "step": step,
                         },
@@ -107,9 +114,33 @@ class Dispatcher:
                 DispatchEvent(
                     kind="llm_turn",
                     message=f"step_{step}_followup",
-                    data={"duration_ms": round((perf_counter() - llm_step_start) * 1000, 2)},
+                data={"duration_ms": round((perf_counter() - llm_step_start) * 1000, 2)},
                 )
             )
+            if failed_calls and (not turn.tool_calls) and (step < self.max_steps):
+                retry_hint = (
+                    "Tool errors detected for calls: "
+                    + ", ".join(failed_calls[:6])
+                    + ". Retry with alternative tools/commands and continue OODA loop."
+                )
+                retry_start = perf_counter()
+                turn = await self.llm.respond(
+                    model=self.model,
+                    tools=specs,
+                    system_prompt=self.system_prompt,
+                    user_input=retry_hint,
+                    text_stream=self.text_stream,
+                )
+                events.append(
+                    DispatchEvent(
+                        kind="auto_retry",
+                        message="tool_error_retry",
+                        data={
+                            "failed_calls": failed_calls[:6],
+                            "duration_ms": round((perf_counter() - retry_start) * 1000, 2),
+                        },
+                    )
+                )
 
         fallback = (
             turn.text.strip()
@@ -118,3 +149,14 @@ class Dispatcher:
         )
         events.append(DispatchEvent(kind="max_steps", message=f"max_steps={self.max_steps}"))
         return DispatchResult(final_text=fallback, events=events)
+
+
+def _tool_output_failed(raw_output: str) -> bool:
+    try:
+        payload = json.loads(raw_output)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    ok = payload.get("ok")
+    return bool(ok is False)

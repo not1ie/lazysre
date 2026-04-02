@@ -10,6 +10,8 @@ from typing import Annotated
 import typer
 
 from lazysre.cli.audit import AuditLogger
+from lazysre.cli.brain import BrainContext
+from lazysre.cli.context_window import ContextWindowManager
 from lazysre.cli.dispatcher import Dispatcher
 from lazysre.cli.executor import SafeExecutor
 from lazysre.cli.fix_mode import (
@@ -23,6 +25,7 @@ from lazysre.cli.llm import MockFunctionCallingLLM, OpenAIResponsesLLM
 from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.session import SessionStore
+from lazysre.cli.memory import IncidentMemoryStore, format_memory_context
 from lazysre.cli.target import TargetEnvStore, probe_target_environment
 from lazysre.cli.tools import build_default_registry
 from lazysre.cli.tools.marketplace import (
@@ -95,7 +98,7 @@ def root(
         "provider": provider,
         "max_steps": max(1, min(max_steps, 12)),
     }
-    if ctx.invoked_subcommand is None and len(sys.argv) <= 1:
+    if ctx.invoked_subcommand is None and _should_launch_assistant(sys.argv[1:]):
         options = _merged_options(
             ctx,
             execute=None,
@@ -373,11 +376,19 @@ def _run_once(
     provider: str,
     max_steps: int,
 ) -> None:
+    context_window = ContextWindowManager()
     session = SessionStore(Path(session_file))
     session_hint = session.build_context_hint(instruction)
+    dialogue_context = session.build_dialogue_context(max_chars=2200)
+    memory_context = _build_memory_context(instruction)
     prompt = instruction
     if session_hint:
         prompt = f"{instruction}\n\n[session]\n{session_hint}"
+    if dialogue_context:
+        prompt = f"{prompt}\n\n[dialogue]\n{dialogue_context}"
+    if memory_context:
+        prompt = f"{prompt}\n\n[memory]\n{memory_context}"
+    prompt = context_window.fit_text(prompt, max_chars=9000)
 
     streamed_chunks: list[str] = []
     stream_enabled = bool(_console and stream_output)
@@ -398,16 +409,18 @@ def _run_once(
                     interactive_approval=interactive_approval,
                     approval_mode=approval_mode,
                     audit_log=audit_log,
-                    lock_file=lock_file,
-                    deny_tool=deny_tool,
-                    deny_prefix=deny_prefix,
-                    tool_pack=tool_pack,
-                    remote_gateway=remote_gateway,
-                    model=model,
-                    provider=provider,
-                    max_steps=max_steps,
-                    text_stream=None,
-                )
+                lock_file=lock_file,
+                deny_tool=deny_tool,
+                deny_prefix=deny_prefix,
+                tool_pack=tool_pack,
+                remote_gateway=remote_gateway,
+                model=model,
+                provider=provider,
+                max_steps=max_steps,
+                text_stream=None,
+                conversation_context=dialogue_context,
+                memory_context=memory_context,
+            )
             )
     else:
         result = asyncio.run(
@@ -427,6 +440,8 @@ def _run_once(
                 provider=provider,
                 max_steps=max_steps,
                 text_stream=_stream_text if stream_enabled else None,
+                conversation_context=dialogue_context,
+                memory_context=memory_context,
             )
         )
     if _console and streamed_chunks:
@@ -474,11 +489,19 @@ def _run_fix(
     provider: str,
     max_steps: int,
 ) -> None:
+    context_window = ContextWindowManager()
     session = SessionStore(Path(session_file))
     session_hint = session.build_context_hint(instruction)
+    dialogue_context = session.build_dialogue_context(max_chars=2200)
+    memory_context = _build_memory_context(instruction)
     prompt = compose_fix_instruction(instruction)
     if session_hint:
         prompt = f"{prompt}\n\n[session]\n{session_hint}"
+    if dialogue_context:
+        prompt = f"{prompt}\n\n[dialogue]\n{dialogue_context}"
+    if memory_context:
+        prompt = f"{prompt}\n\n[memory]\n{memory_context}"
+    prompt = context_window.fit_text(prompt, max_chars=9500)
 
     streamed_chunks: list[str] = []
     stream_enabled = bool(_console and stream_output)
@@ -508,6 +531,8 @@ def _run_fix(
                     provider=provider,
                     max_steps=max_steps,
                     text_stream=None,
+                    conversation_context=dialogue_context,
+                    memory_context=memory_context,
                 )
             )
     else:
@@ -528,6 +553,8 @@ def _run_fix(
                 provider=provider,
                 max_steps=max_steps,
                 text_stream=_stream_text if stream_enabled else None,
+                conversation_context=dialogue_context,
+                memory_context=memory_context,
             )
         )
     if _console and streamed_chunks:
@@ -568,7 +595,7 @@ def _run_fix(
         typer.echo("未从计划中识别到可执行命令，已跳过执行。")
         return
 
-    _execute_fix_plan_steps(
+    exec_summary = _execute_fix_plan_steps(
         plan=plan,
         max_apply_steps=max_apply_steps,
         execute=execute,
@@ -576,6 +603,18 @@ def _run_fix(
         audit_log=audit_log,
         allow_high_risk=allow_high_risk,
         auto_approve_low_risk=auto_approve_low_risk,
+        model=model,
+        provider=provider,
+    )
+
+    _persist_successful_fix_case(
+        instruction=instruction,
+        final_text=result.final_text,
+        plan=plan,
+        plan_md_path=md_path,
+        exec_summary=exec_summary,
+        apply=apply,
+        execute=execute,
     )
 
     if plan.rollback_commands:
@@ -601,6 +640,8 @@ async def _dispatch(
     provider: str,
     max_steps: int,
     text_stream=None,
+    conversation_context: str = "",
+    memory_context: str = "",
 ):
     mode = (provider or "auto").strip().lower()
     if mode not in {"auto", "mock", "openai"}:
@@ -638,7 +679,10 @@ async def _dispatch(
         model=model,
         max_steps=max(1, min(max_steps, 12)),
         text_stream=text_stream,
-        system_prompt=_build_system_prompt(),
+        system_prompt=_build_system_prompt(
+            conversation_context=conversation_context,
+            memory_context=memory_context,
+        ),
     )
     return await dispatcher.run(instruction)
 
@@ -789,20 +833,19 @@ def history_export(
     typer.echo(f"Exported: {out_path}")
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(*, conversation_context: str = "", memory_context: str = "") -> str:
     env = TargetEnvStore().load()
-    return (
-        "You are LazySRE CLI orchestrator with ReAct behavior. "
-        "When user asks incident/root-cause questions, do not guess. "
-        "First collect evidence with observer tools (metrics, cluster context, logs), "
-        "then summarize likely root cause and actionable commands. "
-        "Respect dry-run mode and approval policy. "
-        "For any write operations (delete/patch/scale/restart), provide risk-aware guidance. "
-        f"Target defaults: prometheus_url={env.prometheus_url or '(unset)'}, "
-        f"k8s_api_url={env.k8s_api_url or '(unset)'}, "
-        f"k8s_context={env.k8s_context or '(unset)'}, "
-        f"k8s_namespace={env.k8s_namespace or 'default'}."
+    target_summary = (
+        f"prometheus_url={env.prometheus_url or '(unset)'}\n"
+        f"k8s_api_url={env.k8s_api_url or '(unset)'}\n"
+        f"k8s_context={env.k8s_context or '(unset)'}\n"
+        f"k8s_namespace={env.k8s_namespace or 'default'}"
     )
+    return BrainContext(
+        target_summary=target_summary,
+        conversation_context=conversation_context,
+        memory_context=memory_context,
+    ).render()
 
 
 @pack_app.command("list")
@@ -971,6 +1014,7 @@ def _render_step_risk(
     total_steps: int,
     command_text: str,
     risk_report: dict[str, object],
+    impact_statement: str = "",
 ) -> None:
     lines = [
         f"Step {step_index}/{total_steps}",
@@ -981,6 +1025,8 @@ def _render_step_risk(
         f"- 爆炸半径: {risk_report.get('blast_radius', '-')}",
         f"- 回滚建议: {risk_report.get('rollback', '-')}",
     ]
+    if impact_statement.strip():
+        lines.append(f"- Impact Statement: {impact_statement.strip()}")
     text = "\n".join(lines)
     if _console and Panel:
         _console.print(Panel(text, border_style="yellow"))
@@ -1027,6 +1073,8 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 execute=bool(options["execute"]),
                 approval_mode=str(options["approval_mode"]),
                 audit_log=str(options["audit_log"]),
+                model=str(options["model"]),
+                provider=str(options["provider"]),
             )
             continue
 
@@ -1086,7 +1134,9 @@ def _execute_fix_plan_steps(
     audit_log: str,
     allow_high_risk: bool,
     auto_approve_low_risk: bool,
-) -> None:
+    model: str,
+    provider: str,
+) -> dict[str, int]:
     executor = SafeExecutor(
         dry_run=(not execute),
         approval_mode=approval_mode,
@@ -1096,6 +1146,9 @@ def _execute_fix_plan_steps(
     selected = plan.apply_commands[:max_apply_steps]
     total = len(selected)
     skipped_high_risk = 0
+    executed = 0
+    succeeded = 0
+    failed = 0
     for idx, command_text in enumerate(selected, 1):
         try:
             command = shlex.split(command_text)
@@ -1106,7 +1159,13 @@ def _execute_fix_plan_steps(
             continue
         decision = assess_command(command, approval_mode=approval_mode)
         report = build_risk_report(command, decision)
-        _render_step_risk(idx, total, command_text, report)
+        impact_statement = _generate_impact_statement(
+            command_text=command_text,
+            report=report,
+            model=model,
+            provider=provider,
+        )
+        _render_step_risk(idx, total, command_text, report, impact_statement=impact_statement)
         allow_execute, need_confirm = evaluate_apply_guardrail(
             risk_level=str(report.get("risk_level", "low")),
             allow_high_risk=allow_high_risk,
@@ -1121,11 +1180,22 @@ def _execute_fix_plan_steps(
         if (not need_confirm) and auto_approve_low_risk:
             typer.echo(f"[step {idx}/{total}] low-risk 自动通过确认")
         result_exec = asyncio.run(executor.run(command))
+        executed += 1
+        if result_exec.ok:
+            succeeded += 1
+        else:
+            failed += 1
         _render_step_result(idx, total, result_exec)
         if (not result_exec.ok) and (not typer.confirm("步骤失败，是否继续后续步骤？", default=False)):
             break
     if skipped_high_risk:
         typer.echo(f"共跳过 {skipped_high_risk} 个高风险步骤。")
+    return {
+        "executed": executed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "skipped_high_risk": skipped_high_risk,
+    }
 
 
 def _apply_last_fix_plan(
@@ -1134,6 +1204,8 @@ def _apply_last_fix_plan(
     execute: bool,
     approval_mode: str,
     audit_log: str,
+    model: str,
+    provider: str,
 ) -> None:
     path = Path(".data/lsre-fix-last.json")
     if not path.exists():
@@ -1171,6 +1243,8 @@ def _apply_last_fix_plan(
         audit_log=audit_log,
         allow_high_risk=False,
         auto_approve_low_risk=False,
+        model=model,
+        provider=provider,
     )
     if plan.rollback_commands:
         typer.echo("\n可回滚命令：")
@@ -1210,6 +1284,111 @@ def _looks_like_apply_request(text: str) -> bool:
             "apply fix",
         ]
     )
+
+
+def _build_memory_context(instruction: str) -> str:
+    try:
+        store = IncidentMemoryStore()
+        return format_memory_context(store.search_similar(instruction, limit=3))
+    except Exception:
+        return ""
+
+
+def _persist_successful_fix_case(
+    *,
+    instruction: str,
+    final_text: str,
+    plan: FixPlan,
+    plan_md_path: Path,
+    exec_summary: dict[str, int],
+    apply: bool,
+    execute: bool,
+) -> None:
+    if not apply:
+        return
+    if not execute:
+        return
+    if int(exec_summary.get("executed", 0)) <= 0:
+        return
+    if int(exec_summary.get("failed", 0)) > 0:
+        return
+    root_cause = _extract_markdown_section(final_text, "Root Cause")
+    if not root_cause:
+        root_cause = "unknown"
+    try:
+        IncidentMemoryStore().add_case(
+            symptom=instruction,
+            root_cause=root_cause,
+            fix_commands=plan.apply_commands,
+            rollback_commands=plan.rollback_commands,
+            metadata={
+                "source": "lsre-fix",
+                "plan_md": str(plan_md_path),
+                "executed_steps": int(exec_summary.get("executed", 0)),
+            },
+        )
+        typer.echo("已写入长期记忆库：~/.lazysre/history_db")
+    except Exception as exc:
+        typer.echo(f"长期记忆写入失败（已忽略）: {exc}")
+
+
+def _extract_markdown_section(text: str, section_name: str) -> str:
+    import re
+
+    pattern = re.compile(
+        rf"(?ims)^##\s*{re.escape(section_name)}\s*$\n(?P<body>.*?)(?=^##\s+|\Z)"
+    )
+    match = pattern.search(text or "")
+    if not match:
+        return ""
+    body = match.group("body").strip()
+    lines = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("```"):
+            continue
+        lines.append(line)
+    return " ".join(lines)[:320]
+
+
+def _generate_impact_statement(
+    *,
+    command_text: str,
+    report: dict[str, object],
+    model: str,
+    provider: str,
+) -> str:
+    prompt = (
+        "Generate one concise impact statement for an SRE change in Chinese.\n"
+        f"Command: {command_text}\n"
+        f"Risk: {json.dumps(report, ensure_ascii=False)}\n"
+        "Output one sentence only."
+    )
+    mode = (provider or "auto").strip().lower()
+    if mode not in {"openai"} or (not settings.openai_api_key):
+        # deterministic fallback for local/mock mode
+        scope = str(report.get("impact_scope", "service"))
+        radius = str(report.get("blast_radius", "single target"))
+        return f"该操作将影响 {scope}，潜在影响范围为 {radius}，请确认业务窗口与回滚条件。"
+    try:
+        llm = OpenAIResponsesLLM(settings.openai_api_key)
+        turn = asyncio.run(
+            llm.respond(
+                model=model,
+                tools=[],
+                system_prompt="You are an SRE risk analyst.",
+                user_input=prompt,
+                text_stream=None,
+            )
+        )
+        statement = (turn.text or "").strip()
+        if statement:
+            return statement.splitlines()[0][:220]
+    except Exception:
+        pass
+    scope = str(report.get("impact_scope", "service"))
+    radius = str(report.get("blast_radius", "single target"))
+    return f"该操作将影响 {scope}，潜在影响范围为 {radius}，请确认业务窗口与回滚条件。"
 
 
 def _write_text_file(path: Path, content: str) -> None:
@@ -1266,6 +1445,38 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
             continue
         argv.insert(idx, "run")
         return
+
+
+def _should_launch_assistant(tokens: list[str]) -> bool:
+    if not tokens:
+        return True
+    commands = {"run", "chat", "fix", "pack", "target", "history", "--help", "-h"}
+    options_with_value = {
+        "--approval-mode",
+        "--audit-log",
+        "--lock-file",
+        "--session-file",
+        "--deny-tool",
+        "--deny-prefix",
+        "--tool-pack",
+        "--remote-gateway",
+        "--model",
+        "--provider",
+        "--max-steps",
+    }
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token in commands:
+            return False
+        if token.startswith("-"):
+            if token in options_with_value and idx + 1 < len(tokens):
+                idx += 2
+                continue
+            idx += 1
+            continue
+        return False
+    return True
 
 
 if __name__ == "__main__":

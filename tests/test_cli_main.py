@@ -2,6 +2,7 @@ from lazysre.cli.main import (
     _looks_like_apply_request,
     _looks_like_fix_request,
     _rewrite_argv_for_default_run,
+    _should_launch_assistant,
 )
 
 
@@ -53,3 +54,10 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_apply_request("执行修复计划")
     assert _looks_like_apply_request("apply fix")
     assert _looks_like_fix_request("执行修复计划") is False
+
+
+def test_should_launch_assistant_with_only_options() -> None:
+    assert _should_launch_assistant(["--provider", "mock"]) is True
+    assert _should_launch_assistant([]) is True
+    assert _should_launch_assistant(["chat"]) is False
+    assert _should_launch_assistant(["检查k8s"]) is False

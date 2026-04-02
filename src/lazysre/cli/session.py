@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lazysre.cli.context_window import compact_conversation
 from lazysre.cli.types import DispatchResult
 
 
@@ -41,6 +42,7 @@ class SessionStore:
             {
                 "user": user_input,
                 "assistant": result.final_text[:2000],
+                "trace": _extract_trace(result),
             }
         )
         _extract_entities(user_input, result, entities)
@@ -86,6 +88,13 @@ class SessionStore:
                 }
             )
         return rows
+
+    def build_dialogue_context(self, *, max_chars: int = 2400) -> str:
+        payload = self.load()
+        turns = payload.get("turns", [])
+        if not isinstance(turns, list):
+            return ""
+        return compact_conversation(turns, max_chars=max_chars)
 
     def clear(self) -> None:
         self._save({"turns": [], "entities": {}})
@@ -136,3 +145,15 @@ def _extract_entities(user_input: str, result: DispatchResult, entities: dict[st
             entities["last_service"] = svc
         if ns:
             entities["last_namespace"] = ns
+
+
+def _extract_trace(result: DispatchResult) -> list[str]:
+    trace: list[str] = []
+    for evt in result.events:
+        if evt.kind == "llm_turn":
+            trace.append(f"Thought: {evt.message}")
+        elif evt.kind == "tool_call":
+            trace.append(f"Action: {evt.message}")
+        elif evt.kind == "tool_output":
+            trace.append(f"Observation: {evt.message}")
+    return trace[:24]
