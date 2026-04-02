@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -69,6 +70,7 @@ def root(
     approve: Annotated[bool, typer.Option("--approve", help="Acknowledge policy gate for high-risk commands.")] = False,
     interactive_approval: Annotated[bool, typer.Option("--interactive-approval/--no-interactive-approval", help="Prompt y/n confirmation for risky write actions in execute mode.")] = True,
     stream_output: Annotated[bool, typer.Option("--stream-output/--no-stream-output", help="Stream model tokens in terminal output.")] = True,
+    verbose_reasoning: Annotated[bool, typer.Option("--verbose-reasoning/--no-verbose-reasoning", help="Show full AI reasoning content instead of collapsed summary.")] = False,
     approval_mode: Annotated[str, typer.Option(help="Policy level: strict|balanced|permissive")] = "balanced",
     audit_log: Annotated[str, typer.Option(help="Audit jsonl path for command execution records.")] = ".data/lsre-audit.jsonl",
     lock_file: Annotated[str, typer.Option(help="Tool pack lock file path.")] = ".data/lsre-tool-lock.json",
@@ -86,6 +88,7 @@ def root(
         "approve": approve,
         "interactive_approval": interactive_approval,
         "stream_output": stream_output,
+        "verbose_reasoning": verbose_reasoning,
         "approval_mode": approval_mode,
         "audit_log": audit_log,
         "lock_file": lock_file,
@@ -105,6 +108,7 @@ def root(
             approve=None,
             interactive_approval=None,
             stream_output=None,
+            verbose_reasoning=None,
             approval_mode=None,
             audit_log=None,
             lock_file=None,
@@ -132,6 +136,7 @@ def run_instruction(
         approve=None,
         interactive_approval=None,
         stream_output=None,
+        verbose_reasoning=None,
         approval_mode=None,
         audit_log=None,
         lock_file=None,
@@ -150,6 +155,7 @@ def run_instruction(
         approve=bool(options["approve"]),
         interactive_approval=bool(options["interactive_approval"]),
         stream_output=bool(options["stream_output"]),
+        verbose_reasoning=bool(options["verbose_reasoning"]),
         approval_mode=str(options["approval_mode"]),
         audit_log=str(options["audit_log"]),
         lock_file=str(options["lock_file"]),
@@ -171,6 +177,7 @@ def chat(
     approve: Annotated[bool | None, typer.Option("--approve", help="Override approval gate acknowledgement.")] = None,
     interactive_approval: Annotated[bool | None, typer.Option("--interactive-approval/--no-interactive-approval", help="Override interactive approval prompt.")] = None,
     stream_output: Annotated[bool | None, typer.Option("--stream-output/--no-stream-output", help="Override token streaming mode.")] = None,
+    verbose_reasoning: Annotated[bool | None, typer.Option("--verbose-reasoning/--no-verbose-reasoning", help="Override reasoning verbosity.")] = None,
     approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
     audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
     lock_file: Annotated[str | None, typer.Option(help="Override tool pack lock file path.")] = None,
@@ -189,6 +196,7 @@ def chat(
         approve=approve,
         interactive_approval=interactive_approval,
         stream_output=stream_output,
+        verbose_reasoning=verbose_reasoning,
         approval_mode=approval_mode,
         audit_log=audit_log,
         lock_file=lock_file,
@@ -218,6 +226,7 @@ def fix_instruction(
     approve: Annotated[bool | None, typer.Option("--approve", help="Override approval gate acknowledgement for diagnosis phase.")] = None,
     interactive_approval: Annotated[bool | None, typer.Option("--interactive-approval/--no-interactive-approval", help="Override interactive approval prompt for diagnosis phase.")] = None,
     stream_output: Annotated[bool | None, typer.Option("--stream-output/--no-stream-output", help="Override token streaming mode.")] = None,
+    verbose_reasoning: Annotated[bool | None, typer.Option("--verbose-reasoning/--no-verbose-reasoning", help="Override reasoning verbosity.")] = None,
     approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
     audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
     lock_file: Annotated[str | None, typer.Option(help="Override tool pack lock file path.")] = None,
@@ -236,6 +245,7 @@ def fix_instruction(
         approve=approve,
         interactive_approval=interactive_approval,
         stream_output=stream_output,
+        verbose_reasoning=verbose_reasoning,
         approval_mode=approval_mode,
         audit_log=audit_log,
         lock_file=lock_file,
@@ -260,6 +270,7 @@ def fix_instruction(
         approve=bool(options["approve"]),
         interactive_approval=bool(options["interactive_approval"]),
         stream_output=bool(options["stream_output"]),
+        verbose_reasoning=bool(options["verbose_reasoning"]),
         approval_mode=str(options["approval_mode"]),
         audit_log=str(options["audit_log"]),
         lock_file=str(options["lock_file"]),
@@ -281,6 +292,7 @@ def _merged_options(
     approve: bool | None,
     interactive_approval: bool | None,
     stream_output: bool | None,
+    verbose_reasoning: bool | None,
     approval_mode: str | None,
     audit_log: str | None,
     lock_file: str | None,
@@ -302,6 +314,8 @@ def _merged_options(
         base["interactive_approval"] = interactive_approval
     if stream_output is not None:
         base["stream_output"] = stream_output
+    if verbose_reasoning is not None:
+        base["verbose_reasoning"] = verbose_reasoning
     if approval_mode is not None:
         base["approval_mode"] = approval_mode
     if audit_log is not None:
@@ -332,6 +346,8 @@ def _merged_options(
         base["interactive_approval"] = True
     if "stream_output" not in base:
         base["stream_output"] = True
+    if "verbose_reasoning" not in base:
+        base["verbose_reasoning"] = False
     if "approval_mode" not in base:
         base["approval_mode"] = "balanced"
     if "audit_log" not in base:
@@ -364,6 +380,7 @@ def _run_once(
     approve: bool,
     interactive_approval: bool,
     stream_output: bool,
+    verbose_reasoning: bool,
     approval_mode: str,
     audit_log: str,
     lock_file: str,
@@ -391,7 +408,7 @@ def _run_once(
     prompt = context_window.fit_text(prompt, max_chars=9000)
 
     streamed_chunks: list[str] = []
-    stream_enabled = bool(_console and stream_output)
+    stream_enabled = bool(_console and stream_output and verbose_reasoning)
 
     def _stream_text(delta: str) -> None:
         if not _console:
@@ -456,10 +473,13 @@ def _run_once(
                 detail = json.dumps(event.data, ensure_ascii=False)
                 typer.echo(f"[{event.kind}] {event.message} {detail}")
     if _console:
-        if Markdown and (not streamed_chunks):
-            _console.print(Panel(Markdown(result.final_text), title="LazySRE", border_style="blue"))
-        elif (not streamed_chunks):
-            _console.print(result.final_text)
+        if verbose_reasoning:
+            if Markdown and (not streamed_chunks):
+                _console.print(Panel(Markdown(result.final_text), title="LazySRE", border_style="blue"))
+            elif (not streamed_chunks):
+                _console.print(result.final_text)
+        else:
+            _render_compact_result(result, title="LazySRE")
     else:
         typer.echo(result.final_text)
 
@@ -477,6 +497,7 @@ def _run_fix(
     approve: bool,
     interactive_approval: bool,
     stream_output: bool,
+    verbose_reasoning: bool,
     approval_mode: str,
     audit_log: str,
     lock_file: str,
@@ -504,7 +525,7 @@ def _run_fix(
     prompt = context_window.fit_text(prompt, max_chars=9500)
 
     streamed_chunks: list[str] = []
-    stream_enabled = bool(_console and stream_output)
+    stream_enabled = bool(_console and stream_output and verbose_reasoning)
 
     def _stream_text(delta: str) -> None:
         if not _console:
@@ -563,10 +584,13 @@ def _run_fix(
 
     if _console:
         _render_timeline(result.events)
-        if Markdown and (not streamed_chunks):
-            _console.print(Panel(Markdown(result.final_text), title="Fix Plan", border_style="magenta"))
-        elif (not streamed_chunks):
-            _console.print(result.final_text)
+        if verbose_reasoning:
+            if Markdown and (not streamed_chunks):
+                _console.print(Panel(Markdown(result.final_text), title="Fix Plan", border_style="magenta"))
+            elif (not streamed_chunks):
+                _console.print(result.final_text)
+        else:
+            _render_compact_result(result, title="Fix Plan")
     else:
         typer.echo(result.final_text)
 
@@ -1009,6 +1033,138 @@ def _render_fix_summary(plan: FixPlan, *, max_apply_steps: int) -> None:
             typer.echo(f"- {cmd}")
 
 
+def _render_compact_result(result, *, title: str) -> None:
+    status = _extract_named_field(result.final_text, ["status", "状态"])
+    risk = _extract_named_field(result.final_text, ["risk level", "风险等级"])
+    reasoning = _extract_named_field(result.final_text, ["reasoning", "推理", "诊断"])
+    tools = _extract_tool_calls(result.events)
+    commands = _extract_command_candidates(result.final_text, max_items=10)
+
+    if _console and Table and Panel:
+        lines: list[str] = []
+        if status:
+            lines.append(f"Status: {status}")
+        if risk:
+            lines.append(f"Risk Level: {risk}")
+        if reasoning:
+            lines.append(f"Reasoning: {reasoning}")
+        if not lines:
+            lines.append((result.final_text or "(empty)").strip()[:260])
+        _console.print(Panel("\n".join(lines), title=f"{title} Summary", border_style="blue"))
+
+        if tools:
+            tool_table = Table(title="Tool Calls")
+            tool_table.add_column("#", style="cyan", no_wrap=True)
+            tool_table.add_column("Tool", style="white")
+            for idx, tool in enumerate(tools, 1):
+                tool_table.add_row(str(idx), tool)
+            _console.print(tool_table)
+
+        if commands:
+            cmd_table = Table(title="Recommended Commands")
+            cmd_table.add_column("#", style="cyan", no_wrap=True)
+            cmd_table.add_column("Command", style="green")
+            for idx, command in enumerate(commands, 1):
+                cmd_table.add_row(str(idx), command)
+            _console.print(cmd_table)
+        return
+
+    if status:
+        typer.echo(f"Status: {status}")
+    if risk:
+        typer.echo(f"Risk Level: {risk}")
+    if reasoning:
+        typer.echo(f"Reasoning: {reasoning}")
+    if tools:
+        typer.echo("Tool Calls:")
+        for item in tools:
+            typer.echo(f"- {item}")
+    if commands:
+        typer.echo("Recommended Commands:")
+        for item in commands:
+            typer.echo(f"- {item}")
+    elif not any([status, risk, reasoning, tools]):
+        typer.echo((result.final_text or "(empty)").strip())
+
+
+def _extract_named_field(text: str, names: list[str]) -> str:
+    if not text.strip():
+        return ""
+    pattern = re.compile(
+        r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?\s*([a-zA-Z\u4e00-\u9fff ]+)\s*(?:\*\*)?\s*[:：]\s*(.+)$"
+    )
+    normalized = {item.strip().lower() for item in names}
+    for match in pattern.finditer(text):
+        key = match.group(1).strip().lower()
+        if key in normalized:
+            return match.group(2).strip()[:240]
+    return ""
+
+
+def _extract_tool_calls(events) -> list[str]:
+    seen: set[str] = set()
+    calls: list[str] = []
+    for event in events:
+        if event.kind != "tool_call":
+            continue
+        name = (event.message or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        calls.append(name)
+    return calls[:12]
+
+
+def _extract_command_candidates(text: str, *, max_items: int) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    plan = extract_fix_plan(text)
+    for cmd in plan.apply_commands:
+        _append_command(items, seen, cmd, max_items=max_items)
+    blocks = re.findall(r"```(?:bash|sh|shell)?\n(.*?)```", text or "", flags=re.IGNORECASE | re.DOTALL)
+    for block in blocks:
+        for raw in block.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            _append_command(items, seen, line, max_items=max_items)
+    for raw in (text or "").splitlines():
+        line = raw.strip().strip("`")
+        if not line:
+            continue
+        if _looks_like_shell_command(line):
+            _append_command(items, seen, line, max_items=max_items)
+    return items
+
+
+def _append_command(items: list[str], seen: set[str], value: str, *, max_items: int) -> None:
+    cmd = value.strip()
+    if (not cmd) or (cmd in seen):
+        return
+    seen.add(cmd)
+    if len(items) < max_items:
+        items.append(cmd)
+
+
+def _looks_like_shell_command(text: str) -> bool:
+    prefixes = (
+        "kubectl ",
+        "docker ",
+        "curl ",
+        "helm ",
+        "systemctl ",
+        "journalctl ",
+        "ssh ",
+        "lsre ",
+        "python ",
+        "python3 ",
+        "bash ",
+        "sh ",
+    )
+    lowered = text.lower()
+    return lowered.startswith(prefixes)
+
+
 def _render_step_risk(
     step_index: int,
     total_steps: int,
@@ -1091,6 +1247,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 approve=bool(options["approve"]),
                 interactive_approval=bool(options["interactive_approval"]),
                 stream_output=bool(options["stream_output"]),
+                verbose_reasoning=bool(options["verbose_reasoning"]),
                 approval_mode=str(options["approval_mode"]),
                 audit_log=str(options["audit_log"]),
                 lock_file=str(options["lock_file"]),
@@ -1111,6 +1268,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             approve=bool(options["approve"]),
             interactive_approval=bool(options["interactive_approval"]),
             stream_output=bool(options["stream_output"]),
+            verbose_reasoning=bool(options["verbose_reasoning"]),
             approval_mode=str(options["approval_mode"]),
             audit_log=str(options["audit_log"]),
             lock_file=str(options["lock_file"]),

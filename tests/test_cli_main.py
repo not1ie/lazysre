@@ -1,4 +1,6 @@
 from lazysre.cli.main import (
+    _extract_command_candidates,
+    _extract_named_field,
     _looks_like_apply_request,
     _looks_like_fix_request,
     _rewrite_argv_for_default_run,
@@ -58,6 +60,29 @@ def test_detect_fix_and_apply_intent() -> None:
 
 def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["--provider", "mock"]) is True
+    assert _should_launch_assistant(["--verbose-reasoning"]) is True
     assert _should_launch_assistant([]) is True
     assert _should_launch_assistant(["chat"]) is False
     assert _should_launch_assistant(["检查k8s"]) is False
+
+
+def test_extract_named_field_handles_markdown_and_plain_prefix() -> None:
+    text = """
+**Status**: Diagnosing
+Risk Level: Medium
+"""
+    assert _extract_named_field(text, ["status"]) == "Diagnosing"
+    assert _extract_named_field(text, ["risk level"]) == "Medium"
+
+
+def test_extract_command_candidates_prefers_apply_commands() -> None:
+    text = """
+## Apply Commands
+```bash
+kubectl -n default rollout restart deploy/payment
+kubectl -n default get pods -l app=payment -w
+```
+"""
+    commands = _extract_command_candidates(text, max_items=5)
+    assert commands[0] == "kubectl -n default rollout restart deploy/payment"
+    assert "kubectl -n default get pods -l app=payment -w" in commands
