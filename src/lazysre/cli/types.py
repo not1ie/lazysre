@@ -42,6 +42,7 @@ class ExecResult:
     blocked: bool = False
     risk_level: str = "low"
     policy_reasons: list[str] = field(default_factory=list)
+    risk_report: dict[str, Any] = field(default_factory=dict)
     requires_approval: bool = False
     approved: bool = False
 

@@ -59,6 +59,8 @@ lsre chat
 lsre --provider mock "重启异常容器"
 lsre --execute --approval-mode balanced --approve --provider mock "重启异常容器"
 lsre --execute --interactive-approval --provider mock "为什么支付服务响应变慢了？"
+lsre target show
+lsre target set --prometheus-url http://92.168.69.176:9090 --k8s-api-url https://192.168.10.1:6443 --k8s-skip-tls-verify
 lsre --provider mock --deny-tool docker "重启异常容器"
 lsre --tool-pack builtin --remote-gateway edge=http://127.0.0.1:18080 "检查远端主机状态"
 lsre --tool-pack module:your_pkg.your_pack:tool_pack "执行自定义工具包任务"
@@ -81,6 +83,7 @@ lsre --tool-pack locked:your_pack "执行锁定版本工具包任务"
 9. 内置 Observer 工具：`get_cluster_context`、`fetch_service_logs`、`get_metrics`，输出会自动脱敏和压缩，避免 token 溢出。
 10. 执行模式下高风险写操作会生成“变更风险报告”，并等待控制台 `y/n` 确认（可用 `--no-interactive-approval` 关闭）。
 11. 支持 Session 历史记忆（默认 `.data/lsre-session.json`），可处理“重启它”这类指代。
+12. `target` 子命令可持久化目标环境（默认 `.data/lsre-target.json`），Observer 工具会自动使用这些默认值。
 
 ## 环境变量
 
@@ -309,6 +312,26 @@ Swarm Stack 文件：
 默认发布端口：
 
 - `32080`
+
+## CLI 发布与镜像
+
+构建 Python 包（wheel/sdist）：
+
+```bash
+./scripts/release_cli.sh
+```
+
+构建并推送 CLI 镜像（默认推送到阿里云仓库）：
+
+```bash
+./scripts/build_push_cli_registry.sh
+```
+
+指定仓库与 tag：
+
+```bash
+./scripts/build_push_cli_registry.sh crpi-iihofxt94xlrdrvd.cn-shanghai.personal.cr.aliyuncs.com/lazyops/lazyopsatest cli-20260402180000
+```
 
 ## 下一步建议
 

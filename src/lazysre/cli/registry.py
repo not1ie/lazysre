@@ -65,6 +65,7 @@ class ToolRegistry:
                 "blocked": result.blocked,
                 "risk_level": result.risk_level,
                 "policy_reasons": result.policy_reasons,
+                "risk_report": result.risk_report,
                 "requires_approval": result.requires_approval,
                 "approved": result.approved,
             },

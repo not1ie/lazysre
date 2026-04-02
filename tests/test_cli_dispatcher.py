@@ -80,6 +80,15 @@ async def test_safe_executor_dry_run_keeps_policy_signal(tmp_path: Path) -> None
     assert '"risk_level": "high"' in content
 
 
+async def test_safe_executor_masks_token_and_emits_risk_report() -> None:
+    executor = SafeExecutor(dry_run=True, approval_mode="balanced")
+    result = await executor.run(["kubectl", "--token", "abcd1234", "delete", "pod", "foo"])
+    assert result.ok is True
+    assert result.risk_report.get("risk_level") in {"high", "critical"}
+    assert result.command[2] == "***"
+    assert result.requires_approval is True
+
+
 async def test_tool_permission_context_blocks_registry_tool() -> None:
     registry = build_default_registry(
         permission_context=ToolPermissionContext.from_iterables(

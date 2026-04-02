@@ -51,6 +51,58 @@ def assess_command(command: list[str], approval_mode: str = "balanced") -> Polic
     )
 
 
+def build_risk_report(command: list[str], decision: PolicyDecision) -> dict[str, object]:
+    binary = command[0] if command else ""
+    args = command[1:] if len(command) > 1 else []
+    joined = " ".join(args).strip()
+
+    risk_score_map = {"low": 18, "medium": 45, "high": 78, "critical": 94}
+    score = risk_score_map.get(decision.risk_level, 90)
+
+    impact_scope = "local"
+    blast_radius = "single target"
+    rollback = "manual recovery required"
+
+    if binary == "kubectl":
+        impact_scope = "kubernetes"
+        if "delete namespace" in joined or "delete node" in joined:
+            blast_radius = "cluster-wide"
+            rollback = "kubectl apply -f <backup-manifest>; restore from backup snapshot"
+        elif "rollout restart" in joined:
+            blast_radius = "service-level"
+            rollback = "kubectl rollout undo <resource>"
+        elif args[:1] and args[0] in {"patch", "apply", "replace", "set", "scale"}:
+            blast_radius = "namespace-level"
+            rollback = "kubectl rollout undo <resource> or re-apply previous manifest"
+        else:
+            blast_radius = "resource-level"
+            rollback = "re-apply previous kubectl spec"
+    elif binary == "docker":
+        impact_scope = "docker-runtime"
+        if args[:1] and args[0] in {"restart", "stop", "kill", "rm", "rmi"}:
+            blast_radius = "service/container-level"
+            rollback = "docker start <container> or redeploy service image"
+        elif "prune" in joined:
+            blast_radius = "host-level"
+            rollback = "recover from image/cache/volume backup"
+    elif binary == "curl":
+        impact_scope = "remote-api"
+        methods = [x.upper() for x in args if x.startswith("-X") or x in {"POST", "PUT", "PATCH", "DELETE"}]
+        if methods:
+            blast_radius = "remote service state"
+            rollback = "issue compensating API request based on endpoint contract"
+
+    return {
+        "risk_level": decision.risk_level,
+        "risk_score": score,
+        "impact_scope": impact_scope,
+        "blast_radius": blast_radius,
+        "requires_approval": decision.requires_approval,
+        "reasons": list(decision.reasons),
+        "rollback": rollback,
+    }
+
+
 def _min_approval_level(mode: str) -> str:
     normalized = mode.strip().lower()
     if normalized == "strict":
@@ -76,7 +128,7 @@ def _assess_kubectl(args: list[str], joined: str) -> tuple[str, list[str]]:
     }
     disruptive = {"drain", "uncordon", "cordon", "rollout", "taint"}
 
-    cmd = args[0] if args else ""
+    cmd = _first_subcommand(args)
     if cmd in read_only:
         return "low", ["kubectl 只读查询命令。"]
     if cmd in mutate:
@@ -94,7 +146,7 @@ def _assess_docker(args: list[str], joined: str) -> tuple[str, list[str]]:
     read_only = {"ps", "images", "inspect", "stats", "logs", "service", "node"}
     mutate = {"restart", "stop", "start", "kill", "rm", "rmi", "run"}
 
-    cmd = args[0] if args else ""
+    cmd = _first_subcommand(args)
     if cmd in read_only:
         return "low", ["docker 诊断查询命令。"]
     if cmd in mutate:
@@ -117,3 +169,29 @@ def _assess_curl(args: list[str]) -> tuple[str, list[str]]:
         return "high", [f"HTTP {method} 可能触发远端状态变更。"]
     return "medium", [f"未知 HTTP method={method}，建议先审批。"]
 
+
+def _first_subcommand(args: list[str]) -> str:
+    flags_with_value = {
+        "--token",
+        "--server",
+        "--context",
+        "--namespace",
+        "--kubeconfig",
+        "--cluster",
+        "--user",
+        "-n",
+    }
+    skip_next = False
+    for token in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if not token:
+            continue
+        if token in flags_with_value:
+            skip_next = True
+            continue
+        if token.startswith("-"):
+            continue
+        return token
+    return ""

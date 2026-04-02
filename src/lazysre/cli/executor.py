@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from lazysre.cli.audit import AuditLogger
-from lazysre.cli.policy import PolicyDecision, assess_command
+from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.types import ExecResult
 
 
@@ -25,10 +25,11 @@ class SafeExecutor:
         self, command: list[str]
     ) -> tuple[PolicyDecision | None, ExecResult | None, bool]:
         approved = self.approval_granted
+        safe_command = _sanitize_command(command)
         if not command:
             result = ExecResult(
                 ok=False,
-                command=command,
+                command=safe_command,
                 stderr="empty command",
                 exit_code=1,
                 dry_run=self.dry_run,
@@ -40,7 +41,7 @@ class SafeExecutor:
         if binary not in self.allowed_binaries:
             result = ExecResult(
                 ok=False,
-                command=command,
+                command=safe_command,
                 stderr=f"blocked command: {binary}",
                 exit_code=126,
                 dry_run=self.dry_run,
@@ -52,16 +53,18 @@ class SafeExecutor:
             return None, result, approved
 
         decision = assess_command(command, approval_mode=self.approval_mode)
+        risk_report = build_risk_report(command, decision)
         if decision.blocked:
             result = ExecResult(
                 ok=False,
-                command=command,
+                command=safe_command,
                 stderr=decision.blocked_reason or "blocked by policy",
                 exit_code=126,
                 dry_run=self.dry_run,
                 blocked=True,
                 risk_level=decision.risk_level,
                 policy_reasons=decision.reasons,
+                risk_report=risk_report,
                 requires_approval=decision.requires_approval,
                 approved=approved,
             )
@@ -71,18 +74,19 @@ class SafeExecutor:
         if (not self.dry_run) and (not approved):
             interactive_gate = decision.risk_level in {"high", "critical"}
             if interactive_gate and self.approval_callback:
-                if self.approval_callback(command, decision):
+                if self.approval_callback(safe_command, decision):
                     approved = True
                 else:
                     result = ExecResult(
                         ok=False,
-                        command=command,
+                        command=safe_command,
                         stderr="approval rejected by user",
                         exit_code=125,
                         dry_run=False,
                         blocked=True,
                         risk_level=decision.risk_level,
                         policy_reasons=decision.reasons,
+                        risk_report=risk_report,
                         requires_approval=True,
                         approved=False,
                     )
@@ -91,7 +95,7 @@ class SafeExecutor:
             elif decision.requires_approval:
                 result = ExecResult(
                     ok=False,
-                    command=command,
+                    command=safe_command,
                     stderr=(
                         "approval required by policy. "
                         "Re-run with --approve and review impact first."
@@ -101,6 +105,7 @@ class SafeExecutor:
                     blocked=True,
                     risk_level=decision.risk_level,
                     policy_reasons=decision.reasons,
+                    risk_report=risk_report,
                     requires_approval=True,
                     approved=False,
                 )
@@ -110,20 +115,23 @@ class SafeExecutor:
 
     async def run(self, command: list[str]) -> ExecResult:
         binary = command[0] if command else ""
+        safe_command = _sanitize_command(command)
         decision, blocked, approved = self.preflight(command)
         if blocked:
             return blocked
         assert decision is not None
+        risk_report = build_risk_report(command, decision)
 
         if self.dry_run:
             result = ExecResult(
                 ok=True,
-                command=command,
-                stdout=f"[dry-run] {' '.join(command)}",
+                command=safe_command,
+                stdout=f"[dry-run] {' '.join(safe_command)}",
                 exit_code=0,
                 dry_run=True,
                 risk_level=decision.risk_level,
                 policy_reasons=decision.reasons,
+                risk_report=risk_report,
                 requires_approval=decision.requires_approval,
                 approved=approved,
             )
@@ -140,12 +148,13 @@ class SafeExecutor:
         except TimeoutError:
             result = ExecResult(
                 ok=False,
-                command=command,
+                command=safe_command,
                 stderr=f"timeout after {self.timeout_sec}s",
                 exit_code=124,
                 dry_run=False,
                 risk_level=decision.risk_level,
                 policy_reasons=decision.reasons,
+                risk_report=risk_report,
                 requires_approval=decision.requires_approval,
                 approved=approved,
             )
@@ -154,12 +163,13 @@ class SafeExecutor:
         except FileNotFoundError:
             result = ExecResult(
                 ok=False,
-                command=command,
+                command=safe_command,
                 stderr=f"binary not found: {binary}",
                 exit_code=127,
                 dry_run=False,
                 risk_level=decision.risk_level,
                 policy_reasons=decision.reasons,
+                risk_report=risk_report,
                 requires_approval=decision.requires_approval,
                 approved=approved,
             )
@@ -168,13 +178,14 @@ class SafeExecutor:
 
         result = ExecResult(
             ok=(proc.returncode == 0),
-            command=command,
+            command=safe_command,
             stdout=stdout.decode("utf-8", errors="replace").strip(),
             stderr=stderr.decode("utf-8", errors="replace").strip(),
             exit_code=int(proc.returncode or 0),
             dry_run=False,
             risk_level=decision.risk_level,
             policy_reasons=decision.reasons,
+            risk_report=risk_report,
             requires_approval=decision.requires_approval,
             approved=approved,
         )
@@ -195,7 +206,28 @@ class SafeExecutor:
                 "requires_approval": result.requires_approval,
                 "approved": result.approved,
                 "policy_reasons": result.policy_reasons,
+                "risk_report": result.risk_report,
                 "stderr": result.stderr[:500],
                 "stdout_preview": result.stdout[:300],
             }
         )
+
+
+def _sanitize_command(command: list[str]) -> list[str]:
+    if not command:
+        return []
+    out: list[str] = []
+    idx = 0
+    while idx < len(command):
+        token = command[idx]
+        if token in {"--token", "--password", "--passwd"} and idx + 1 < len(command):
+            out.extend([token, "***"])
+            idx += 2
+            continue
+        if token.startswith("Bearer "):
+            out.append("Bearer ***")
+            idx += 1
+            continue
+        out.append(token)
+        idx += 1
+    return out

@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 from lazysre.cli.executor import SafeExecutor
 from lazysre.cli.registry import ToolDefinition
+from lazysre.cli.target import TargetEnvStore
 from lazysre.cli.types import ExecResult, ToolSpec
 from lazysre.cli.tools.redact import redact_and_compress
 
@@ -69,7 +70,7 @@ def builtin_tools() -> list[ToolDefinition]:
                         "step_sec": {"type": "integer", "default": 30},
                         "timeout_sec": {"type": "integer", "default": 10},
                     },
-                    "required": ["prometheus_url", "query"],
+                    "required": ["query"],
                     "additionalProperties": False,
                 },
             ),
@@ -154,33 +155,17 @@ def tool_pack() -> list[ToolDefinition]:
 
 
 async def _get_cluster_context(args: dict[str, object], executor: SafeExecutor) -> ExecResult:
-    namespace = str(args.get("namespace", "")).strip()
+    target = TargetEnvStore().load()
+    namespace = str(args.get("namespace", "")).strip() or target.k8s_namespace
     event_limit = int(args.get("event_limit", 30) or 30)
     event_limit = max(1, min(event_limit, 200))
 
-    ns_cmd = ["kubectl", "get", "namespaces", "-o", "json"]
-    pods_cmd = ["kubectl", "get", "pods", "-A", "-o", "json"]
-    events_cmd = [
-        "kubectl",
-        "get",
-        "events",
-        "-A",
-        "--sort-by=.metadata.creationTimestamp",
-        "-o",
-        "json",
-    ]
+    ns_cmd = [*_kubectl_base(target, namespace=""), "get", "namespaces", "-o", "json"]
+    pods_cmd = [*_kubectl_base(target, namespace=""), "get", "pods", "-A", "-o", "json"]
+    events_cmd = [*_kubectl_base(target, namespace=""), "get", "events", "-A", "--sort-by=.metadata.creationTimestamp", "-o", "json"]
     if namespace:
-        pods_cmd = ["kubectl", "-n", namespace, "get", "pods", "-o", "json"]
-        events_cmd = [
-            "kubectl",
-            "-n",
-            namespace,
-            "get",
-            "events",
-            "--sort-by=.metadata.creationTimestamp",
-            "-o",
-            "json",
-        ]
+        pods_cmd = [*_kubectl_base(target, namespace=namespace), "get", "pods", "-o", "json"]
+        events_cmd = [*_kubectl_base(target, namespace=namespace), "get", "events", "--sort-by=.metadata.creationTimestamp", "-o", "json"]
 
     ns_res = await executor.run(ns_cmd)
     pods_res = await executor.run(pods_cmd)
@@ -219,7 +204,8 @@ async def _get_cluster_context(args: dict[str, object], executor: SafeExecutor) 
 
 
 async def _fetch_service_logs(args: dict[str, object], executor: SafeExecutor) -> ExecResult:
-    namespace = str(args.get("namespace", "default")).strip() or "default"
+    target_env = TargetEnvStore().load()
+    namespace = str(args.get("namespace", "")).strip() or target_env.k8s_namespace
     service = str(args.get("service", "")).strip()
     pod = str(args.get("pod", "")).strip()
     container = str(args.get("container", "")).strip()
@@ -240,17 +226,7 @@ async def _fetch_service_logs(args: dict[str, object], executor: SafeExecutor) -
             risk_level="low",
         )
 
-    cmd = [
-        "kubectl",
-        "-n",
-        namespace,
-        "logs",
-        target,
-        "--since",
-        f"{since_minutes}m",
-        "--tail",
-        str(limit),
-    ]
+    cmd = [*_kubectl_base(target_env, namespace=namespace), "logs", target, "--since", f"{since_minutes}m", "--tail", str(limit)]
     if container:
         cmd.extend(["-c", container])
     res = await executor.run(cmd)
@@ -272,17 +248,27 @@ async def _fetch_service_logs(args: dict[str, object], executor: SafeExecutor) -
 
 
 async def _get_metrics(args: dict[str, object], executor: SafeExecutor) -> ExecResult:
-    prom_url = str(args.get("prometheus_url", "")).strip().rstrip("/")
+    target = TargetEnvStore().load()
+    prom_url = str(args.get("prometheus_url", "")).strip().rstrip("/") or target.prometheus_url.rstrip("/")
     query = str(args.get("query", "")).strip()
     window_minutes = int(args.get("window_minutes", 15) or 15)
     step_sec = int(args.get("step_sec", 30) or 30)
     timeout_sec = int(args.get("timeout_sec", 10) or 10)
 
-    if not prom_url or not query:
+    if not query:
         return ExecResult(
             ok=False,
             command=["observer/get_metrics"],
-            stderr="prometheus_url and query are required",
+            stderr="query is required",
+            exit_code=2,
+            dry_run=executor.dry_run,
+            risk_level="low",
+        )
+    if not prom_url:
+        return ExecResult(
+            ok=False,
+            command=["observer/get_metrics"],
+            stderr="prometheus_url is missing. set LAZYSRE_TARGET_PROMETHEUS_URL or use lsre target set --prometheus-url",
             exit_code=2,
             dry_run=executor.dry_run,
             risk_level="low",
@@ -321,13 +307,10 @@ async def _run_kubectl(args: dict[str, object], executor: SafeExecutor) -> ExecR
     command = str(args.get("command", "")).strip()
     if not command:
         return ExecResult(ok=False, command=["kubectl"], stderr="missing command", exit_code=2)
-    cmd = ["kubectl"]
+    target = TargetEnvStore().load()
     context = str(args.get("context", "")).strip()
     namespace = str(args.get("namespace", "")).strip()
-    if context:
-        cmd.extend(["--context", context])
-    if namespace:
-        cmd.extend(["-n", namespace])
+    cmd = _kubectl_base(target, namespace=namespace, context=context or target.k8s_context)
     cmd.extend(shlex.split(command))
     return await executor.run(cmd)
 
@@ -465,3 +448,22 @@ def _url_quote(value: str) -> str:
     from urllib.parse import quote
 
     return quote(value, safe="")
+
+
+def _kubectl_base(target, *, namespace: str = "", context: str = "") -> list[str]:
+    cmd = ["kubectl"]
+    selected_context = context.strip() if context else str(getattr(target, "k8s_context", "")).strip()
+    if selected_context:
+        cmd.extend(["--context", selected_context])
+    api_url = str(getattr(target, "k8s_api_url", "")).strip()
+    if api_url:
+        cmd.extend(["--server", api_url])
+    token = str(getattr(target, "k8s_bearer_token", "")).strip()
+    if token:
+        cmd.extend(["--token", token])
+    verify_tls = bool(getattr(target, "k8s_verify_tls", False))
+    if (not verify_tls) and api_url:
+        cmd.append("--insecure-skip-tls-verify=true")
+    if namespace.strip():
+        cmd.extend(["-n", namespace.strip()])
+    return cmd

@@ -13,8 +13,9 @@ from lazysre.cli.dispatcher import Dispatcher
 from lazysre.cli.executor import SafeExecutor
 from lazysre.cli.llm import MockFunctionCallingLLM, OpenAIResponsesLLM
 from lazysre.cli.permissions import ToolPermissionContext
-from lazysre.cli.policy import PolicyDecision
+from lazysre.cli.policy import PolicyDecision, build_risk_report
 from lazysre.cli.session import SessionStore
+from lazysre.cli.target import TargetEnvStore
 from lazysre.cli.tools import build_default_registry
 from lazysre.cli.tools.marketplace import (
     LockedPack,
@@ -44,6 +45,7 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 pack_app = typer.Typer(help="Tool pack marketplace and lock management.")
+target_app = typer.Typer(help="Target environment profile management.")
 
 
 @app.callback(invoke_without_command=True)
@@ -398,6 +400,7 @@ async def _dispatch(
         ),
         model=model,
         max_steps=max(1, min(max_steps, 12)),
+        system_prompt=_build_system_prompt(),
     )
     return await dispatcher.run(instruction)
 
@@ -407,15 +410,22 @@ def _build_approval_callback(*, enabled: bool):
         return None
 
     def _callback(command: list[str], decision: PolicyDecision) -> bool:
+        report = build_risk_report(command, decision)
         lines = [
             "变更风险报告",
             f"- 风险等级: {decision.risk_level}",
+            f"- 风险分值: {report.get('risk_score', '-')}",
+            f"- 影响范围: {report.get('impact_scope', '-')}",
+            f"- 爆炸半径: {report.get('blast_radius', '-')}",
             f"- 目标命令: {' '.join(command)}",
         ]
         if decision.reasons:
             lines.append("- 风险原因:")
             for reason in decision.reasons:
                 lines.append(f"  - {reason}")
+        rollback = str(report.get("rollback", "")).strip()
+        if rollback:
+            lines.append(f"- 回滚建议: {rollback}")
         text = "\n".join(lines)
         if _console and Panel:
             _console.print(Panel(text, border_style="yellow"))
@@ -428,6 +438,53 @@ def _build_approval_callback(*, enabled: bool):
         return bool(approved)
 
     return _callback
+
+
+@target_app.command("show")
+def target_show(
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
+) -> None:
+    store = TargetEnvStore(Path(profile_file))
+    payload = store.load().to_safe_dict()
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@target_app.command("set")
+def target_set(
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
+    prometheus_url: Annotated[str | None, typer.Option("--prometheus-url", help="Prometheus base URL.")] = None,
+    k8s_api_url: Annotated[str | None, typer.Option("--k8s-api-url", help="Kubernetes API URL.")] = None,
+    k8s_context: Annotated[str | None, typer.Option("--k8s-context", help="kubectl context name.")] = None,
+    k8s_namespace: Annotated[str | None, typer.Option("--k8s-namespace", help="Default Kubernetes namespace.")] = None,
+    k8s_bearer_token: Annotated[str | None, typer.Option("--k8s-bearer-token", help="Kubernetes bearer token.")] = None,
+    k8s_verify_tls: Annotated[bool | None, typer.Option("--k8s-verify-tls/--k8s-skip-tls-verify", help="TLS verification for Kubernetes API.")] = None,
+) -> None:
+    store = TargetEnvStore(Path(profile_file))
+    updated = store.update(
+        prometheus_url=prometheus_url,
+        k8s_api_url=k8s_api_url,
+        k8s_context=k8s_context,
+        k8s_namespace=k8s_namespace,
+        k8s_bearer_token=k8s_bearer_token,
+        k8s_verify_tls=k8s_verify_tls,
+    )
+    typer.echo(json.dumps(updated.to_safe_dict(), ensure_ascii=False, indent=2))
+
+
+def _build_system_prompt() -> str:
+    env = TargetEnvStore().load()
+    return (
+        "You are LazySRE CLI orchestrator with ReAct behavior. "
+        "When user asks incident/root-cause questions, do not guess. "
+        "First collect evidence with observer tools (metrics, cluster context, logs), "
+        "then summarize likely root cause and actionable commands. "
+        "Respect dry-run mode and approval policy. "
+        "For any write operations (delete/patch/scale/restart), provide risk-aware guidance. "
+        f"Target defaults: prometheus_url={env.prometheus_url or '(unset)'}, "
+        f"k8s_api_url={env.k8s_api_url or '(unset)'}, "
+        f"k8s_context={env.k8s_context or '(unset)'}, "
+        f"k8s_namespace={env.k8s_namespace or 'default'}."
+    )
 
 
 @pack_app.command("list")
@@ -518,6 +575,7 @@ def _resolve_lock_file(ctx: typer.Context, lock_file: str | None) -> Path:
 
 
 app.add_typer(pack_app, name="pack")
+app.add_typer(target_app, name="target")
 
 
 def main() -> None:
@@ -528,7 +586,7 @@ def main() -> None:
 def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     if len(argv) <= 1:
         return
-    commands = {"run", "chat", "pack", "--help", "-h"}
+    commands = {"run", "chat", "pack", "target", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",

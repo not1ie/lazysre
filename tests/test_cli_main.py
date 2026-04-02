@@ -23,3 +23,9 @@ def test_rewrite_argv_with_session_file_option_then_instruction() -> None:
     argv = ["lsre", "--session-file", ".data/custom-session.json", "重启它"]
     _rewrite_argv_for_default_run(argv)
     assert argv == ["lsre", "--session-file", ".data/custom-session.json", "run", "重启它"]
+
+
+def test_rewrite_argv_preserves_target_subcommand() -> None:
+    argv = ["lsre", "target", "show"]
+    _rewrite_argv_for_default_run(argv)
+    assert argv == ["lsre", "target", "show"]

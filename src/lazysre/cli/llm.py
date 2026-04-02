@@ -145,7 +145,6 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
                         call_id="mock-metrics-1",
                         name="get_metrics",
                         arguments={
-                            "prometheus_url": "http://127.0.0.1:9090",
                             "query": 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service="payment"}[5m])) by (le))',
                             "window_minutes": 15,
                             "step_sec": 30,

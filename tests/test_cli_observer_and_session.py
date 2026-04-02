@@ -15,7 +15,7 @@ def test_builtin_tools_include_observers_with_schema() -> None:
     assert "get_cluster_context" in specs
     assert "fetch_service_logs" in specs
     assert "get_metrics" in specs
-    assert specs["get_metrics"].parameters.get("required") == ["prometheus_url", "query"]
+    assert specs["get_metrics"].parameters.get("required") == ["query"]
 
 
 def test_redact_and_compress_masks_sensitive_fields() -> None:
