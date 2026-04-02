@@ -69,6 +69,45 @@ class SessionStore:
             return f"previous_user_request={last_user}"
         return "session_hint: " + ", ".join(hints)
 
+    def recent_turns(self, limit: int = 10) -> list[dict[str, str]]:
+        payload = self.load()
+        turns = payload.get("turns", [])
+        if not isinstance(turns, list):
+            return []
+        cap = max(1, min(limit, 100))
+        rows: list[dict[str, str]] = []
+        for item in turns[-cap:]:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "user": str(item.get("user", "")),
+                    "assistant": str(item.get("assistant", "")),
+                }
+            )
+        return rows
+
+    def clear(self) -> None:
+        self._save({"turns": [], "entities": {}})
+
+    def export_markdown(self, limit: int = 30) -> str:
+        turns = self.recent_turns(limit=limit)
+        if not turns:
+            return "# LazySRE Session History\n\n(Empty)\n"
+        lines = ["# LazySRE Session History", ""]
+        for idx, item in enumerate(turns, 1):
+            lines.append(f"## Turn {idx}")
+            lines.append("")
+            lines.append(f"### User")
+            lines.append("")
+            lines.append(item["user"])
+            lines.append("")
+            lines.append(f"### Assistant")
+            lines.append("")
+            lines.append(item["assistant"])
+            lines.append("")
+        return "\n".join(lines).strip() + "\n"
+
     def _save(self, payload: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -97,4 +136,3 @@ def _extract_entities(user_input: str, result: DispatchResult, entities: dict[st
             entities["last_service"] = svc
         if ns:
             entities["last_namespace"] = ns
-

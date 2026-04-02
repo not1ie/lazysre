@@ -143,7 +143,7 @@ def _assess_kubectl(args: list[str], joined: str) -> tuple[str, list[str]]:
 
 
 def _assess_docker(args: list[str], joined: str) -> tuple[str, list[str]]:
-    read_only = {"ps", "images", "inspect", "stats", "logs", "service", "node"}
+    read_only = {"ps", "images", "inspect", "stats", "logs", "service", "node", "info"}
     mutate = {"restart", "stop", "start", "kill", "rm", "rmi", "run"}
 
     cmd = _first_subcommand(args)

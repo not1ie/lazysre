@@ -54,6 +54,19 @@ def test_session_store_builds_pronoun_hint(tmp_path: Path) -> None:
     assert "last_namespace=prod" in hint
 
 
+def test_session_store_recent_clear_and_export(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "session.json")
+    base = DispatchResult(final_text="处理完成", events=[])
+    store.append_turn("查看 pod", base)
+    store.append_turn("重启它", base)
+    turns = store.recent_turns(limit=5)
+    assert len(turns) == 2
+    md = store.export_markdown(limit=5)
+    assert "Turn 1" in md and "Turn 2" in md
+    store.clear()
+    assert store.recent_turns(limit=5) == []
+
+
 async def test_dispatcher_react_flow_for_latency_question() -> None:
     dispatcher = Dispatcher(
         llm=MockFunctionCallingLLM(),

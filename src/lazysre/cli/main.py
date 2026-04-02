@@ -15,7 +15,7 @@ from lazysre.cli.llm import MockFunctionCallingLLM, OpenAIResponsesLLM
 from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.policy import PolicyDecision, build_risk_report
 from lazysre.cli.session import SessionStore
-from lazysre.cli.target import TargetEnvStore
+from lazysre.cli.target import TargetEnvStore, probe_target_environment
 from lazysre.cli.tools import build_default_registry
 from lazysre.cli.tools.marketplace import (
     LockedPack,
@@ -48,6 +48,7 @@ app = typer.Typer(
 )
 pack_app = typer.Typer(help="Tool pack marketplace and lock management.")
 target_app = typer.Typer(help="Target environment profile management.")
+history_app = typer.Typer(help="Session history management.")
 
 
 @app.callback(invoke_without_command=True)
@@ -503,6 +504,86 @@ def target_set(
     typer.echo(json.dumps(updated.to_safe_dict(), ensure_ascii=False, indent=2))
 
 
+@target_app.command("probe")
+def target_probe(
+    ctx: typer.Context,
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 6,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview probe commands without executing.")] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON report.")] = False,
+) -> None:
+    target = TargetEnvStore(Path(profile_file)).load()
+    base = dict(ctx.obj or {})
+    audit_path = Path(str(base.get("audit_log", ".data/lsre-audit.jsonl")))
+    report = asyncio.run(
+        probe_target_environment(
+            target,
+            executor=SafeExecutor(
+                dry_run=dry_run,
+                approval_mode="permissive",
+                approval_granted=True,
+                audit_logger=AuditLogger(audit_path),
+            ),
+            timeout_sec=timeout_sec,
+        )
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_probe_report(report)
+
+
+@history_app.command("show")
+def history_show(
+    ctx: typer.Context,
+    session_file: Annotated[str | None, typer.Option("--session-file", help="Override session file path.")] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Number of turns to display.")] = 10,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = SessionStore(_resolve_session_file(ctx, session_file))
+    turns = store.recent_turns(limit=limit)
+    if as_json or (not _console):
+        typer.echo(json.dumps(turns, ensure_ascii=False, indent=2))
+        return
+    table = Table(title="Session History")
+    table.add_column("#", style="cyan", no_wrap=True)
+    table.add_column("User", style="white")
+    table.add_column("Assistant", style="green")
+    for idx, item in enumerate(turns, 1):
+        table.add_row(str(idx), item["user"][:100], item["assistant"][:140])
+    _console.print(table)
+
+
+@history_app.command("clear")
+def history_clear(
+    ctx: typer.Context,
+    session_file: Annotated[str | None, typer.Option("--session-file", help="Override session file path.")] = None,
+    yes: Annotated[bool, typer.Option("--yes", help="Skip confirmation prompt.")] = False,
+) -> None:
+    store = SessionStore(_resolve_session_file(ctx, session_file))
+    if not yes:
+        if not typer.confirm("确认清空会话历史吗？", default=False):
+            typer.echo("Canceled.")
+            return
+    store.clear()
+    typer.echo("Session history cleared.")
+
+
+@history_app.command("export")
+def history_export(
+    ctx: typer.Context,
+    session_file: Annotated[str | None, typer.Option("--session-file", help="Override session file path.")] = None,
+    output: Annotated[str, typer.Option("--output", help="Output markdown file path.")] = ".data/lsre-session-history.md",
+    limit: Annotated[int, typer.Option("--limit", help="Number of turns to export.")] = 30,
+) -> None:
+    store = SessionStore(_resolve_session_file(ctx, session_file))
+    content = store.export_markdown(limit=limit)
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(content, encoding="utf-8")
+    typer.echo(f"Exported: {out_path}")
+
+
 def _build_system_prompt() -> str:
     env = TargetEnvStore().load()
     return (
@@ -608,6 +689,7 @@ def _resolve_lock_file(ctx: typer.Context, lock_file: str | None) -> Path:
 
 app.add_typer(pack_app, name="pack")
 app.add_typer(target_app, name="target")
+app.add_typer(history_app, name="history")
 
 
 def _render_timeline(events) -> None:
@@ -632,6 +714,38 @@ def _render_timeline(events) -> None:
     _console.print(table)
 
 
+def _render_probe_report(report: dict[str, object]) -> None:
+    if not (_console and Table):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    summary = dict(report.get("summary", {})) if isinstance(report, dict) else {}
+    checks = dict(report.get("checks", {})) if isinstance(report, dict) else {}
+    title = (
+        f"Target Probe ({summary.get('ok_count', 0)}/{summary.get('total', 0)}) "
+        f"{'OK' if summary.get('all_ok') else 'Degraded'}"
+    )
+    table = Table(title=title)
+    table.add_column("Check", style="cyan", no_wrap=True)
+    table.add_column("Status", style="white", no_wrap=True)
+    table.add_column("Exit", style="green", no_wrap=True)
+    table.add_column("Detail", style="white")
+    for name, row in checks.items():
+        item = row if isinstance(row, dict) else {}
+        ok = bool(item.get("ok"))
+        status = "ok" if ok else "failed"
+        detail = str(item.get("stdout_preview", "") or item.get("stderr_preview", ""))[:160]
+        table.add_row(str(name), status, str(item.get("exit_code", "-")), detail)
+    _console.print(table)
+
+
+def _resolve_session_file(ctx: typer.Context, session_file: str | None) -> Path:
+    if session_file and session_file.strip():
+        return Path(session_file)
+    obj = dict(ctx.obj or {})
+    candidate = str(obj.get("session_file", ".data/lsre-session.json")).strip()
+    return Path(candidate or ".data/lsre-session.json")
+
+
 def main() -> None:
     _rewrite_argv_for_default_run(sys.argv)
     app()
@@ -640,7 +754,7 @@ def main() -> None:
 def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     if len(argv) <= 1:
         return
-    commands = {"run", "chat", "pack", "target", "--help", "-h"}
+    commands = {"run", "chat", "pack", "target", "history", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",

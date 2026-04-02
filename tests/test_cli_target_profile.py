@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from lazysre.cli.executor import SafeExecutor
-from lazysre.cli.target import TargetEnvStore
+from lazysre.cli.target import TargetEnvStore, TargetEnvironment, probe_target_environment
 from lazysre.cli.tools.builtin import _get_metrics, _run_kubectl
 from lazysre.cli.types import ExecResult
 from lazysre.config import settings
@@ -18,6 +18,58 @@ class _CaptureExecutor(SafeExecutor):
             ok=True,
             command=command,
             stdout="{}",
+            stderr="",
+            exit_code=0,
+            dry_run=True,
+        )
+
+
+class _ProbeExecutor(SafeExecutor):
+    async def run(self, command: list[str]) -> ExecResult:
+        head = command[0] if command else ""
+        if head == "curl":
+            return ExecResult(
+                ok=True,
+                command=command,
+                stdout="Prometheus Server is Healthy.",
+                stderr="",
+                exit_code=0,
+                dry_run=False,
+            )
+        if head == "kubectl":
+            return ExecResult(
+                ok=True,
+                command=command,
+                stdout="Client Version: v1.30.1\nServer Version: v1.30.0",
+                stderr="",
+                exit_code=0,
+                dry_run=False,
+            )
+        if head == "docker":
+            return ExecResult(
+                ok=True,
+                command=command,
+                stdout="27.0.2",
+                stderr="",
+                exit_code=0,
+                dry_run=False,
+            )
+        return ExecResult(
+            ok=False,
+            command=command,
+            stdout="",
+            stderr="unsupported",
+            exit_code=1,
+            dry_run=False,
+        )
+
+
+class _ProbeDryRunExecutor(SafeExecutor):
+    async def run(self, command: list[str]) -> ExecResult:
+        return ExecResult(
+            ok=True,
+            command=command,
+            stdout="[dry-run] " + " ".join(command),
             stderr="",
             exit_code=0,
             dry_run=True,
@@ -82,3 +134,40 @@ async def test_observer_tools_use_target_profile_defaults(tmp_path: Path) -> Non
         settings.target_k8s_namespace = old_k8s_ns
         settings.target_k8s_bearer_token = old_k8s_token
         settings.target_k8s_verify_tls = old_k8s_tls
+
+
+async def test_probe_target_environment_report_shape() -> None:
+    report = await probe_target_environment(
+        TargetEnvironment(
+            prometheus_url="http://92.168.69.176:9090",
+            k8s_api_url="https://192.168.10.1:6443",
+            k8s_context="prod",
+            k8s_namespace="default",
+            k8s_bearer_token="abcd1234",
+            k8s_verify_tls=False,
+        ),
+        executor=_ProbeExecutor(dry_run=False),
+        timeout_sec=5,
+    )
+    summary = report["summary"]
+    checks = report["checks"]
+    assert summary["total"] == 3
+    assert "prometheus" in checks
+    assert "kubernetes" in checks
+    assert "docker" in checks
+
+
+async def test_probe_target_environment_dry_run_marks_checks_ok() -> None:
+    report = await probe_target_environment(
+        TargetEnvironment(
+            prometheus_url="http://92.168.69.176:9090",
+            k8s_api_url="https://192.168.10.1:6443",
+            k8s_context="prod",
+            k8s_namespace="default",
+            k8s_bearer_token="abcd1234",
+            k8s_verify_tls=False,
+        ),
+        executor=_ProbeDryRunExecutor(dry_run=True),
+        timeout_sec=5,
+    )
+    assert report["summary"]["all_ok"] is True
