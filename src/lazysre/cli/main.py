@@ -12,7 +12,13 @@ import typer
 from lazysre.cli.audit import AuditLogger
 from lazysre.cli.dispatcher import Dispatcher
 from lazysre.cli.executor import SafeExecutor
-from lazysre.cli.fix_mode import FixPlan, compose_fix_instruction, extract_fix_plan
+from lazysre.cli.fix_mode import (
+    FixPlan,
+    build_plan_record,
+    compose_fix_instruction,
+    evaluate_apply_guardrail,
+    extract_fix_plan,
+)
 from lazysre.cli.llm import MockFunctionCallingLLM, OpenAIResponsesLLM
 from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
@@ -209,6 +215,10 @@ def fix_instruction(
     instruction: Annotated[str, typer.Argument(help='Incident instruction, e.g. lsre fix "payment service slow"')],
     apply: Annotated[bool, typer.Option("--apply", help="Apply suggested commands step-by-step with confirmations.")] = False,
     max_apply_steps: Annotated[int, typer.Option("--max-apply-steps", help="Max number of suggested commands to execute.")] = 6,
+    allow_high_risk: Annotated[bool, typer.Option("--allow-high-risk", help="Allow high/critical risk steps in apply mode.")] = False,
+    auto_approve_low_risk: Annotated[bool, typer.Option("--auto-approve-low-risk", help="Auto-approve low-risk steps in apply mode.")] = False,
+    export_plan_md: Annotated[str, typer.Option("--export-plan-md", help="Export fix plan markdown path.")] = "",
+    export_plan_json: Annotated[str, typer.Option("--export-plan-json", help="Export fix plan json path.")] = "",
     execute: Annotated[bool | None, typer.Option("--execute", help="Override execution mode for apply steps.")] = None,
     approve: Annotated[bool | None, typer.Option("--approve", help="Override approval gate acknowledgement for diagnosis phase.")] = None,
     interactive_approval: Annotated[bool | None, typer.Option("--interactive-approval/--no-interactive-approval", help="Override interactive approval prompt for diagnosis phase.")] = None,
@@ -247,6 +257,10 @@ def fix_instruction(
         instruction=instruction,
         apply=apply,
         max_apply_steps=max(1, min(max_apply_steps, 30)),
+        allow_high_risk=allow_high_risk,
+        auto_approve_low_risk=auto_approve_low_risk,
+        export_plan_md=export_plan_md,
+        export_plan_json=export_plan_json,
         execute=bool(options["execute"]),
         approve=bool(options["approve"]),
         interactive_approval=bool(options["interactive_approval"]),
@@ -448,6 +462,10 @@ def _run_fix(
     instruction: str,
     apply: bool,
     max_apply_steps: int,
+    allow_high_risk: bool,
+    auto_approve_low_risk: bool,
+    export_plan_md: str,
+    export_plan_json: str,
     execute: bool,
     approve: bool,
     interactive_approval: bool,
@@ -535,6 +553,21 @@ def _run_fix(
 
     plan = extract_fix_plan(result.final_text)
     _render_fix_summary(plan, max_apply_steps=max_apply_steps)
+    selected_preview = plan.apply_commands[:max_apply_steps]
+    md_path = Path(export_plan_md.strip() or ".data/lsre-fix-last.md")
+    json_path = Path(export_plan_json.strip() or ".data/lsre-fix-last.json")
+    _write_text_file(md_path, result.final_text)
+    _write_json_file(
+        json_path,
+        build_plan_record(
+            instruction=instruction,
+            plan=plan,
+            final_text=result.final_text,
+            selected_apply_commands=selected_preview,
+            approval_mode=approval_mode,
+        ),
+    )
+    typer.echo(f"修复计划已导出: md={md_path} json={json_path}")
 
     if not apply:
         typer.echo("计划已生成。若需分步执行，请加 --apply。")
@@ -549,8 +582,9 @@ def _run_fix(
         approval_granted=True,  # step-level y/n confirmation already enforced below
         audit_logger=AuditLogger(Path(audit_log)),
     )
-    selected = plan.apply_commands[:max_apply_steps]
+    selected = selected_preview
     total = len(selected)
+    skipped_high_risk = 0
     for idx, command_text in enumerate(selected, 1):
         try:
             command = shlex.split(command_text)
@@ -562,12 +596,26 @@ def _run_fix(
         decision = assess_command(command, approval_mode=approval_mode)
         report = build_risk_report(command, decision)
         _render_step_risk(idx, total, command_text, report)
-        if not typer.confirm(f"[step {idx}/{total}] 是否执行该步骤？", default=False):
+        allow_execute, need_confirm = evaluate_apply_guardrail(
+            risk_level=str(report.get("risk_level", "low")),
+            allow_high_risk=allow_high_risk,
+            auto_approve_low_risk=auto_approve_low_risk,
+        )
+        if not allow_execute:
+            skipped_high_risk += 1
+            typer.echo(f"[step {idx}/{total}] 已跳过高风险步骤（如需执行请加 --allow-high-risk）")
             continue
+        if need_confirm and (not typer.confirm(f"[step {idx}/{total}] 是否执行该步骤？", default=False)):
+            continue
+        if (not need_confirm) and auto_approve_low_risk:
+            typer.echo(f"[step {idx}/{total}] low-risk 自动通过确认")
         result_exec = asyncio.run(executor.run(command))
         _render_step_result(idx, total, result_exec)
         if (not result_exec.ok) and (not typer.confirm("步骤失败，是否继续后续步骤？", default=False)):
             break
+
+    if skipped_high_risk:
+        typer.echo(f"共跳过 {skipped_high_risk} 个高风险步骤。")
 
     if plan.rollback_commands:
         typer.echo("\n可回滚命令：")
@@ -995,6 +1043,16 @@ def _render_step_result(step_index: int, total_steps: int, result) -> None:
         _console.print(Panel(text, border_style=border))
     else:
         typer.echo(text)
+
+
+def _write_text_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _write_json_file(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _resolve_session_file(ctx: typer.Context, session_file: str | None) -> Path:

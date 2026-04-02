@@ -23,9 +23,12 @@ lsre "检查 k8s pod 状态"
 
 # 自动修复模式（先生成修复与回滚计划）
 lsre fix "为什么支付服务响应变慢了？"
+lsre fix "为什么支付服务响应变慢了？" --export-plan-md .data/fix.md --export-plan-json .data/fix.json
 
 # 分步执行修复（每步确认）
 lsre fix "为什么支付服务响应变慢了？" --apply --execute
+lsre fix "为什么支付服务响应变慢了？" --apply --execute --allow-high-risk
+lsre fix "为什么支付服务响应变慢了？" --apply --execute --auto-approve-low-risk
 
 # 目标环境配置与连通性探针
 lsre target show

@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
 
 
 @dataclass(slots=True)
 class FixPlan:
     apply_commands: list[str]
     rollback_commands: list[str]
+
+    def to_dict(self) -> dict[str, list[str]]:
+        return {
+            "apply_commands": list(self.apply_commands),
+            "rollback_commands": list(self.rollback_commands),
+        }
 
 
 def compose_fix_instruction(user_instruction: str) -> str:
@@ -51,6 +59,38 @@ def extract_fix_plan(markdown_text: str) -> FixPlan:
             return FixPlan(apply_commands=all_apply, rollback_commands=last_rollback)
 
     return FixPlan(apply_commands=apply_commands, rollback_commands=[])
+
+
+def build_plan_record(
+    *,
+    instruction: str,
+    plan: FixPlan,
+    final_text: str,
+    selected_apply_commands: list[str],
+    approval_mode: str,
+) -> dict[str, Any]:
+    return {
+        "instruction": instruction,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "approval_mode": approval_mode,
+        "plan": plan.to_dict(),
+        "selected_apply_commands": list(selected_apply_commands),
+        "final_text": final_text,
+    }
+
+
+def evaluate_apply_guardrail(
+    *,
+    risk_level: str,
+    allow_high_risk: bool,
+    auto_approve_low_risk: bool,
+) -> tuple[bool, bool]:
+    level = (risk_level or "low").strip().lower()
+    if level in {"high", "critical"} and (not allow_high_risk):
+        return False, False
+    if level == "low" and auto_approve_low_risk:
+        return True, False
+    return True, True
 
 
 def _extract_section(text: str, headings: tuple[str, ...]) -> str:
