@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -20,6 +21,7 @@ class FunctionCallingLLM(ABC):
         user_input: str | None = None,
         previous_response_id: str | None = None,
         tool_outputs: list[ToolOutput] | None = None,
+        text_stream: Callable[[str], None] | None = None,
     ) -> LLMTurn:
         raise NotImplementedError
 
@@ -37,6 +39,7 @@ class OpenAIResponsesLLM(FunctionCallingLLM):
         user_input: str | None = None,
         previous_response_id: str | None = None,
         tool_outputs: list[ToolOutput] | None = None,
+        text_stream: Callable[[str], None] | None = None,
     ) -> LLMTurn:
         payload: dict[str, Any] = {"model": model}
         headers = {
@@ -76,6 +79,13 @@ class OpenAIResponsesLLM(FunctionCallingLLM):
             ]
             payload["tool_choice"] = "auto"
         payload["max_output_tokens"] = 800
+        if text_stream:
+            payload["stream"] = True
+            return await _stream_openai_turn(
+                payload=payload,
+                headers=headers,
+                text_stream=text_stream,
+            )
 
         async with httpx.AsyncClient(timeout=45.0) as client:
             resp = await client.post(
@@ -98,6 +108,7 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
         user_input: str | None = None,
         previous_response_id: str | None = None,
         tool_outputs: list[ToolOutput] | None = None,
+        text_stream: Callable[[str], None] | None = None,
     ) -> LLMTurn:
         if previous_response_id == "mock-react-1":
             return LLMTurn(
@@ -127,14 +138,22 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
             lines.append("kubectl -n default rollout restart deploy/payment")
             lines.append("kubectl -n default get pods -l app=payment -w")
             lines.append("```")
-            return LLMTurn(response_id="mock-final", text="\n".join(lines), tool_calls=[])
+            rendered = "\n".join(lines)
+            if text_stream:
+                for token in _chunk_text(rendered):
+                    text_stream(token)
+            return LLMTurn(response_id="mock-final", text=rendered, tool_calls=[])
 
         if previous_response_id and tool_outputs:
             lines = [f"[mock:{model}] 工具执行结果汇总："]
             for item in tool_outputs:
                 lines.append(f"- call={item.call_id}: {item.output[:220]}")
             lines.append("建议：先 dry-run 验证，再执行线上动作。")
-            return LLMTurn(response_id="mock-final", text="\n".join(lines), tool_calls=[])
+            rendered = "\n".join(lines)
+            if text_stream:
+                for token in _chunk_text(rendered):
+                    text_stream(token)
+            return LLMTurn(response_id="mock-final", text=rendered, tool_calls=[])
 
         text = (user_input or "").lower()
         if any(word in text for word in ("变慢", "慢了", "latency", "延迟", "响应慢", "支付服务")):
@@ -213,12 +232,16 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
                     )
                 ],
             )
+        fallback = (
+            f"[mock:{model}] 已收到指令。可尝试包含关键字 kubectl/docker/curl/log，"
+            "我会自动触发对应工具。"
+        )
+        if text_stream:
+            for token in _chunk_text(fallback):
+                text_stream(token)
         return LLMTurn(
             response_id="mock-0",
-            text=(
-                f"[mock:{model}] 已收到指令。可尝试包含关键字 kubectl/docker/curl/log，"
-                "我会自动触发对应工具。"
-            ),
+            text=fallback,
             tool_calls=[],
         )
 
@@ -265,3 +288,52 @@ def _safe_json_loads(raw: Any) -> Any:
         return json.loads(raw)
     except Exception:
         return {}
+
+
+async def _stream_openai_turn(
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    text_stream: Callable[[str], None],
+) -> LLMTurn:
+    final_response: dict[str, Any] | None = None
+    buffered_chunks: list[str] = []
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        async with client.stream(
+            "POST",
+            "https://api.openai.com/v1/responses",
+            json=payload,
+            headers=headers,
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except Exception:
+                    continue
+                event_type = str(event.get("type", ""))
+                if event_type == "response.output_text.delta":
+                    delta = str(event.get("delta", ""))
+                    if delta:
+                        buffered_chunks.append(delta)
+                        text_stream(delta)
+                elif event_type == "response.completed":
+                    maybe_response = event.get("response")
+                    if isinstance(maybe_response, dict):
+                        final_response = maybe_response
+    if final_response is not None:
+        return _parse_openai_turn(final_response)
+    return LLMTurn(response_id="stream-fallback", text="".join(buffered_chunks), tool_calls=[])
+
+
+def _chunk_text(text: str, size: int = 18) -> list[str]:
+    if not text:
+        return []
+    return [text[idx : idx + size] for idx in range(0, len(text), size)]

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from time import perf_counter
 
 from lazysre.cli.executor import SafeExecutor
 from lazysre.cli.llm import FunctionCallingLLM
@@ -15,6 +17,7 @@ class Dispatcher:
     executor: SafeExecutor
     model: str
     max_steps: int = 6
+    text_stream: Callable[[str], None] | None = None
     system_prompt: str = (
         "You are LazySRE CLI orchestrator with ReAct behavior. "
         "When user asks incident/root-cause questions, do not guess. "
@@ -38,11 +41,20 @@ class Dispatcher:
             ),
         ]
         specs = self.registry.specs()
+        llm_start = perf_counter()
         turn = await self.llm.respond(
             model=self.model,
             tools=specs,
             system_prompt=self.system_prompt,
             user_input=instruction,
+            text_stream=self.text_stream,
+        )
+        events.append(
+            DispatchEvent(
+                kind="llm_turn",
+                message="initial_response",
+                data={"duration_ms": round((perf_counter() - llm_start) * 1000, 2)},
+            )
         )
 
         for step in range(1, self.max_steps + 1):
@@ -66,22 +78,37 @@ class Dispatcher:
                         data={"call_id": call.call_id, "arguments": call.arguments},
                     )
                 )
+                tool_start = perf_counter()
                 output = await self.registry.execute(call, self.executor)
                 outputs.append(ToolOutput(call_id=call.call_id, output=output))
                 events.append(
                     DispatchEvent(
                         kind="tool_output",
                         message=f"{call.name} returned",
-                        data={"call_id": call.call_id, "output_preview": output[:220]},
+                        data={
+                            "call_id": call.call_id,
+                            "output_preview": output[:220],
+                            "duration_ms": round((perf_counter() - tool_start) * 1000, 2),
+                            "step": step,
+                        },
                     )
                 )
 
+            llm_step_start = perf_counter()
             turn = await self.llm.respond(
                 model=self.model,
                 tools=specs,
                 system_prompt=self.system_prompt,
                 previous_response_id=turn.response_id,
                 tool_outputs=outputs,
+                text_stream=self.text_stream,
+            )
+            events.append(
+                DispatchEvent(
+                    kind="llm_turn",
+                    message=f"step_{step}_followup",
+                    data={"duration_ms": round((perf_counter() - llm_step_start) * 1000, 2)},
+                )
             )
 
         fallback = (

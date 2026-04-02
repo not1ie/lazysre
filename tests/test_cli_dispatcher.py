@@ -107,3 +107,36 @@ async def test_tool_permission_context_blocks_registry_tool() -> None:
     assert outputs
     preview = str(outputs[0].data.get("output_preview", ""))
     assert "tool blocked by permission context" in preview
+
+
+async def test_dispatcher_emits_timeline_durations() -> None:
+    dispatcher = Dispatcher(
+        llm=MockFunctionCallingLLM(),
+        registry=build_default_registry(),
+        executor=SafeExecutor(dry_run=True),
+        model="gpt-5.4-mini",
+        max_steps=3,
+    )
+    result = await dispatcher.run("检查 k8s")
+    llm_events = [e for e in result.events if e.kind == "llm_turn"]
+    assert llm_events
+    assert isinstance(llm_events[0].data.get("duration_ms"), float | int)
+
+
+async def test_dispatcher_stream_callback_receives_tokens() -> None:
+    chunks: list[str] = []
+
+    def _stream(delta: str) -> None:
+        chunks.append(delta)
+
+    dispatcher = Dispatcher(
+        llm=MockFunctionCallingLLM(),
+        registry=build_default_registry(),
+        executor=SafeExecutor(dry_run=True),
+        model="gpt-5.4-mini",
+        max_steps=2,
+        text_stream=_stream,
+    )
+    result = await dispatcher.run("随便问一个不会触发工具的提示")
+    assert result.final_text
+    assert chunks

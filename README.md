@@ -59,6 +59,7 @@ lsre chat
 lsre --provider mock "重启异常容器"
 lsre --execute --approval-mode balanced --approve --provider mock "重启异常容器"
 lsre --execute --interactive-approval --provider mock "为什么支付服务响应变慢了？"
+lsre chat --stream-output
 lsre target show
 lsre target set --prometheus-url http://92.168.69.176:9090 --k8s-api-url https://192.168.10.1:6443 --k8s-skip-tls-verify
 lsre --provider mock --deny-tool docker "重启异常容器"
@@ -84,6 +85,7 @@ lsre --tool-pack locked:your_pack "执行锁定版本工具包任务"
 10. 执行模式下高风险写操作会生成“变更风险报告”，并等待控制台 `y/n` 确认（可用 `--no-interactive-approval` 关闭）。
 11. 支持 Session 历史记忆（默认 `.data/lsre-session.json`），可处理“重启它”这类指代。
 12. `target` 子命令可持久化目标环境（默认 `.data/lsre-target.json`），Observer 工具会自动使用这些默认值。
+13. 支持流式 token 输出（`--stream-output`）和执行时间线（LLM 轮次 + 工具耗时）。
 
 ## 环境变量
 

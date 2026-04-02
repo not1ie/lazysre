@@ -31,10 +31,12 @@ try:
     from rich.console import Console
     from rich.markdown import Markdown
     from rich.panel import Panel
+    from rich.table import Table
 except Exception:  # pragma: no cover
     Console = None  # type: ignore[assignment]
     Markdown = None  # type: ignore[assignment]
     Panel = None  # type: ignore[assignment]
+    Table = None  # type: ignore[assignment]
 
 _console = Console() if Console else None
 
@@ -54,6 +56,7 @@ def root(
     execute: Annotated[bool, typer.Option("--execute", help="Run commands for real. Default is dry-run.")] = False,
     approve: Annotated[bool, typer.Option("--approve", help="Acknowledge policy gate for high-risk commands.")] = False,
     interactive_approval: Annotated[bool, typer.Option("--interactive-approval/--no-interactive-approval", help="Prompt y/n confirmation for risky write actions in execute mode.")] = True,
+    stream_output: Annotated[bool, typer.Option("--stream-output/--no-stream-output", help="Stream model tokens in terminal output.")] = True,
     approval_mode: Annotated[str, typer.Option(help="Policy level: strict|balanced|permissive")] = "balanced",
     audit_log: Annotated[str, typer.Option(help="Audit jsonl path for command execution records.")] = ".data/lsre-audit.jsonl",
     lock_file: Annotated[str, typer.Option(help="Tool pack lock file path.")] = ".data/lsre-tool-lock.json",
@@ -70,6 +73,7 @@ def root(
         "execute": execute,
         "approve": approve,
         "interactive_approval": interactive_approval,
+        "stream_output": stream_output,
         "approval_mode": approval_mode,
         "audit_log": audit_log,
         "lock_file": lock_file,
@@ -94,6 +98,7 @@ def run_instruction(
         execute=None,
         approve=None,
         interactive_approval=None,
+        stream_output=None,
         approval_mode=None,
         audit_log=None,
         lock_file=None,
@@ -111,6 +116,7 @@ def run_instruction(
         execute=bool(options["execute"]),
         approve=bool(options["approve"]),
         interactive_approval=bool(options["interactive_approval"]),
+        stream_output=bool(options["stream_output"]),
         approval_mode=str(options["approval_mode"]),
         audit_log=str(options["audit_log"]),
         lock_file=str(options["lock_file"]),
@@ -131,6 +137,7 @@ def chat(
     execute: Annotated[bool | None, typer.Option("--execute", help="Override execution mode.")] = None,
     approve: Annotated[bool | None, typer.Option("--approve", help="Override approval gate acknowledgement.")] = None,
     interactive_approval: Annotated[bool | None, typer.Option("--interactive-approval/--no-interactive-approval", help="Override interactive approval prompt.")] = None,
+    stream_output: Annotated[bool | None, typer.Option("--stream-output/--no-stream-output", help="Override token streaming mode.")] = None,
     approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
     audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
     lock_file: Annotated[str | None, typer.Option(help="Override tool pack lock file path.")] = None,
@@ -148,6 +155,7 @@ def chat(
         execute=execute,
         approve=approve,
         interactive_approval=interactive_approval,
+        stream_output=stream_output,
         approval_mode=approval_mode,
         audit_log=audit_log,
         lock_file=lock_file,
@@ -177,6 +185,7 @@ def chat(
             execute=bool(options["execute"]),
             approve=bool(options["approve"]),
             interactive_approval=bool(options["interactive_approval"]),
+            stream_output=bool(options["stream_output"]),
             approval_mode=str(options["approval_mode"]),
             audit_log=str(options["audit_log"]),
             lock_file=str(options["lock_file"]),
@@ -197,6 +206,7 @@ def _merged_options(
     execute: bool | None,
     approve: bool | None,
     interactive_approval: bool | None,
+    stream_output: bool | None,
     approval_mode: str | None,
     audit_log: str | None,
     lock_file: str | None,
@@ -216,6 +226,8 @@ def _merged_options(
         base["approve"] = approve
     if interactive_approval is not None:
         base["interactive_approval"] = interactive_approval
+    if stream_output is not None:
+        base["stream_output"] = stream_output
     if approval_mode is not None:
         base["approval_mode"] = approval_mode
     if audit_log is not None:
@@ -244,6 +256,8 @@ def _merged_options(
         base["approve"] = False
     if "interactive_approval" not in base:
         base["interactive_approval"] = True
+    if "stream_output" not in base:
+        base["stream_output"] = True
     if "approval_mode" not in base:
         base["approval_mode"] = "balanced"
     if "audit_log" not in base:
@@ -275,6 +289,7 @@ def _run_once(
     execute: bool,
     approve: bool,
     interactive_approval: bool,
+    stream_output: bool,
     approval_mode: str,
     audit_log: str,
     lock_file: str,
@@ -293,7 +308,16 @@ def _run_once(
     if session_hint:
         prompt = f"{instruction}\n\n[session]\n{session_hint}"
 
-    if _console:
+    streamed_chunks: list[str] = []
+    stream_enabled = bool(_console and stream_output)
+
+    def _stream_text(delta: str) -> None:
+        if not _console:
+            return
+        streamed_chunks.append(delta)
+        _console.print(delta, end="")
+
+    if _console and (not stream_enabled):
         with _console.status("[bold cyan]AI思考中...[/]"):
             result = asyncio.run(
                 _dispatch(
@@ -311,6 +335,7 @@ def _run_once(
                     model=model,
                     provider=provider,
                     max_steps=max_steps,
+                    text_stream=None,
                 )
             )
     else:
@@ -330,20 +355,25 @@ def _run_once(
                 model=model,
                 provider=provider,
                 max_steps=max_steps,
+                text_stream=_stream_text if stream_enabled else None,
             )
         )
+    if _console and streamed_chunks:
+        _console.print("")
     session.append_turn(user_input=instruction, result=result)
 
-    for event in result.events:
-        if event.kind in {"tool_call", "tool_output"}:
-            detail = json.dumps(event.data, ensure_ascii=False)
-            if _console:
-                style = "cyan" if event.kind == "tool_call" else "green"
-                _console.print(f"[{style}][{event.kind}][/]{event.message} {detail}")
-            else:
+    if _console:
+        _render_timeline(result.events)
+    else:
+        for event in result.events:
+            if event.kind in {"tool_call", "tool_output", "llm_turn"}:
+                detail = json.dumps(event.data, ensure_ascii=False)
                 typer.echo(f"[{event.kind}] {event.message} {detail}")
-    if _console and Markdown:
-        _console.print(Panel(Markdown(result.final_text), title="LazySRE", border_style="blue"))
+    if _console:
+        if Markdown and (not streamed_chunks):
+            _console.print(Panel(Markdown(result.final_text), title="LazySRE", border_style="blue"))
+        elif (not streamed_chunks):
+            _console.print(result.final_text)
     else:
         typer.echo(result.final_text)
 
@@ -364,6 +394,7 @@ async def _dispatch(
     model: str,
     provider: str,
     max_steps: int,
+    text_stream=None,
 ):
     mode = (provider or "auto").strip().lower()
     if mode not in {"auto", "mock", "openai"}:
@@ -400,6 +431,7 @@ async def _dispatch(
         ),
         model=model,
         max_steps=max(1, min(max_steps, 12)),
+        text_stream=text_stream,
         system_prompt=_build_system_prompt(),
     )
     return await dispatcher.run(instruction)
@@ -576,6 +608,28 @@ def _resolve_lock_file(ctx: typer.Context, lock_file: str | None) -> Path:
 
 app.add_typer(pack_app, name="pack")
 app.add_typer(target_app, name="target")
+
+
+def _render_timeline(events) -> None:
+    if not (_console and Table):
+        return
+    rows: list[tuple[str, str, str]] = []
+    for event in events:
+        if event.kind == "llm_turn":
+            duration = str(event.data.get("duration_ms", "-"))
+            rows.append(("llm", event.message, f"{duration} ms"))
+        elif event.kind == "tool_output":
+            duration = str(event.data.get("duration_ms", "-"))
+            rows.append(("tool", event.message, f"{duration} ms"))
+    if not rows:
+        return
+    table = Table(title="Execution Timeline")
+    table.add_column("Type", style="cyan", no_wrap=True)
+    table.add_column("Step", style="white")
+    table.add_column("Duration", style="green", justify="right")
+    for row in rows[-18:]:
+        table.add_row(*row)
+    _console.print(table)
 
 
 def main() -> None:
