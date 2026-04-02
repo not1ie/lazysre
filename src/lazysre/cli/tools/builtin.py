@@ -83,6 +83,10 @@ def builtin_tools() -> list[ToolDefinition]:
     ]
 
 
+def tool_pack() -> list[ToolDefinition]:
+    return builtin_tools()
+
+
 async def _run_kubectl(args: dict[str, object], executor: SafeExecutor) -> ExecResult:
     command = str(args.get("command", "")).strip()
     if not command:
@@ -137,4 +141,3 @@ async def _run_logs(args: dict[str, object], executor: SafeExecutor) -> ExecResu
     lines = max(1, min(lines, 2000))
     cmd = ["tail", "-n", str(lines), path]
     return await executor.run(cmd)
-

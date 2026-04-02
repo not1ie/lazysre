@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 
 from lazysre.cli.audit import AuditLogger
-from lazysre.cli.policy import assess_command
+from lazysre.cli.policy import PolicyDecision, assess_command
 from lazysre.cli.types import ExecResult
 
 
@@ -19,7 +19,7 @@ class SafeExecutor:
         default_factory=lambda: {"kubectl", "docker", "curl", "tail"}
     )
 
-    async def run(self, command: list[str]) -> ExecResult:
+    def preflight(self, command: list[str]) -> tuple[PolicyDecision | None, ExecResult | None]:
         if not command:
             result = ExecResult(
                 ok=False,
@@ -28,8 +28,9 @@ class SafeExecutor:
                 exit_code=1,
                 dry_run=self.dry_run,
             )
-            self._audit(result)
-            return result
+            self.record(result)
+            return None, result
+
         binary = command[0]
         if binary not in self.allowed_binaries:
             result = ExecResult(
@@ -42,8 +43,8 @@ class SafeExecutor:
                 risk_level="critical",
                 policy_reasons=[f"binary '{binary}' is not in allowlist"],
             )
-            self._audit(result)
-            return result
+            self.record(result)
+            return None, result
 
         decision = assess_command(command, approval_mode=self.approval_mode)
         if decision.blocked:
@@ -59,25 +60,10 @@ class SafeExecutor:
                 requires_approval=decision.requires_approval,
                 approved=self.approval_granted,
             )
-            self._audit(result)
-            return result
+            self.record(result)
+            return decision, result
 
-        if self.dry_run:
-            result = ExecResult(
-                ok=True,
-                command=command,
-                stdout=f"[dry-run] {' '.join(command)}",
-                exit_code=0,
-                dry_run=True,
-                risk_level=decision.risk_level,
-                policy_reasons=decision.reasons,
-                requires_approval=decision.requires_approval,
-                approved=self.approval_granted,
-            )
-            self._audit(result)
-            return result
-
-        if decision.requires_approval and not self.approval_granted:
+        if (not self.dry_run) and decision.requires_approval and (not self.approval_granted):
             result = ExecResult(
                 ok=False,
                 command=command,
@@ -93,7 +79,29 @@ class SafeExecutor:
                 requires_approval=True,
                 approved=False,
             )
-            self._audit(result)
+            self.record(result)
+            return decision, result
+        return decision, None
+
+    async def run(self, command: list[str]) -> ExecResult:
+        decision, blocked = self.preflight(command)
+        if blocked:
+            return blocked
+        assert decision is not None
+
+        if self.dry_run:
+            result = ExecResult(
+                ok=True,
+                command=command,
+                stdout=f"[dry-run] {' '.join(command)}",
+                exit_code=0,
+                dry_run=True,
+                risk_level=decision.risk_level,
+                policy_reasons=decision.reasons,
+                requires_approval=decision.requires_approval,
+                approved=self.approval_granted,
+            )
+            self.record(result)
             return result
 
         try:
@@ -115,7 +123,7 @@ class SafeExecutor:
                 requires_approval=decision.requires_approval,
                 approved=self.approval_granted,
             )
-            self._audit(result)
+            self.record(result)
             return result
         except FileNotFoundError:
             result = ExecResult(
@@ -129,7 +137,7 @@ class SafeExecutor:
                 requires_approval=decision.requires_approval,
                 approved=self.approval_granted,
             )
-            self._audit(result)
+            self.record(result)
             return result
 
         result = ExecResult(
@@ -144,10 +152,10 @@ class SafeExecutor:
             requires_approval=decision.requires_approval,
             approved=self.approval_granted,
         )
-        self._audit(result)
+        self.record(result)
         return result
 
-    def _audit(self, result: ExecResult) -> None:
+    def record(self, result: ExecResult) -> None:
         if not self.audit_logger:
             return
         self.audit_logger.write(

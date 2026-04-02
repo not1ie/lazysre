@@ -33,6 +33,8 @@ def root(
     audit_log: Annotated[str, typer.Option(help="Audit jsonl path for command execution records.")] = ".data/lsre-audit.jsonl",
     deny_tool: Annotated[list[str], typer.Option("--deny-tool", help="Block specific tools by name, can be repeated.")] = [],
     deny_prefix: Annotated[list[str], typer.Option("--deny-prefix", help="Block tools by prefix, can be repeated.")] = [],
+    tool_pack: Annotated[list[str], typer.Option("--tool-pack", help="Tool pack spec. e.g. builtin or module:pkg.mod[:factory].")] = ["builtin"],
+    remote_gateway: Annotated[list[str], typer.Option("--remote-gateway", help="Remote gateway <name>=<url>[#token]. can be repeated.")] = [],
     model: Annotated[str, typer.Option(help="Model name for LLM dispatcher.")] = settings.model_name,
     provider: Annotated[str, typer.Option(help="LLM provider: auto|mock|openai")] = "auto",
     max_steps: Annotated[int, typer.Option(help="Max function-calling iterations.")] = 6,
@@ -44,6 +46,8 @@ def root(
         "audit_log": audit_log,
         "deny_tool": list(deny_tool),
         "deny_prefix": list(deny_prefix),
+        "tool_pack": list(tool_pack),
+        "remote_gateway": list(remote_gateway),
         "model": model,
         "provider": provider,
         "max_steps": max(1, min(max_steps, 12)),
@@ -57,6 +61,8 @@ def root(
             audit_log=audit_log,
             deny_tool=list(deny_tool),
             deny_prefix=list(deny_prefix),
+            tool_pack=list(tool_pack),
+            remote_gateway=list(remote_gateway),
             model=model,
             provider=provider,
             max_steps=max_steps,
@@ -72,6 +78,8 @@ def chat(
     audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
     deny_tool: Annotated[list[str] | None, typer.Option("--deny-tool", help="Override deny tool names.")] = None,
     deny_prefix: Annotated[list[str] | None, typer.Option("--deny-prefix", help="Override deny tool prefixes.")] = None,
+    tool_pack: Annotated[list[str] | None, typer.Option("--tool-pack", help="Override tool packs.")] = None,
+    remote_gateway: Annotated[list[str] | None, typer.Option("--remote-gateway", help="Override remote gateways.")] = None,
     model: Annotated[str | None, typer.Option(help="Override model.")] = None,
     provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
     max_steps: Annotated[int | None, typer.Option(help="Override max function-calling iterations.")] = None,
@@ -84,6 +92,8 @@ def chat(
         audit_log=audit_log,
         deny_tool=deny_tool,
         deny_prefix=deny_prefix,
+        tool_pack=tool_pack,
+        remote_gateway=remote_gateway,
         model=model,
         provider=provider,
         max_steps=max_steps,
@@ -108,6 +118,8 @@ def chat(
             audit_log=str(options["audit_log"]),
             deny_tool=list(options["deny_tool"]),
             deny_prefix=list(options["deny_prefix"]),
+            tool_pack=list(options["tool_pack"]),
+            remote_gateway=list(options["remote_gateway"]),
             model=str(options["model"]),
             provider=str(options["provider"]),
             max_steps=int(options["max_steps"]),
@@ -123,6 +135,8 @@ def _merged_options(
     audit_log: str | None,
     deny_tool: list[str] | None,
     deny_prefix: list[str] | None,
+    tool_pack: list[str] | None,
+    remote_gateway: list[str] | None,
     model: str | None,
     provider: str | None,
     max_steps: int | None,
@@ -140,6 +154,10 @@ def _merged_options(
         base["deny_tool"] = list(deny_tool)
     if deny_prefix is not None:
         base["deny_prefix"] = list(deny_prefix)
+    if tool_pack is not None:
+        base["tool_pack"] = list(tool_pack)
+    if remote_gateway is not None:
+        base["remote_gateway"] = list(remote_gateway)
     if model is not None:
         base["model"] = model
     if provider is not None:
@@ -158,6 +176,10 @@ def _merged_options(
         base["deny_tool"] = []
     if "deny_prefix" not in base:
         base["deny_prefix"] = []
+    if "tool_pack" not in base:
+        base["tool_pack"] = ["builtin"]
+    if "remote_gateway" not in base:
+        base["remote_gateway"] = []
     if "model" not in base:
         base["model"] = settings.model_name
     if "provider" not in base:
@@ -176,6 +198,8 @@ def _run_once(
     audit_log: str,
     deny_tool: list[str],
     deny_prefix: list[str],
+    tool_pack: list[str],
+    remote_gateway: list[str],
     model: str,
     provider: str,
     max_steps: int,
@@ -189,6 +213,8 @@ def _run_once(
             audit_log=audit_log,
             deny_tool=deny_tool,
             deny_prefix=deny_prefix,
+            tool_pack=tool_pack,
+            remote_gateway=remote_gateway,
             model=model,
             provider=provider,
             max_steps=max_steps,
@@ -210,6 +236,8 @@ async def _dispatch(
     audit_log: str,
     deny_tool: list[str],
     deny_prefix: list[str],
+    tool_pack: list[str],
+    remote_gateway: list[str],
     model: str,
     provider: str,
     max_steps: int,
@@ -235,7 +263,9 @@ async def _dispatch(
             permission_context=ToolPermissionContext.from_iterables(
                 deny_names=deny_tool,
                 deny_prefixes=deny_prefix,
-            )
+            ),
+            tool_packs=tool_pack,
+            remote_gateways=remote_gateway,
         ),
         executor=SafeExecutor(
             dry_run=(not execute),

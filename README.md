@@ -59,6 +59,8 @@ lsre chat
 lsre --provider mock "重启异常容器"
 lsre --execute --approval-mode balanced --approve --provider mock "重启异常容器"
 lsre --provider mock --deny-tool docker "重启异常容器"
+lsre --tool-pack builtin --remote-gateway edge=http://127.0.0.1:18080 "检查远端主机状态"
+lsre --tool-pack module:your_pkg.your_pack:tool_pack "执行自定义工具包任务"
 ```
 
 说明：
@@ -68,6 +70,7 @@ lsre --provider mock --deny-tool docker "重启异常容器"
 3. 高风险命令在执行模式下需要 `--approve`。
 4. 每次工具执行都会写入审计日志（默认 `.data/lsre-audit.jsonl`）。
 5. 可通过 `--deny-tool` 和 `--deny-prefix` 禁用指定工具。
+6. 可通过 `--tool-pack` 加载本地模块工具包，通过 `--remote-gateway` 注册远端执行网关工具。
 
 ## 环境变量
 
