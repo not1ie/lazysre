@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from lazysre.cli.registry import ToolDefinition
 from lazysre.cli.tools.builtin import builtin_tools
+from lazysre.cli.tools.marketplace import ToolPackLockStore, compute_module_digest
 from lazysre.cli.tools.remote_pack import remote_gateway_tool
 
 
@@ -18,8 +20,10 @@ class LoadedPack:
 def load_tool_packs(
     pack_specs: list[str] | None = None,
     remote_gateways: list[str] | None = None,
+    lock_file: Path | None = None,
 ) -> list[LoadedPack]:
     specs = pack_specs or ["builtin"]
+    store = ToolPackLockStore(lock_file or Path(".data/lsre-tool-lock.json"))
     packs: list[LoadedPack] = []
     for spec in specs:
         normalized = spec.strip()
@@ -31,6 +35,10 @@ def load_tool_packs(
         if normalized.startswith("module:"):
             module_spec = normalized[len("module:") :].strip()
             packs.append(_load_module_pack(module_spec))
+            continue
+        if normalized.startswith("locked:"):
+            name = normalized[len("locked:") :].strip()
+            packs.append(_load_locked_pack(store, name))
             continue
         raise ValueError(f"unknown tool pack spec: {normalized}")
 
@@ -62,6 +70,23 @@ def _load_module_pack(spec: str) -> LoadedPack:
     return LoadedPack(name=f"module:{module_name}", tools=tool_list)
 
 
+def _load_locked_pack(store: ToolPackLockStore, name: str) -> LoadedPack:
+    if not name:
+        raise ValueError("locked pack name is empty")
+    locked = store.get(name)
+    if not locked:
+        raise ValueError(f"locked pack not found: {name}")
+    expected = locked.digest_sha256.strip().lower()
+    if expected:
+        actual = compute_module_digest(locked.module)
+        if actual != expected:
+            raise ValueError(
+                f"locked pack digest mismatch for {locked.name}: expected={expected}, actual={actual}"
+            )
+    loaded = _load_module_pack(locked.module)
+    return LoadedPack(name=f"locked:{locked.name}@{locked.version}", tools=loaded.tools)
+
+
 def _call_factory(factory: Callable[[], list[ToolDefinition]]) -> list[ToolDefinition]:
     return factory()
 
@@ -84,4 +109,3 @@ def _parse_remote_gateway(raw: str) -> tuple[str, str, str]:
     if not base_url.startswith(("http://", "https://")):
         raise ValueError("remote gateway base_url must start with http:// or https://")
     return name, base_url, token.strip()
-
