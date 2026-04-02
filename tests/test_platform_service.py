@@ -495,3 +495,56 @@ async def test_run_compare_and_approval_advice(tmp_path: Path) -> None:
         assert False, "missing run should fail"
     except ValueError:
         assert True
+
+
+async def test_approval_advice_uses_bound_tool_permission(tmp_path: Path) -> None:
+    service = PlatformService(store_path=str(tmp_path / "platform.json"))
+    agent = await service.create_agent(
+        AgentCreateRequest(
+            name="Advice Worker",
+            role="worker",
+            system_prompt="执行排障并给出操作建议",
+            model="gpt-5.4-mini",
+        )
+    )
+    tool = await service.create_tool(
+        ToolCreateRequest(
+            name="K8s Admin Tool",
+            kind="kubernetes",
+            base_url="https://192.168.10.1:6443",
+            verify_tls=False,
+            default_query="/version",
+            required_permission="admin",
+        )
+    )
+    wf = await service.create_workflow(
+        WorkflowCreateRequest(
+            name="Advice Tool Permission Flow",
+            objective="验证审批建议按工具权限提升",
+            start_node="guarded_step",
+            nodes=[
+                WorkflowNode(
+                    id="guarded_step",
+                    agent_id=agent.id,
+                    instruction="重启异常工作负载并验证可用性",
+                    tool_binding=tool.id,
+                    required_permission="read",
+                    requires_approval=True,
+                    approval_reason="涉及生产操作",
+                    next_nodes=[],
+                )
+            ],
+        )
+    )
+    run = await service.create_run(
+        workflow_id=wf.id,
+        req=RunCreateRequest(input={"actor_permission": "admin"}),
+    )
+    assert run is not None
+    status = await _wait_run(service, run.id)
+    assert status == RunStatus.waiting_approval
+
+    advice = await service.get_run_approval_advice(run.id)
+    assert advice is not None
+    assert advice.required_permission == "admin"
+    assert advice.risk_level in {"high", "critical"}

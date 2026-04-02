@@ -1191,6 +1191,11 @@ def _is_risky_instruction(instruction: str) -> bool:
     return any(word in lowered for word in risky_keywords)
 
 
+def _perm_rank(permission: str) -> int:
+    mapping = {"read": 1, "write": 2, "admin": 3}
+    return mapping.get(permission.strip().lower(), 0)
+
+
 def _duration_ms(run: WorkflowRun) -> int | None:
     if not run.started_at or not run.finished_at:
         return None
