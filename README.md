@@ -58,6 +58,7 @@ lsre chat
 ```bash
 lsre --provider mock "重启异常容器"
 lsre --execute --approval-mode balanced --approve --provider mock "重启异常容器"
+lsre --execute --interactive-approval --provider mock "为什么支付服务响应变慢了？"
 lsre --provider mock --deny-tool docker "重启异常容器"
 lsre --tool-pack builtin --remote-gateway edge=http://127.0.0.1:18080 "检查远端主机状态"
 lsre --tool-pack module:your_pkg.your_pack:tool_pack "执行自定义工具包任务"
@@ -77,6 +78,9 @@ lsre --tool-pack locked:your_pack "执行锁定版本工具包任务"
 6. 可通过 `--tool-pack` 加载本地模块工具包，通过 `--remote-gateway` 注册远端执行网关工具。
 7. 可通过 `lsre pack pin` 将 marketplace 包锁定到 `.data/lsre-tool-lock.json` 并在运行时使用 `locked:<name>` 加载。
 8. `pack pin` 支持 `--require-signature` + `--hmac-key` 做签名校验，支持 `digest_sha256` 做本地模块完整性校验。
+9. 内置 Observer 工具：`get_cluster_context`、`fetch_service_logs`、`get_metrics`，输出会自动脱敏和压缩，避免 token 溢出。
+10. 执行模式下高风险写操作会生成“变更风险报告”，并等待控制台 `y/n` 确认（可用 `--no-interactive-approval` 关闭）。
+11. 支持 Session 历史记忆（默认 `.data/lsre-session.json`），可处理“重启它”这类指代。
 
 ## 环境变量
 

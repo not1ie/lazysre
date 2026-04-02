@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from typing import Callable
 
 from lazysre.cli.audit import AuditLogger
 from lazysre.cli.policy import PolicyDecision, assess_command
@@ -14,12 +15,16 @@ class SafeExecutor:
     timeout_sec: float = 20.0
     approval_mode: str = "balanced"
     approval_granted: bool = False
+    approval_callback: Callable[[list[str], PolicyDecision], bool] | None = None
     audit_logger: AuditLogger | None = None
     allowed_binaries: set[str] = field(
         default_factory=lambda: {"kubectl", "docker", "curl", "tail"}
     )
 
-    def preflight(self, command: list[str]) -> tuple[PolicyDecision | None, ExecResult | None]:
+    def preflight(
+        self, command: list[str]
+    ) -> tuple[PolicyDecision | None, ExecResult | None, bool]:
+        approved = self.approval_granted
         if not command:
             result = ExecResult(
                 ok=False,
@@ -29,7 +34,7 @@ class SafeExecutor:
                 dry_run=self.dry_run,
             )
             self.record(result)
-            return None, result
+            return None, result, approved
 
         binary = command[0]
         if binary not in self.allowed_binaries:
@@ -44,7 +49,7 @@ class SafeExecutor:
                 policy_reasons=[f"binary '{binary}' is not in allowlist"],
             )
             self.record(result)
-            return None, result
+            return None, result, approved
 
         decision = assess_command(command, approval_mode=self.approval_mode)
         if decision.blocked:
@@ -58,33 +63,54 @@ class SafeExecutor:
                 risk_level=decision.risk_level,
                 policy_reasons=decision.reasons,
                 requires_approval=decision.requires_approval,
-                approved=self.approval_granted,
+                approved=approved,
             )
             self.record(result)
-            return decision, result
+            return decision, result, approved
 
-        if (not self.dry_run) and decision.requires_approval and (not self.approval_granted):
-            result = ExecResult(
-                ok=False,
-                command=command,
-                stderr=(
-                    "approval required by policy. "
-                    "Re-run with --approve and review impact first."
-                ),
-                exit_code=125,
-                dry_run=False,
-                blocked=True,
-                risk_level=decision.risk_level,
-                policy_reasons=decision.reasons,
-                requires_approval=True,
-                approved=False,
-            )
-            self.record(result)
-            return decision, result
-        return decision, None
+        if (not self.dry_run) and (not approved):
+            interactive_gate = decision.risk_level in {"high", "critical"}
+            if interactive_gate and self.approval_callback:
+                if self.approval_callback(command, decision):
+                    approved = True
+                else:
+                    result = ExecResult(
+                        ok=False,
+                        command=command,
+                        stderr="approval rejected by user",
+                        exit_code=125,
+                        dry_run=False,
+                        blocked=True,
+                        risk_level=decision.risk_level,
+                        policy_reasons=decision.reasons,
+                        requires_approval=True,
+                        approved=False,
+                    )
+                    self.record(result)
+                    return decision, result, approved
+            elif decision.requires_approval:
+                result = ExecResult(
+                    ok=False,
+                    command=command,
+                    stderr=(
+                        "approval required by policy. "
+                        "Re-run with --approve and review impact first."
+                    ),
+                    exit_code=125,
+                    dry_run=False,
+                    blocked=True,
+                    risk_level=decision.risk_level,
+                    policy_reasons=decision.reasons,
+                    requires_approval=True,
+                    approved=False,
+                )
+                self.record(result)
+                return decision, result, approved
+        return decision, None, approved
 
     async def run(self, command: list[str]) -> ExecResult:
-        decision, blocked = self.preflight(command)
+        binary = command[0] if command else ""
+        decision, blocked, approved = self.preflight(command)
         if blocked:
             return blocked
         assert decision is not None
@@ -99,7 +125,7 @@ class SafeExecutor:
                 risk_level=decision.risk_level,
                 policy_reasons=decision.reasons,
                 requires_approval=decision.requires_approval,
-                approved=self.approval_granted,
+                approved=approved,
             )
             self.record(result)
             return result
@@ -121,7 +147,7 @@ class SafeExecutor:
                 risk_level=decision.risk_level,
                 policy_reasons=decision.reasons,
                 requires_approval=decision.requires_approval,
-                approved=self.approval_granted,
+                approved=approved,
             )
             self.record(result)
             return result
@@ -135,7 +161,7 @@ class SafeExecutor:
                 risk_level=decision.risk_level,
                 policy_reasons=decision.reasons,
                 requires_approval=decision.requires_approval,
-                approved=self.approval_granted,
+                approved=approved,
             )
             self.record(result)
             return result
@@ -150,7 +176,7 @@ class SafeExecutor:
             risk_level=decision.risk_level,
             policy_reasons=decision.reasons,
             requires_approval=decision.requires_approval,
-            approved=self.approval_granted,
+            approved=approved,
         )
         self.record(result)
         return result

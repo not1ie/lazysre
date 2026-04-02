@@ -18,3 +18,8 @@ def test_rewrite_argv_with_global_option_then_instruction() -> None:
     _rewrite_argv_for_default_run(argv)
     assert argv == ["lsre", "--provider", "mock", "run", "检查k8s"]
 
+
+def test_rewrite_argv_with_session_file_option_then_instruction() -> None:
+    argv = ["lsre", "--session-file", ".data/custom-session.json", "重启它"]
+    _rewrite_argv_for_default_run(argv)
+    assert argv == ["lsre", "--session-file", ".data/custom-session.json", "run", "重启它"]

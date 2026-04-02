@@ -99,6 +99,36 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
         previous_response_id: str | None = None,
         tool_outputs: list[ToolOutput] | None = None,
     ) -> LLMTurn:
+        if previous_response_id == "mock-react-1":
+            return LLMTurn(
+                response_id="mock-react-2",
+                tool_calls=[
+                    ToolCall(
+                        call_id="mock-logs-react-1",
+                        name="fetch_service_logs",
+                        arguments={
+                            "namespace": "default",
+                            "service": "payment",
+                            "keyword": "error",
+                            "since_minutes": 30,
+                            "limit": 200,
+                        },
+                    )
+                ],
+            )
+
+        if previous_response_id == "mock-react-2" and tool_outputs:
+            lines = [f"[mock:{model}] 初步诊断完成："]
+            for item in tool_outputs:
+                lines.append(f"- call={item.call_id}: {item.output[:200]}")
+            lines.append("")
+            lines.append("建议先在 dry-run 校验以下修复命令：")
+            lines.append("```bash")
+            lines.append("kubectl -n default rollout restart deploy/payment")
+            lines.append("kubectl -n default get pods -l app=payment -w")
+            lines.append("```")
+            return LLMTurn(response_id="mock-final", text="\n".join(lines), tool_calls=[])
+
         if previous_response_id and tool_outputs:
             lines = [f"[mock:{model}] 工具执行结果汇总："]
             for item in tool_outputs:
@@ -107,6 +137,28 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
             return LLMTurn(response_id="mock-final", text="\n".join(lines), tool_calls=[])
 
         text = (user_input or "").lower()
+        if any(word in text for word in ("变慢", "慢了", "latency", "延迟", "响应慢", "支付服务")):
+            return LLMTurn(
+                response_id="mock-react-1",
+                tool_calls=[
+                    ToolCall(
+                        call_id="mock-metrics-1",
+                        name="get_metrics",
+                        arguments={
+                            "prometheus_url": "http://127.0.0.1:9090",
+                            "query": 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service="payment"}[5m])) by (le))',
+                            "window_minutes": 15,
+                            "step_sec": 30,
+                            "timeout_sec": 8,
+                        },
+                    ),
+                    ToolCall(
+                        call_id="mock-cluster-1",
+                        name="get_cluster_context",
+                        arguments={"namespace": "default", "event_limit": 30},
+                    ),
+                ],
+            )
         if any(word in text for word in ("pod", "k8s", "kubectl", "节点", "集群")):
             return LLMTurn(
                 response_id="mock-1",

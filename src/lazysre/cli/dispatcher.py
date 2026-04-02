@@ -16,8 +16,12 @@ class Dispatcher:
     model: str
     max_steps: int = 6
     system_prompt: str = (
-        "You are LazySRE CLI orchestrator. Decide when to call tools, keep actions safe, "
-        "respect dry-run mode, approval policy and provide concise SRE guidance."
+        "You are LazySRE CLI orchestrator with ReAct behavior. "
+        "When user asks incident/root-cause questions, do not guess. "
+        "First collect evidence with observer tools (metrics, cluster context, logs), "
+        "then summarize likely root cause and actionable commands. "
+        "Respect dry-run mode and approval policy. "
+        "For any write operations (delete/patch/scale/restart), provide risk-aware guidance."
     )
 
     async def run(self, instruction: str) -> DispatchResult:

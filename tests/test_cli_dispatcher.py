@@ -42,6 +42,27 @@ async def test_safe_executor_requires_approval_on_high_risk_execute() -> None:
     assert result.exit_code == 125
 
 
+async def test_safe_executor_interactive_gate_can_block_high_risk_even_permissive_mode() -> None:
+    calls: list[list[str]] = []
+
+    def _reject(command: list[str], _decision) -> bool:
+        calls.append(command)
+        return False
+
+    executor = SafeExecutor(
+        dry_run=False,
+        approval_mode="permissive",
+        approval_granted=False,
+        approval_callback=_reject,
+    )
+    result = await executor.run(["kubectl", "delete", "pod", "foo"])
+    assert calls
+    assert result.ok is False
+    assert result.blocked is True
+    assert result.requires_approval is True
+    assert result.exit_code == 125
+
+
 async def test_safe_executor_dry_run_keeps_policy_signal(tmp_path: Path) -> None:
     audit_path = tmp_path / "cli-audit.jsonl"
     executor = SafeExecutor(

@@ -13,6 +13,8 @@ from lazysre.cli.dispatcher import Dispatcher
 from lazysre.cli.executor import SafeExecutor
 from lazysre.cli.llm import MockFunctionCallingLLM, OpenAIResponsesLLM
 from lazysre.cli.permissions import ToolPermissionContext
+from lazysre.cli.policy import PolicyDecision
+from lazysre.cli.session import SessionStore
 from lazysre.cli.tools import build_default_registry
 from lazysre.cli.tools.marketplace import (
     LockedPack,
@@ -23,6 +25,17 @@ from lazysre.cli.tools.marketplace import (
     verify_pack_signature,
 )
 from lazysre.config import settings
+
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+except Exception:  # pragma: no cover
+    Console = None  # type: ignore[assignment]
+    Markdown = None  # type: ignore[assignment]
+    Panel = None  # type: ignore[assignment]
+
+_console = Console() if Console else None
 
 app = typer.Typer(
     name="lsre",
@@ -38,9 +51,11 @@ def root(
     ctx: typer.Context,
     execute: Annotated[bool, typer.Option("--execute", help="Run commands for real. Default is dry-run.")] = False,
     approve: Annotated[bool, typer.Option("--approve", help="Acknowledge policy gate for high-risk commands.")] = False,
+    interactive_approval: Annotated[bool, typer.Option("--interactive-approval/--no-interactive-approval", help="Prompt y/n confirmation for risky write actions in execute mode.")] = True,
     approval_mode: Annotated[str, typer.Option(help="Policy level: strict|balanced|permissive")] = "balanced",
     audit_log: Annotated[str, typer.Option(help="Audit jsonl path for command execution records.")] = ".data/lsre-audit.jsonl",
     lock_file: Annotated[str, typer.Option(help="Tool pack lock file path.")] = ".data/lsre-tool-lock.json",
+    session_file: Annotated[str, typer.Option(help="Session memory file path.")] = ".data/lsre-session.json",
     deny_tool: Annotated[list[str], typer.Option("--deny-tool", help="Block specific tools by name, can be repeated.")] = [],
     deny_prefix: Annotated[list[str], typer.Option("--deny-prefix", help="Block tools by prefix, can be repeated.")] = [],
     tool_pack: Annotated[list[str], typer.Option("--tool-pack", help="Tool pack spec. e.g. builtin or module:pkg.mod[:factory].")] = ["builtin"],
@@ -52,9 +67,11 @@ def root(
     ctx.obj = {
         "execute": execute,
         "approve": approve,
+        "interactive_approval": interactive_approval,
         "approval_mode": approval_mode,
         "audit_log": audit_log,
         "lock_file": lock_file,
+        "session_file": session_file,
         "deny_tool": list(deny_tool),
         "deny_prefix": list(deny_prefix),
         "tool_pack": list(tool_pack),
@@ -74,9 +91,11 @@ def run_instruction(
         ctx,
         execute=None,
         approve=None,
+        interactive_approval=None,
         approval_mode=None,
         audit_log=None,
         lock_file=None,
+        session_file=None,
         deny_tool=None,
         deny_prefix=None,
         tool_pack=None,
@@ -89,9 +108,11 @@ def run_instruction(
         instruction=instruction,
         execute=bool(options["execute"]),
         approve=bool(options["approve"]),
+        interactive_approval=bool(options["interactive_approval"]),
         approval_mode=str(options["approval_mode"]),
         audit_log=str(options["audit_log"]),
         lock_file=str(options["lock_file"]),
+        session_file=str(options["session_file"]),
         deny_tool=list(options["deny_tool"]),
         deny_prefix=list(options["deny_prefix"]),
         tool_pack=list(options["tool_pack"]),
@@ -107,9 +128,11 @@ def chat(
     ctx: typer.Context,
     execute: Annotated[bool | None, typer.Option("--execute", help="Override execution mode.")] = None,
     approve: Annotated[bool | None, typer.Option("--approve", help="Override approval gate acknowledgement.")] = None,
+    interactive_approval: Annotated[bool | None, typer.Option("--interactive-approval/--no-interactive-approval", help="Override interactive approval prompt.")] = None,
     approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
     audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
     lock_file: Annotated[str | None, typer.Option(help="Override tool pack lock file path.")] = None,
+    session_file: Annotated[str | None, typer.Option(help="Override session memory file path.")] = None,
     deny_tool: Annotated[list[str] | None, typer.Option("--deny-tool", help="Override deny tool names.")] = None,
     deny_prefix: Annotated[list[str] | None, typer.Option("--deny-prefix", help="Override deny tool prefixes.")] = None,
     tool_pack: Annotated[list[str] | None, typer.Option("--tool-pack", help="Override tool packs.")] = None,
@@ -122,9 +145,11 @@ def chat(
         ctx,
         execute=execute,
         approve=approve,
+        interactive_approval=interactive_approval,
         approval_mode=approval_mode,
         audit_log=audit_log,
         lock_file=lock_file,
+        session_file=session_file,
         deny_tool=deny_tool,
         deny_prefix=deny_prefix,
         tool_pack=tool_pack,
@@ -149,9 +174,11 @@ def chat(
             instruction=text,
             execute=bool(options["execute"]),
             approve=bool(options["approve"]),
+            interactive_approval=bool(options["interactive_approval"]),
             approval_mode=str(options["approval_mode"]),
             audit_log=str(options["audit_log"]),
             lock_file=str(options["lock_file"]),
+            session_file=str(options["session_file"]),
             deny_tool=list(options["deny_tool"]),
             deny_prefix=list(options["deny_prefix"]),
             tool_pack=list(options["tool_pack"]),
@@ -167,9 +194,11 @@ def _merged_options(
     *,
     execute: bool | None,
     approve: bool | None,
+    interactive_approval: bool | None,
     approval_mode: str | None,
     audit_log: str | None,
     lock_file: str | None,
+    session_file: str | None,
     deny_tool: list[str] | None,
     deny_prefix: list[str] | None,
     tool_pack: list[str] | None,
@@ -183,12 +212,16 @@ def _merged_options(
         base["execute"] = execute
     if approve is not None:
         base["approve"] = approve
+    if interactive_approval is not None:
+        base["interactive_approval"] = interactive_approval
     if approval_mode is not None:
         base["approval_mode"] = approval_mode
     if audit_log is not None:
         base["audit_log"] = audit_log
     if lock_file is not None:
         base["lock_file"] = lock_file
+    if session_file is not None:
+        base["session_file"] = session_file
     if deny_tool is not None:
         base["deny_tool"] = list(deny_tool)
     if deny_prefix is not None:
@@ -207,12 +240,16 @@ def _merged_options(
         base["execute"] = False
     if "approve" not in base:
         base["approve"] = False
+    if "interactive_approval" not in base:
+        base["interactive_approval"] = True
     if "approval_mode" not in base:
         base["approval_mode"] = "balanced"
     if "audit_log" not in base:
         base["audit_log"] = ".data/lsre-audit.jsonl"
     if "lock_file" not in base:
         base["lock_file"] = ".data/lsre-tool-lock.json"
+    if "session_file" not in base:
+        base["session_file"] = ".data/lsre-session.json"
     if "deny_tool" not in base:
         base["deny_tool"] = []
     if "deny_prefix" not in base:
@@ -235,9 +272,11 @@ def _run_once(
     instruction: str,
     execute: bool,
     approve: bool,
+    interactive_approval: bool,
     approval_mode: str,
     audit_log: str,
     lock_file: str,
+    session_file: str,
     deny_tool: list[str],
     deny_prefix: list[str],
     tool_pack: list[str],
@@ -246,28 +285,65 @@ def _run_once(
     provider: str,
     max_steps: int,
 ) -> None:
-    result = asyncio.run(
-        _dispatch(
-            instruction=instruction,
-            execute=execute,
-            approve=approve,
-            approval_mode=approval_mode,
-            audit_log=audit_log,
-            lock_file=lock_file,
-            deny_tool=deny_tool,
-            deny_prefix=deny_prefix,
-            tool_pack=tool_pack,
-            remote_gateway=remote_gateway,
-            model=model,
-            provider=provider,
-            max_steps=max_steps,
+    session = SessionStore(Path(session_file))
+    session_hint = session.build_context_hint(instruction)
+    prompt = instruction
+    if session_hint:
+        prompt = f"{instruction}\n\n[session]\n{session_hint}"
+
+    if _console:
+        with _console.status("[bold cyan]AI思考中...[/]"):
+            result = asyncio.run(
+                _dispatch(
+                    instruction=prompt,
+                    execute=execute,
+                    approve=approve,
+                    interactive_approval=interactive_approval,
+                    approval_mode=approval_mode,
+                    audit_log=audit_log,
+                    lock_file=lock_file,
+                    deny_tool=deny_tool,
+                    deny_prefix=deny_prefix,
+                    tool_pack=tool_pack,
+                    remote_gateway=remote_gateway,
+                    model=model,
+                    provider=provider,
+                    max_steps=max_steps,
+                )
+            )
+    else:
+        result = asyncio.run(
+            _dispatch(
+                instruction=prompt,
+                execute=execute,
+                approve=approve,
+                interactive_approval=interactive_approval,
+                approval_mode=approval_mode,
+                audit_log=audit_log,
+                lock_file=lock_file,
+                deny_tool=deny_tool,
+                deny_prefix=deny_prefix,
+                tool_pack=tool_pack,
+                remote_gateway=remote_gateway,
+                model=model,
+                provider=provider,
+                max_steps=max_steps,
+            )
         )
-    )
+    session.append_turn(user_input=instruction, result=result)
+
     for event in result.events:
         if event.kind in {"tool_call", "tool_output"}:
             detail = json.dumps(event.data, ensure_ascii=False)
-            typer.echo(f"[{event.kind}] {event.message} {detail}")
-    typer.echo(result.final_text)
+            if _console:
+                style = "cyan" if event.kind == "tool_call" else "green"
+                _console.print(f"[{style}][{event.kind}][/]{event.message} {detail}")
+            else:
+                typer.echo(f"[{event.kind}] {event.message} {detail}")
+    if _console and Markdown:
+        _console.print(Panel(Markdown(result.final_text), title="LazySRE", border_style="blue"))
+    else:
+        typer.echo(result.final_text)
 
 
 async def _dispatch(
@@ -275,6 +351,7 @@ async def _dispatch(
     instruction: str,
     execute: bool,
     approve: bool,
+    interactive_approval: bool,
     approval_mode: str,
     audit_log: str,
     lock_file: str,
@@ -316,12 +393,41 @@ async def _dispatch(
             dry_run=(not execute),
             approval_mode=ap_mode,
             approval_granted=approve,
+            approval_callback=_build_approval_callback(enabled=interactive_approval and execute),
             audit_logger=AuditLogger(Path(audit_log)),
         ),
         model=model,
         max_steps=max(1, min(max_steps, 12)),
     )
     return await dispatcher.run(instruction)
+
+
+def _build_approval_callback(*, enabled: bool):
+    if not enabled:
+        return None
+
+    def _callback(command: list[str], decision: PolicyDecision) -> bool:
+        lines = [
+            "变更风险报告",
+            f"- 风险等级: {decision.risk_level}",
+            f"- 目标命令: {' '.join(command)}",
+        ]
+        if decision.reasons:
+            lines.append("- 风险原因:")
+            for reason in decision.reasons:
+                lines.append(f"  - {reason}")
+        text = "\n".join(lines)
+        if _console and Panel:
+            _console.print(Panel(text, border_style="yellow"))
+        else:
+            typer.echo(text)
+        try:
+            approved = typer.confirm("确认执行该变更吗？", default=False)
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return bool(approved)
+
+    return _callback
 
 
 @pack_app.command("list")
@@ -427,6 +533,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "--approval-mode",
         "--audit-log",
         "--lock-file",
+        "--session-file",
         "--deny-tool",
         "--deny-prefix",
         "--tool-pack",
