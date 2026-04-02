@@ -4,6 +4,7 @@ from lazysre.cli.audit import AuditLogger
 from lazysre.cli.dispatcher import Dispatcher
 from lazysre.cli.executor import SafeExecutor
 from lazysre.cli.llm import MockFunctionCallingLLM
+from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.tools import build_default_registry
 
 
@@ -56,3 +57,23 @@ async def test_safe_executor_dry_run_keeps_policy_signal(tmp_path: Path) -> None
     assert audit_path.exists()
     content = audit_path.read_text(encoding="utf-8")
     assert '"risk_level": "high"' in content
+
+
+async def test_tool_permission_context_blocks_registry_tool() -> None:
+    registry = build_default_registry(
+        permission_context=ToolPermissionContext.from_iterables(
+            deny_names=["docker"],
+        )
+    )
+    dispatcher = Dispatcher(
+        llm=MockFunctionCallingLLM(),
+        registry=registry,
+        executor=SafeExecutor(dry_run=True),
+        model="gpt-5.4-mini",
+        max_steps=3,
+    )
+    result = await dispatcher.run("重启容器")
+    outputs = [e for e in result.events if e.kind == "tool_output"]
+    assert outputs
+    preview = str(outputs[0].data.get("output_preview", ""))
+    assert "tool blocked by permission context" in preview

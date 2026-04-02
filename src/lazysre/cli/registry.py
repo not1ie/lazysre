@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from lazysre.cli.executor import SafeExecutor
+from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.types import ExecResult, ToolCall, ToolSpec
 
 ToolHandler = Callable[[dict[str, object], SafeExecutor], Awaitable[ExecResult]]
@@ -17,16 +18,31 @@ class ToolDefinition:
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, permission_context: ToolPermissionContext | None = None) -> None:
         self._tools: dict[str, ToolDefinition] = {}
+        self._permission_context = permission_context or ToolPermissionContext()
 
     def register(self, definition: ToolDefinition) -> None:
         self._tools[definition.spec.name] = definition
 
     def specs(self) -> list[ToolSpec]:
-        return [x.spec for x in self._tools.values()]
+        return [
+            x.spec
+            for x in self._tools.values()
+            if not self._permission_context.blocks(x.spec.name)
+        ]
 
     async def execute(self, call: ToolCall, executor: SafeExecutor) -> str:
+        if self._permission_context.blocks(call.name):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": f"tool blocked by permission context: {call.name}",
+                    "call_id": call.call_id,
+                    "blocked": True,
+                },
+                ensure_ascii=False,
+            )
         definition = self._tools.get(call.name)
         if not definition:
             return json.dumps(

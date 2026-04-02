@@ -11,6 +11,7 @@ from lazysre.cli.audit import AuditLogger
 from lazysre.cli.dispatcher import Dispatcher
 from lazysre.cli.executor import SafeExecutor
 from lazysre.cli.llm import MockFunctionCallingLLM, OpenAIResponsesLLM
+from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.tools import build_default_registry
 from lazysre.config import settings
 
@@ -30,6 +31,8 @@ def root(
     approve: Annotated[bool, typer.Option("--approve", help="Acknowledge policy gate for high-risk commands.")] = False,
     approval_mode: Annotated[str, typer.Option(help="Policy level: strict|balanced|permissive")] = "balanced",
     audit_log: Annotated[str, typer.Option(help="Audit jsonl path for command execution records.")] = ".data/lsre-audit.jsonl",
+    deny_tool: Annotated[list[str], typer.Option("--deny-tool", help="Block specific tools by name, can be repeated.")] = [],
+    deny_prefix: Annotated[list[str], typer.Option("--deny-prefix", help="Block tools by prefix, can be repeated.")] = [],
     model: Annotated[str, typer.Option(help="Model name for LLM dispatcher.")] = settings.model_name,
     provider: Annotated[str, typer.Option(help="LLM provider: auto|mock|openai")] = "auto",
     max_steps: Annotated[int, typer.Option(help="Max function-calling iterations.")] = 6,
@@ -39,6 +42,8 @@ def root(
         "approve": approve,
         "approval_mode": approval_mode,
         "audit_log": audit_log,
+        "deny_tool": list(deny_tool),
+        "deny_prefix": list(deny_prefix),
         "model": model,
         "provider": provider,
         "max_steps": max(1, min(max_steps, 12)),
@@ -50,6 +55,8 @@ def root(
             approve=approve,
             approval_mode=approval_mode,
             audit_log=audit_log,
+            deny_tool=list(deny_tool),
+            deny_prefix=list(deny_prefix),
             model=model,
             provider=provider,
             max_steps=max_steps,
@@ -63,6 +70,8 @@ def chat(
     approve: Annotated[bool | None, typer.Option("--approve", help="Override approval gate acknowledgement.")] = None,
     approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
     audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
+    deny_tool: Annotated[list[str] | None, typer.Option("--deny-tool", help="Override deny tool names.")] = None,
+    deny_prefix: Annotated[list[str] | None, typer.Option("--deny-prefix", help="Override deny tool prefixes.")] = None,
     model: Annotated[str | None, typer.Option(help="Override model.")] = None,
     provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
     max_steps: Annotated[int | None, typer.Option(help="Override max function-calling iterations.")] = None,
@@ -73,6 +82,8 @@ def chat(
         approve=approve,
         approval_mode=approval_mode,
         audit_log=audit_log,
+        deny_tool=deny_tool,
+        deny_prefix=deny_prefix,
         model=model,
         provider=provider,
         max_steps=max_steps,
@@ -95,6 +106,8 @@ def chat(
             approve=bool(options["approve"]),
             approval_mode=str(options["approval_mode"]),
             audit_log=str(options["audit_log"]),
+            deny_tool=list(options["deny_tool"]),
+            deny_prefix=list(options["deny_prefix"]),
             model=str(options["model"]),
             provider=str(options["provider"]),
             max_steps=int(options["max_steps"]),
@@ -108,6 +121,8 @@ def _merged_options(
     approve: bool | None,
     approval_mode: str | None,
     audit_log: str | None,
+    deny_tool: list[str] | None,
+    deny_prefix: list[str] | None,
     model: str | None,
     provider: str | None,
     max_steps: int | None,
@@ -121,6 +136,10 @@ def _merged_options(
         base["approval_mode"] = approval_mode
     if audit_log is not None:
         base["audit_log"] = audit_log
+    if deny_tool is not None:
+        base["deny_tool"] = list(deny_tool)
+    if deny_prefix is not None:
+        base["deny_prefix"] = list(deny_prefix)
     if model is not None:
         base["model"] = model
     if provider is not None:
@@ -135,6 +154,10 @@ def _merged_options(
         base["approval_mode"] = "balanced"
     if "audit_log" not in base:
         base["audit_log"] = ".data/lsre-audit.jsonl"
+    if "deny_tool" not in base:
+        base["deny_tool"] = []
+    if "deny_prefix" not in base:
+        base["deny_prefix"] = []
     if "model" not in base:
         base["model"] = settings.model_name
     if "provider" not in base:
@@ -151,6 +174,8 @@ def _run_once(
     approve: bool,
     approval_mode: str,
     audit_log: str,
+    deny_tool: list[str],
+    deny_prefix: list[str],
     model: str,
     provider: str,
     max_steps: int,
@@ -162,6 +187,8 @@ def _run_once(
             approve=approve,
             approval_mode=approval_mode,
             audit_log=audit_log,
+            deny_tool=deny_tool,
+            deny_prefix=deny_prefix,
             model=model,
             provider=provider,
             max_steps=max_steps,
@@ -181,6 +208,8 @@ async def _dispatch(
     approve: bool,
     approval_mode: str,
     audit_log: str,
+    deny_tool: list[str],
+    deny_prefix: list[str],
     model: str,
     provider: str,
     max_steps: int,
@@ -202,7 +231,12 @@ async def _dispatch(
 
     dispatcher = Dispatcher(
         llm=llm,
-        registry=build_default_registry(),
+        registry=build_default_registry(
+            permission_context=ToolPermissionContext.from_iterables(
+                deny_names=deny_tool,
+                deny_prefixes=deny_prefix,
+            )
+        ),
         executor=SafeExecutor(
             dry_run=(not execute),
             approval_mode=ap_mode,
