@@ -50,6 +50,8 @@ const els = {
   approvalForm: $("approval-form"),
   approverName: $("approver-name"),
   approvalComment: $("approval-comment"),
+  approvalAdviceBtn: $("approval-advice-btn"),
+  approvalAdviceLog: $("approval-advice-log"),
   approveBtn: $("approve-btn"),
   rejectBtn: $("reject-btn"),
   generateBriefingBtn: $("generate-briefing-btn"),
@@ -59,6 +61,10 @@ const els = {
   downloadArtifactBtn: $("download-artifact-btn"),
   artifactList: $("artifact-list"),
   artifactPreview: $("artifact-preview"),
+  compareRunsBtn: $("compare-runs-btn"),
+  compareLeftRun: $("compare-left-run"),
+  compareRightRun: $("compare-right-run"),
+  runCompareLog: $("run-compare-log"),
   runList: $("run-list"),
   briefingLog: $("briefing-log"),
   eventLog: $("event-log"),
@@ -117,9 +123,19 @@ function setSummary(text) {
   els.activeSummary.textContent = text;
 }
 
+function setApprovalAdvice(text) {
+  els.approvalAdviceLog.textContent = text;
+  els.approvalAdviceLog.scrollTop = 0;
+}
+
 function setArtifactPreview(text) {
   els.artifactPreview.textContent = text;
   els.artifactPreview.scrollTop = 0;
+}
+
+function setRunCompare(text) {
+  els.runCompareLog.textContent = text;
+  els.runCompareLog.scrollTop = 0;
 }
 
 function renderCounters(overview) {
@@ -238,6 +254,7 @@ function renderRuns() {
   if (!state.runs.length) {
     els.runList.innerHTML = `<div class="row-item"><div class="meta">暂无 run</div></div>`;
   }
+  renderRunCompareOptions();
 }
 
 function artifactApiPath(item) {
@@ -288,9 +305,47 @@ function renderOutputs(outputs) {
   }
 }
 
+function renderRunCompareOptions() {
+  const leftSel = els.compareLeftRun;
+  const rightSel = els.compareRightRun;
+  if (!leftSel || !rightSel) return;
+
+  const prevLeft = leftSel.value;
+  const prevRight = rightSel.value;
+  leftSel.innerHTML = "";
+  rightSel.innerHTML = "";
+
+  for (const run of state.runs) {
+    const label = `${run.id.slice(0, 8)} · ${run.status}`;
+    const o1 = document.createElement("option");
+    o1.value = run.id;
+    o1.textContent = label;
+    leftSel.appendChild(o1);
+    const o2 = document.createElement("option");
+    o2.value = run.id;
+    o2.textContent = label;
+    rightSel.appendChild(o2);
+  }
+
+  if (!state.runs.length) {
+    setRunCompare("");
+    return;
+  }
+
+  leftSel.value = state.runs.find((r) => r.id === prevLeft)?.id || state.runs[0].id;
+  if (state.runs.find((r) => r.id === prevRight)?.id) {
+    rightSel.value = prevRight;
+  } else {
+    rightSel.value = state.runs[1]?.id || state.runs[0].id;
+  }
+}
+
 function updateApprovalForm(run) {
   const waiting = run && run.status === "waiting_approval";
   els.approvalForm.style.display = waiting ? "grid" : "none";
+  if (!waiting) {
+    setApprovalAdvice("");
+  }
   if (waiting) {
     const node = run.pending_node_id || "-";
     setSummary(`run ${run.id.slice(0, 8)} 等待审批: node=${node}`);
@@ -375,6 +430,9 @@ async function loadRunDetail(runId) {
   const run = await api(`/v1/platform/runs/${runId}`);
   renderOutputs(run.outputs || {});
   updateApprovalForm(run);
+  if (run.status === "waiting_approval") {
+    await loadApprovalAdvice(run.id);
+  }
   setSummary(
     `run=${run.id.slice(0, 8)} status=${run.status} workflow=${run.workflow_id.slice(0, 8)}`
   );
@@ -384,6 +442,74 @@ async function loadRunDetail(runId) {
     startRunPoller();
   }
   return run;
+}
+
+function formatApprovalAdvice(advice) {
+  const lines = [];
+  lines.push(`run=${advice.run_id.slice(0, 8)} node=${advice.node_id}`);
+  lines.push(`risk=${advice.risk_level} action=${advice.recommended_action} perm=${advice.required_permission}`);
+  lines.push("");
+  lines.push("Reasons:");
+  for (const item of advice.reasons || []) {
+    lines.push(`- ${item}`);
+  }
+  lines.push("");
+  lines.push("Checklist:");
+  for (const item of advice.checklist || []) {
+    lines.push(`- ${item}`);
+  }
+  if (advice.suggested_comment) {
+    lines.push("");
+    lines.push(`Suggested Comment: ${advice.suggested_comment}`);
+  }
+  return lines.join("\n");
+}
+
+async function loadApprovalAdvice(runId) {
+  const advice = await api(`/v1/platform/runs/${runId}/approval/advice`);
+  setApprovalAdvice(formatApprovalAdvice(advice));
+  if (!els.approvalComment.value.trim()) {
+    els.approvalComment.value = advice.suggested_comment || "";
+  }
+}
+
+function formatRunComparison(comp) {
+  const lines = [];
+  lines.push(`left=${comp.left_run_id.slice(0, 8)} status=${comp.left_status} duration=${comp.left_duration_ms ?? "-"}ms`);
+  lines.push(`right=${comp.right_run_id.slice(0, 8)} status=${comp.right_status} duration=${comp.right_duration_ms ?? "-"}ms`);
+  lines.push("");
+  lines.push(`events: ${comp.left_event_count} -> ${comp.right_event_count}`);
+  lines.push(`tool_failed: ${comp.left_tool_failed_count} -> ${comp.right_tool_failed_count}`);
+  lines.push(`approvals: ${comp.left_approval_count} -> ${comp.right_approval_count}`);
+  lines.push("");
+  lines.push(`shared nodes: ${(comp.shared_nodes || []).join(", ") || "-"}`);
+  lines.push(`left only: ${(comp.nodes_only_left || []).join(", ") || "-"}`);
+  lines.push(`right only: ${(comp.nodes_only_right || []).join(", ") || "-"}`);
+  lines.push("");
+  lines.push("Summary:");
+  for (const item of comp.summary || []) {
+    lines.push(`- ${item}`);
+  }
+  return lines.join("\n");
+}
+
+async function compareRuns() {
+  const leftRunId = els.compareLeftRun.value;
+  const rightRunId = els.compareRightRun.value;
+  if (!leftRunId || !rightRunId) {
+    alert("请先选择要对比的两个 run");
+    return;
+  }
+  if (leftRunId === rightRunId) {
+    alert("请选择两个不同的 run");
+    return;
+  }
+  const q =
+    `?left_run_id=${encodeURIComponent(leftRunId)}` +
+    `&right_run_id=${encodeURIComponent(rightRunId)}`;
+  const comp = await api(`/v1/platform/runs/compare${q}`);
+  setRunCompare(formatRunComparison(comp));
+  setSummary(`run 对比完成: ${leftRunId.slice(0, 8)} vs ${rightRunId.slice(0, 8)}`);
 }
 
 function formatBriefing(briefing) {
@@ -767,6 +893,18 @@ els.cancelRunBtn.addEventListener("click", async () => {
 
 els.approveBtn.addEventListener("click", () => approveOrReject("approve"));
 els.rejectBtn.addEventListener("click", () => approveOrReject("reject"));
+els.approvalAdviceBtn.addEventListener("click", async () => {
+  if (!state.selectedRunId) {
+    alert("请先选择 run");
+    return;
+  }
+  try {
+    await loadApprovalAdvice(state.selectedRunId);
+    setSummary(`审批建议已生成: run=${state.selectedRunId.slice(0, 8)}`);
+  } catch (err) {
+    alert(`生成审批建议失败: ${err.message}`);
+  }
+});
 
 els.refreshAll.addEventListener("click", async () => {
   await refreshAll();
@@ -793,6 +931,14 @@ els.refreshRuns.addEventListener("click", async () => {
   await refreshRuns();
   if (state.selectedRunId) {
     await loadRunDetail(state.selectedRunId);
+  }
+});
+
+els.compareRunsBtn.addEventListener("click", async () => {
+  try {
+    await compareRuns();
+  } catch (err) {
+    alert(`run 对比失败: ${err.message}`);
   }
 });
 

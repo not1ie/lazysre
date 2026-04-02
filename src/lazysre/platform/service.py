@@ -16,6 +16,7 @@ from lazysre.platform.models import (
     AgentCreateRequest,
     AgentDefinition,
     AgentRole,
+    ApprovalAdvice,
     ArtifactItem,
     AutoDesignRequest,
     EnvironmentBootstrapRequest,
@@ -26,6 +27,7 @@ from lazysre.platform.models import (
     PlatformOverview,
     PlatformTemplate,
     QuickstartRequest,
+    RunComparison,
     RunApprovalRecord,
     RunApprovalRequest,
     RunCreateRequest,
@@ -257,6 +259,147 @@ class PlatformService:
             outputs=dict(run.outputs),
             summary=run.summary,
             error=run.error,
+        )
+
+    async def compare_runs(self, left_run_id: str, right_run_id: str) -> RunComparison:
+        left = self._state.runs.get(left_run_id)
+        if not left:
+            raise ValueError("left run not found")
+        right = self._state.runs.get(right_run_id)
+        if not right:
+            raise ValueError("right run not found")
+
+        left_nodes = set(left.outputs.keys())
+        right_nodes = set(right.outputs.keys())
+        shared_nodes = sorted(left_nodes & right_nodes)
+        only_left = sorted(left_nodes - right_nodes)
+        only_right = sorted(right_nodes - left_nodes)
+
+        left_tool_failed = sum(1 for e in left.events if e.kind == "tool_failed")
+        right_tool_failed = sum(1 for e in right.events if e.kind == "tool_failed")
+        left_events = len(left.events)
+        right_events = len(right.events)
+
+        summary: list[str] = []
+        if left.status != right.status:
+            summary.append(f"状态变化: {left.status.value} -> {right.status.value}")
+        if left_tool_failed != right_tool_failed:
+            delta = right_tool_failed - left_tool_failed
+            trend = "上升" if delta > 0 else "下降"
+            summary.append(f"tool_failed 次数{trend}: {left_tool_failed} -> {right_tool_failed}")
+        if left_events != right_events:
+            summary.append(f"事件量变化: {left_events} -> {right_events}")
+        if only_left:
+            summary.append(f"仅左侧执行节点: {', '.join(only_left[:6])}")
+        if only_right:
+            summary.append(f"仅右侧执行节点: {', '.join(only_right[:6])}")
+        if not summary:
+            summary.append("两个 run 的状态与核心指标一致。")
+
+        return RunComparison(
+            left_run_id=left.id,
+            right_run_id=right.id,
+            left_status=left.status.value,
+            right_status=right.status.value,
+            left_duration_ms=_duration_ms(left),
+            right_duration_ms=_duration_ms(right),
+            left_event_count=left_events,
+            right_event_count=right_events,
+            left_tool_failed_count=left_tool_failed,
+            right_tool_failed_count=right_tool_failed,
+            left_approval_count=len(left.approvals),
+            right_approval_count=len(right.approvals),
+            shared_nodes=shared_nodes[:50],
+            nodes_only_left=only_left[:50],
+            nodes_only_right=only_right[:50],
+            summary=summary,
+        )
+
+    async def get_run_approval_advice(self, run_id: str) -> ApprovalAdvice | None:
+        run = self._state.runs.get(run_id)
+        if not run:
+            return None
+        if run.status != RunStatus.waiting_approval or not run.pending_node_id:
+            raise ValueError("run is not waiting for approval")
+
+        workflow = self._state.workflows.get(run.workflow_id)
+        if not workflow:
+            raise ValueError("workflow not found")
+        node = next((x for x in workflow.nodes if x.id == run.pending_node_id), None)
+        if not node:
+            raise ValueError("pending node not found")
+
+        required_permission = node.required_permission
+        if node.tool_binding and node.tool_binding in self._state.tools:
+            tool_perm = self._state.tools[node.tool_binding].required_permission
+            if _perm_rank(tool_perm) > _perm_rank(required_permission):
+                required_permission = tool_perm
+
+        risk_score = 0
+        reasons: list[str] = []
+
+        if required_permission == "admin":
+            risk_score += 2
+            reasons.append("节点需要 admin 级权限，可能涉及生产变更。")
+        elif required_permission == "write":
+            risk_score += 1
+            reasons.append("节点需要 write 权限，存在状态变更风险。")
+        else:
+            reasons.append("节点为只读权限，风险相对可控。")
+
+        if _is_risky_instruction(node.instruction):
+            risk_score += 1
+            reasons.append("节点指令包含高风险关键词（如重启/回滚/扩缩容）。")
+
+        if node.tool_binding and node.tool_binding in self._state.tools:
+            tool = self._state.tools[node.tool_binding]
+            if tool.kind == OpsToolKind.kubernetes:
+                risk_score += 1
+                reasons.append("目标工具是 Kubernetes API，建议重点核查影响面。")
+
+        recent_tool_failures = sum(1 for e in run.events if e.kind == "tool_failed")
+        if recent_tool_failures > 0:
+            risk_score += 1
+            reasons.append("该 run 已出现 tool_failed，证据链可能不完整。")
+
+        recent_failed_runs = sum(
+            1
+            for x in self._state.runs.values()
+            if x.workflow_id == run.workflow_id and x.status == RunStatus.failed
+        )
+        if recent_failed_runs >= 2:
+            risk_score += 1
+            reasons.append("同一 workflow 最近失败次数偏高，建议提升审批标准。")
+
+        if risk_score >= 4:
+            risk_level = "critical"
+            action = "manual_review"
+            suggested_comment = "风险偏高，先补齐回滚预案与验证证据，再审批。"
+        elif risk_score >= 2:
+            risk_level = "high"
+            action = "approve_with_guardrails"
+            suggested_comment = "可在加护栏前提下批准：灰度执行并实时观测关键指标。"
+        else:
+            risk_level = "medium"
+            action = "approve"
+            suggested_comment = "风险可控，建议按步骤执行并保留审计记录。"
+
+        checklist = [
+            "确认变更 owner、执行窗口与回滚负责人。",
+            "确认关键监控项（错误率、延迟、可用性）已就绪。",
+            "确认失败退出条件与回滚触发阈值。",
+        ]
+
+        return ApprovalAdvice(
+            run_id=run.id,
+            workflow_id=run.workflow_id,
+            node_id=node.id,
+            required_permission=required_permission,
+            risk_level=risk_level,
+            recommended_action=action,
+            reasons=reasons,
+            checklist=checklist,
+            suggested_comment=suggested_comment,
         )
 
     async def list_artifacts(self, kind: str = "all", limit: int = 40) -> list[ArtifactItem]:
@@ -1046,6 +1189,13 @@ def _is_risky_instruction(instruction: str) -> bool:
     lowered = instruction.lower()
     risky_keywords = ("delete", "restart", "scale", "rollback", "drain", "kill", "升级")
     return any(word in lowered for word in risky_keywords)
+
+
+def _duration_ms(run: WorkflowRun) -> int | None:
+    if not run.started_at or not run.finished_at:
+        return None
+    delta = run.finished_at - run.started_at
+    return max(0, int(delta.total_seconds() * 1000))
 
 
 def _derive_incident_severity(tools: list[ToolHealthItem], runs: list[WorkflowRun]) -> str:

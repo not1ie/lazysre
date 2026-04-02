@@ -199,9 +199,11 @@
               <input id="approval-comment" value="风险可控，批准执行" />
             </label>
             <div class="inline-actions">
+              <button type="button" id="approval-advice-btn" class="ghost">生成审批建议</button>
               <button type="button" id="approve-btn">Approve</button>
               <button type="button" id="reject-btn" class="danger">Reject</button>
             </div>
+            <pre id="approval-advice-log" class="event-log approval-advice-log"></pre>
           </form>
           <div class="inline-actions">
             <button type="button" id="generate-briefing-btn" class="ghost">生成故障简报</button>
@@ -219,8 +221,23 @@
               <button type="button" id="refresh-artifacts" class="ghost">刷新</button>
               <button type="button" id="download-artifact-btn" class="ghost">下载</button>
             </div>
-            <div id="artifact-list" class="artifact-list"></div>
-            <pre id="artifact-preview" class="event-log artifact-preview"></pre>
+          <div id="artifact-list" class="artifact-list"></div>
+          <pre id="artifact-preview" class="event-log artifact-preview"></pre>
+          </div>
+          <div class="compare-panel">
+            <div class="inline-actions">
+              <h3>Run 对比</h3>
+              <button type="button" id="compare-runs-btn" class="ghost">对比</button>
+            </div>
+            <label>
+              左侧 Run
+              <select id="compare-left-run"></select>
+            </label>
+            <label>
+              右侧 Run
+              <select id="compare-right-run"></select>
+            </label>
+            <pre id="run-compare-log" class="event-log compare-log"></pre>
           </div>
           <div id="run-list" class="run-list"></div>
           <pre id="event-log" class="event-log"></pre>

@@ -228,6 +228,37 @@ class ArtifactItem(BaseModel):
     modified_at: datetime
 
 
+class ApprovalAdvice(BaseModel):
+    run_id: str
+    workflow_id: str
+    node_id: str
+    required_permission: str
+    risk_level: str
+    recommended_action: str
+    reasons: list[str] = Field(default_factory=list)
+    checklist: list[str] = Field(default_factory=list)
+    suggested_comment: str = ""
+
+
+class RunComparison(BaseModel):
+    left_run_id: str
+    right_run_id: str
+    left_status: str
+    right_status: str
+    left_duration_ms: int | None = None
+    right_duration_ms: int | None = None
+    left_event_count: int
+    right_event_count: int
+    left_tool_failed_count: int
+    right_tool_failed_count: int
+    left_approval_count: int
+    right_approval_count: int
+    shared_nodes: list[str] = Field(default_factory=list)
+    nodes_only_left: list[str] = Field(default_factory=list)
+    nodes_only_right: list[str] = Field(default_factory=list)
+    summary: list[str] = Field(default_factory=list)
+
+
 class RunApprovalRequest(BaseModel):
     action: str = Field(pattern="^(approve|reject)$")
     approver: str = Field(min_length=1, max_length=120)

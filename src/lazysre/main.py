@@ -11,6 +11,7 @@ from lazysre.models import MemorySearchResponse, TaskCreateRequest, TaskRecord
 from lazysre.platform.models import (
     AgentCreateRequest,
     AgentDefinition,
+    ApprovalAdvice,
     ArtifactItem,
     AutoDesignRequest,
     EnvironmentBootstrapRequest,
@@ -20,6 +21,7 @@ from lazysre.platform.models import (
     PlatformOverview,
     PlatformTemplate,
     QuickstartRequest,
+    RunComparison,
     RunApprovalRequest,
     RunCreateRequest,
     ToolCreateRequest,
@@ -232,6 +234,19 @@ async def list_runs(workflow_id: str | None = None) -> list[WorkflowRun]:
     return await platform_service.list_runs(workflow_id=workflow_id)
 
 
+@app.get("/v1/platform/runs/compare", response_model=RunComparison)
+async def compare_runs(left_run_id: str, right_run_id: str) -> RunComparison:
+    try:
+        return await platform_service.compare_runs(
+            left_run_id=left_run_id,
+            right_run_id=right_run_id,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        code = 404 if "not found" in msg else 400
+        raise HTTPException(status_code=code, detail=msg) from exc
+
+
 @app.get("/v1/platform/runs/{run_id}", response_model=WorkflowRun)
 async def get_run(run_id: str) -> WorkflowRun:
     run = await platform_service.get_run(run_id)
@@ -275,6 +290,19 @@ async def run_approval(run_id: str, req: RunApprovalRequest) -> WorkflowRun:
     if not run:
         raise HTTPException(status_code=404, detail="run not found")
     return run
+
+
+@app.get("/v1/platform/runs/{run_id}/approval/advice", response_model=ApprovalAdvice)
+async def run_approval_advice(run_id: str) -> ApprovalAdvice:
+    try:
+        advice = await platform_service.get_run_approval_advice(run_id)
+    except ValueError as exc:
+        msg = str(exc)
+        code = 404 if "not found" in msg else 400
+        raise HTTPException(status_code=code, detail=msg) from exc
+    if not advice:
+        raise HTTPException(status_code=404, detail="run not found")
+    return advice
 
 
 @app.get("/v1/platform/runs/{run_id}/events")

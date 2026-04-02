@@ -431,3 +431,67 @@ async def test_incident_briefing_and_run_report_export(tmp_path: Path) -> None:
         assert False, "invalid kind should raise"
     except ValueError:
         assert True
+
+
+async def test_run_compare_and_approval_advice(tmp_path: Path) -> None:
+    service = PlatformService(store_path=str(tmp_path / "platform.json"))
+    wf = await service.quickstart(
+        QuickstartRequest(name="Compare Flow", objective="验证审批建议与 run 对比")
+    )
+
+    run1 = await service.create_run(
+        workflow_id=wf.id,
+        req=RunCreateRequest(input={"actor_permission": "write"}),
+    )
+    assert run1 is not None
+    status1 = await _wait_run(service, run1.id)
+    assert status1 == RunStatus.waiting_approval
+
+    advice = await service.get_run_approval_advice(run1.id)
+    assert advice is not None
+    assert advice.node_id
+    assert advice.recommended_action in {"approve", "approve_with_guardrails", "manual_review"}
+    assert advice.reasons
+    assert advice.checklist
+
+    await service.approve_run(
+        run1.id,
+        RunApprovalRequest(action="approve", approver="oncall.a", comment="ok"),
+    )
+    status1_done = await _wait_run(service, run1.id)
+    assert status1_done == RunStatus.completed
+
+    run2 = await service.create_run(
+        workflow_id=wf.id,
+        req=RunCreateRequest(input={"actor_permission": "write"}),
+    )
+    assert run2 is not None
+    status2 = await _wait_run(service, run2.id)
+    assert status2 == RunStatus.waiting_approval
+
+    await service.approve_run(
+        run2.id,
+        RunApprovalRequest(action="reject", approver="oncall.b", comment="high risk"),
+    )
+    loaded2 = await service.get_run(run2.id)
+    assert loaded2 is not None
+    assert loaded2.status == RunStatus.failed
+
+    comp = await service.compare_runs(left_run_id=run1.id, right_run_id=run2.id)
+    assert comp.left_run_id == run1.id
+    assert comp.right_run_id == run2.id
+    assert comp.left_status == RunStatus.completed.value
+    assert comp.right_status == RunStatus.failed.value
+    assert comp.summary
+
+    try:
+        await service.get_run_approval_advice(run1.id)
+        assert False, "completed run should not have approval advice"
+    except ValueError:
+        assert True
+
+    try:
+        await service.compare_runs("missing-left", run2.id)
+        assert False, "missing run should fail"
+    except ValueError:
+        assert True

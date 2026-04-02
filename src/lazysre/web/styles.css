@@ -259,6 +259,26 @@ button.danger {
   border-color: rgba(35, 117, 147, 0.24);
 }
 
+.compare-panel {
+  margin: 10px 0;
+  border: 1px dashed rgba(29, 143, 148, 0.28);
+  border-radius: 12px;
+  padding: 10px;
+  background: rgba(242, 251, 250, 0.7);
+}
+
+.compare-log {
+  min-height: 120px;
+  max-height: 200px;
+}
+
+.approval-advice-log {
+  min-height: 100px;
+  max-height: 180px;
+  background: #f7fbf8;
+  border-color: rgba(27, 136, 119, 0.24);
+}
+
 .row-item {
   border: 1px solid var(--line);
   border-radius: 12px;
