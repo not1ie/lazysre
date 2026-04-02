@@ -47,7 +47,10 @@ class ToolRegistry:
                 "exit_code": result.exit_code,
                 "dry_run": result.dry_run,
                 "blocked": result.blocked,
+                "risk_level": result.risk_level,
+                "policy_reasons": result.policy_reasons,
+                "requires_approval": result.requires_approval,
+                "approved": result.approved,
             },
             ensure_ascii=False,
         )
-

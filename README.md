@@ -44,6 +44,29 @@ uvicorn lazysre.main:app --reload
 
 - `http://127.0.0.1:8000/`
 
+## CLI 模式（lsre）
+
+安装后可直接使用：
+
+```bash
+lsre "检查 k8s pod 状态"
+lsre chat
+```
+
+执行控制（默认 dry-run）：
+
+```bash
+lsre --provider mock "重启异常容器"
+lsre --execute --approval-mode balanced --approve --provider mock "重启异常容器"
+```
+
+说明：
+
+1. `--execute` 才会真正执行命令；默认仅预演。
+2. 风险策略 `--approval-mode`：`strict|balanced|permissive`。
+3. 高风险命令在执行模式下需要 `--approve`。
+4. 每次工具执行都会写入审计日志（默认 `.data/lsre-audit.jsonl`）。
+
 ## 环境变量
 
 复制 `.env.example` 到 `.env` 后按需调整。

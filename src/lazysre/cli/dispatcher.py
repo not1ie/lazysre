@@ -17,7 +17,7 @@ class Dispatcher:
     max_steps: int = 6
     system_prompt: str = (
         "You are LazySRE CLI orchestrator. Decide when to call tools, keep actions safe, "
-        "respect dry-run mode, and provide concise SRE guidance."
+        "respect dry-run mode, approval policy and provide concise SRE guidance."
     )
 
     async def run(self, instruction: str) -> DispatchResult:
@@ -26,6 +26,11 @@ class Dispatcher:
             DispatchEvent(
                 kind="executor_mode",
                 message="dry-run" if self.executor.dry_run else "execute",
+            ),
+            DispatchEvent(
+                kind="approval_policy",
+                message=self.executor.approval_mode,
+                data={"approved": self.executor.approval_granted},
             ),
         ]
         specs = self.registry.specs()
@@ -82,4 +87,3 @@ class Dispatcher:
         )
         events.append(DispatchEvent(kind="max_steps", message=f"max_steps={self.max_steps}"))
         return DispatchResult(final_text=fallback, events=events)
-

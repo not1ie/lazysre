@@ -118,6 +118,17 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
                     )
                 ],
             )
+        if any(word in text for word in ("重启", "restart", "reboot")):
+            return LLMTurn(
+                response_id="mock-1",
+                tool_calls=[
+                    ToolCall(
+                        call_id="mock-docker-risk-1",
+                        name="docker",
+                        arguments={"command": "restart lazysre_lazysre.1.kdjvjz4qyxrhpsojsr3o7ye9q"},
+                    )
+                ],
+            )
         if any(word in text for word in ("docker", "容器", "service")):
             return LLMTurn(
                 response_id="mock-1",
@@ -203,4 +214,3 @@ def _safe_json_loads(raw: Any) -> Any:
         return json.loads(raw)
     except Exception:
         return {}
-

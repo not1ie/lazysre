@@ -40,6 +40,10 @@ class ExecResult:
     exit_code: int = 0
     dry_run: bool = False
     blocked: bool = False
+    risk_level: str = "low"
+    policy_reasons: list[str] = field(default_factory=list)
+    requires_approval: bool = False
+    approved: bool = False
 
 
 @dataclass(slots=True)
@@ -53,4 +57,3 @@ class DispatchEvent:
 class DispatchResult:
     final_text: str
     events: list[DispatchEvent] = field(default_factory=list)
-
