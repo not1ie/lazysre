@@ -6,6 +6,9 @@ LazySRE 是一个纯 AI 驱动的 SRE/运维 CLI 工具。
 ## 安装方式（开箱即用）
 
 ```bash
+# 方式1：npm 全局安装（Windows/macOS/Linux，安装后可直接输入 lazysre）
+npm install -g lazysre
+
 # 推荐：pipx 全局安装（安装后可直接输入 lazysre）
 pipx install "git+https://github.com/not1ie/lazysre.git"
 
@@ -19,6 +22,8 @@ lsre
 # 或 python 模块方式
 python -m lazysre
 ```
+
+说明：`npm install -g lazysre` 安装的是跨平台启动器；首次运行会自动检查并安装 Python 版 LazySRE 内核。
 
 ## 项目介绍
 

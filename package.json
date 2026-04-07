@@ -1,0 +1,33 @@
+{
+  "name": "lazysre",
+  "version": "0.1.0",
+  "description": "AI-native SRE CLI launcher for LazySRE (cross-platform npm wrapper).",
+  "license": "MIT",
+  "bin": {
+    "lazysre": "bin/lazysre.js",
+    "lsre": "bin/lazysre.js"
+  },
+  "files": [
+    "bin/lazysre.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/not1ie/lazysre.git"
+  },
+  "bugs": {
+    "url": "https://github.com/not1ie/lazysre/issues"
+  },
+  "homepage": "https://github.com/not1ie/lazysre#readme",
+  "keywords": [
+    "sre",
+    "aiops",
+    "cli",
+    "kubernetes",
+    "devops",
+    "lazysre"
+  ]
+}
