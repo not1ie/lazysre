@@ -26,6 +26,7 @@ build-backend = "setuptools.build_meta"
 
 [project.scripts]
 lsre = "lazysre.cli.main:main"
+lazysre = "lazysre.cli.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

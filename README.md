@@ -3,6 +3,23 @@
 LazySRE 是一个纯 AI 驱动的 SRE/运维 CLI 工具。  
 目标是让你用自然语言驱动排障、诊断、修复与回滚，而不是手工拼接一堆命令。
 
+## 安装方式（开箱即用）
+
+```bash
+# 推荐：pipx 全局安装（安装后可直接输入 lazysre）
+pipx install "git+https://github.com/not1ie/lazysre.git"
+
+# 或者一键脚本（自动使用 pipx，若无 pipx 则回退到 venv）
+curl -fsSL https://raw.githubusercontent.com/not1ie/lazysre/main/scripts/install_user.sh | bash
+
+# 启动
+lazysre
+# 兼容短命令
+lsre
+# 或 python 模块方式
+python -m lazysre
+```
+
 ## 项目介绍
 
 项目主命令是 `lsre`，围绕“观察 -> 推理 -> 执行 -> 回滚”闭环设计：
@@ -21,6 +38,7 @@ LazySRE 是一个纯 AI 驱动的 SRE/运维 CLI 工具。
 
 ```bash
 # 对话与诊断
+lazysre
 lsre
 lsre chat
 lsre "检查 k8s pod 状态"
