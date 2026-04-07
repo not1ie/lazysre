@@ -1,0 +1,27 @@
+name: npm-pack-check
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "package.json"
+      - "bin/**"
+      - ".github/workflows/npm-pack-check.yml"
+      - ".github/workflows/release-npm.yml"
+  pull_request:
+    paths:
+      - "package.json"
+      - "bin/**"
+      - ".github/workflows/npm-pack-check.yml"
+      - ".github/workflows/release-npm.yml"
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check npm package can be packed
+        run: npm pack --dry-run

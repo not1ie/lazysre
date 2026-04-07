@@ -25,6 +25,19 @@ python -m lazysre
 
 说明：`npm install -g lazysre` 安装的是跨平台启动器；首次运行会自动检查并安装 Python 版 LazySRE 内核。
 
+## npm 发布（维护者）
+
+```bash
+# 1) 配置仓库 Secret: NPM_TOKEN
+# 2) 本地执行发版脚本（会更新 package.json、打 tag、推送）
+./scripts/release_npm.sh 0.1.1
+```
+
+发布机制：
+- GitHub Actions 监听 tag `npm-v*`
+- 自动校验 tag 与 `package.json` 版本一致
+- 自动执行 `npm publish --access public`
+
 ## 项目介绍
 
 项目主命令是 `lsre`，围绕“观察 -> 推理 -> 执行 -> 回滚”闭环设计：
