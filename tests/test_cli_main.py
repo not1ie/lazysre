@@ -1,8 +1,13 @@
+import json
+from pathlib import Path
+
 from lazysre.cli.main import (
+    _collect_runtime_status,
     _extract_command_candidates,
     _extract_named_field,
     _looks_like_apply_request,
     _looks_like_fix_request,
+    _read_last_fix_plan_summary,
     _rewrite_argv_for_default_run,
     _should_launch_assistant,
 )
@@ -50,6 +55,12 @@ def test_rewrite_argv_preserves_fix_subcommand() -> None:
     assert argv == ["lsre", "fix", "支付服务变慢", "--apply"]
 
 
+def test_rewrite_argv_preserves_status_subcommand() -> None:
+    argv = ["lsre", "status", "--json"]
+    _rewrite_argv_for_default_run(argv)
+    assert argv == ["lsre", "status", "--json"]
+
+
 def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_fix_request("请帮我修复支付服务")
     assert _looks_like_fix_request("fix payment service latency")
@@ -63,6 +74,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["--verbose-reasoning"]) is True
     assert _should_launch_assistant([]) is True
     assert _should_launch_assistant(["chat"]) is False
+    assert _should_launch_assistant(["status"]) is False
     assert _should_launch_assistant(["检查k8s"]) is False
 
 
@@ -86,3 +98,58 @@ kubectl -n default get pods -l app=payment -w
     commands = _extract_command_candidates(text, max_items=5)
     assert commands[0] == "kubectl -n default rollout restart deploy/payment"
     assert "kubectl -n default get pods -l app=payment -w" in commands
+
+
+def test_read_last_fix_plan_summary(tmp_path: Path) -> None:
+    plan_path = tmp_path / "last.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-04-07T00:00:00Z",
+                "instruction": "修复 payment",
+                "plan": {"apply_commands": ["kubectl get pods"]},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    summary = _read_last_fix_plan_summary(plan_path)
+    assert summary["exists"] is True
+    assert summary["apply_commands"] == 1
+
+
+def test_collect_runtime_status_without_probe(tmp_path: Path) -> None:
+    session_file = tmp_path / "session.json"
+    session_file.write_text(
+        json.dumps(
+            {
+                "turns": [{"user": "检查集群", "assistant": "ok"}],
+                "entities": {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    profile_file = tmp_path / "target.json"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "prometheus_url": "http://127.0.0.1:9090",
+                "k8s_api_url": "https://127.0.0.1:6443",
+                "k8s_namespace": "default",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    status = _collect_runtime_status(
+        session_file=session_file,
+        profile_file=profile_file,
+        include_probe=False,
+        execute_probe=False,
+        timeout_sec=4,
+        audit_log=tmp_path / "audit.jsonl",
+    )
+    assert "target" in status
+    assert "session" in status
+    assert "probe" not in status

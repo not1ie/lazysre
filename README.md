@@ -22,6 +22,8 @@ LazySRE 是一个纯 AI 驱动的 SRE/运维 CLI 工具。
 lsre
 lsre chat
 lsre "检查 k8s pod 状态"
+# chat 快捷命令
+# /help /status /status probe /fix <问题> /apply
 
 # 自动修复模式（先生成修复与回滚计划）
 lsre fix "为什么支付服务响应变慢了？"
@@ -36,6 +38,9 @@ lsre fix "为什么支付服务响应变慢了？" --apply --execute --auto-appr
 lsre target show
 lsre target set --prometheus-url http://92.168.69.176:9090 --k8s-api-url https://192.168.10.1:6443 --k8s-skip-tls-verify
 lsre target probe --json
+# 运行时状态总览
+lsre status
+lsre status --probe --json
 
 # 会话历史
 lsre history show --limit 10

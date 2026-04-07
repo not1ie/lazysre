@@ -4,7 +4,9 @@ import asyncio
 import json
 import re
 import shlex
+import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -168,6 +170,49 @@ def run_instruction(
         provider=str(options["provider"]),
         max_steps=int(options["max_steps"]),
     )
+
+
+@app.command("status")
+def status(
+    ctx: typer.Context,
+    session_file: Annotated[str | None, typer.Option("--session-file", help="Override session memory file path.")] = None,
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
+    probe: Annotated[bool, typer.Option("--probe", help="Run target environment probe summary.")] = False,
+    execute_probe: Annotated[bool, typer.Option("--execute-probe", help="Execute probe commands for real. Default is dry-run probe.")] = False,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 6,
+    as_json: Annotated[bool, typer.Option("--json", help="Print status as JSON.")] = False,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=session_file,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
+    snapshot = _collect_runtime_status(
+        session_file=Path(str(options["session_file"])),
+        profile_file=Path(profile_file),
+        include_probe=probe,
+        execute_probe=execute_probe,
+        timeout_sec=timeout_sec,
+        audit_log=Path(str(options["audit_log"])),
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        return
+    _render_status_snapshot(snapshot)
 
 
 @app.command("chat")
@@ -1010,6 +1055,149 @@ def _render_probe_report(report: dict[str, object]) -> None:
     _console.print(table)
 
 
+def _collect_runtime_status(
+    *,
+    session_file: Path,
+    profile_file: Path,
+    include_probe: bool,
+    execute_probe: bool,
+    timeout_sec: int,
+    audit_log: Path,
+) -> dict[str, object]:
+    session_store = SessionStore(session_file)
+    payload = session_store.load()
+    turns = payload.get("turns", []) if isinstance(payload, dict) else []
+    last_user = ""
+    if isinstance(turns, list) and turns:
+        tail = turns[-1]
+        if isinstance(tail, dict):
+            last_user = str(tail.get("user", "")).strip()
+
+    target_store = TargetEnvStore(profile_file)
+    target = target_store.load()
+
+    snapshot: dict[str, object] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "target_profile_file": str(profile_file),
+        "session_file": str(session_file),
+        "target": target.to_safe_dict(),
+        "session": {
+            "turns": len(turns) if isinstance(turns, list) else 0,
+            "last_user": last_user[:160],
+        },
+        "last_fix_plan": _read_last_fix_plan_summary(Path(".data/lsre-fix-last.json")),
+        "memory": {
+            "db_path": str(_default_memory_db_path()),
+            "cases": _count_memory_cases(_default_memory_db_path()),
+        },
+    }
+
+    if include_probe:
+        report = asyncio.run(
+            probe_target_environment(
+                target,
+                executor=SafeExecutor(
+                    dry_run=(not execute_probe),
+                    approval_mode="permissive",
+                    approval_granted=True,
+                    audit_logger=AuditLogger(audit_log),
+                ),
+                timeout_sec=timeout_sec,
+            )
+        )
+        snapshot["probe"] = {
+            "mode": "execute" if execute_probe else "dry-run",
+            "timeout_sec": timeout_sec,
+            "summary": report.get("summary", {}),
+            "checks": report.get("checks", {}),
+        }
+    return snapshot
+
+
+def _default_memory_db_path() -> Path:
+    return Path.home() / ".lazysre" / "history_db"
+
+
+def _count_memory_cases(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        with sqlite3.connect(path) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM incident_memory").fetchone()
+            return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _read_last_fix_plan_summary(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {"exists": False}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"exists": False, "invalid": True}
+    if not isinstance(payload, dict):
+        return {"exists": False, "invalid": True}
+    plan = payload.get("plan", {})
+    apply_cmds = []
+    if isinstance(plan, dict):
+        raw = plan.get("apply_commands", [])
+        if isinstance(raw, list):
+            apply_cmds = [str(x).strip() for x in raw if str(x).strip()]
+    return {
+        "exists": True,
+        "generated_at": str(payload.get("generated_at", "")),
+        "instruction": str(payload.get("instruction", ""))[:180],
+        "apply_commands": len(apply_cmds),
+        "path": str(path),
+    }
+
+
+def _render_status_snapshot(snapshot: dict[str, object]) -> None:
+    if not (_console and Table):
+        typer.echo(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        return
+    table = Table(title="LazySRE Runtime Status")
+    table.add_column("Item", style="cyan", no_wrap=True)
+    table.add_column("Value", style="white")
+
+    session = snapshot.get("session", {})
+    session_turns = "-"
+    session_last = ""
+    if isinstance(session, dict):
+        session_turns = str(session.get("turns", "-"))
+        session_last = str(session.get("last_user", ""))
+    target = snapshot.get("target", {})
+    target_payload = target if isinstance(target, dict) else {}
+
+    table.add_row("Generated", str(snapshot.get("generated_at_utc", "-")))
+    table.add_row("Session Turns", session_turns)
+    table.add_row("Last User Input", session_last or "-")
+    table.add_row("Prometheus", str(target_payload.get("prometheus_url", "-") or "-"))
+    table.add_row("K8s API", str(target_payload.get("k8s_api_url", "-") or "-"))
+    table.add_row("K8s Context", str(target_payload.get("k8s_context", "-") or "-"))
+    table.add_row("K8s Namespace", str(target_payload.get("k8s_namespace", "-") or "-"))
+    memory = snapshot.get("memory", {})
+    if isinstance(memory, dict):
+        table.add_row("Memory Cases", str(memory.get("cases", 0)))
+    last_fix = snapshot.get("last_fix_plan", {})
+    if isinstance(last_fix, dict):
+        if bool(last_fix.get("exists")):
+            table.add_row("Last Fix", str(last_fix.get("instruction", "-")) or "-")
+            table.add_row("Fix Cmds", str(last_fix.get("apply_commands", 0)))
+        else:
+            table.add_row("Last Fix", "none")
+    probe = snapshot.get("probe", {})
+    if isinstance(probe, dict):
+        summary = probe.get("summary", {})
+        if isinstance(summary, dict):
+            table.add_row(
+                "Probe",
+                f"{probe.get('mode', '-')}: {summary.get('ok_count', 0)}/{summary.get('total', 0)}",
+            )
+    _console.print(table)
+
+
 def _render_fix_summary(plan: FixPlan, *, max_apply_steps: int) -> None:
     apply_preview = plan.apply_commands[:max_apply_steps]
     if _console and Table:
@@ -1208,9 +1396,27 @@ def _render_step_result(step_index: int, total_steps: int, result) -> None:
         typer.echo(text)
 
 
+def _render_chat_short_help() -> None:
+    lines = [
+        "LazySRE Chat 快捷命令",
+        "- /help: 查看帮助",
+        "- /status: 查看当前会话、目标配置、最近修复计划",
+        "- /status probe: 追加目标探测摘要（dry-run）",
+        "- /fix <问题>: 进入修复计划模式",
+        "- /apply: 执行最近一次修复计划",
+        "- exit / quit: 退出",
+    ]
+    text = "\n".join(lines)
+    if _console and Panel:
+        _console.print(Panel(text, border_style="cyan"))
+    else:
+        typer.echo(text)
+
+
 def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("LazySRE 自然语言助手已启动。直接输入问题即可，输入 exit/quit 退出。")
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
+    typer.echo("快捷命令：/help /status [/status probe] /fix <问题> /apply")
     while True:
         try:
             line = typer.prompt("lsre")
@@ -1222,6 +1428,40 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower() in {"exit", "quit"}:
             break
+        if text.lower() in {"/help", "/h"}:
+            _render_chat_short_help()
+            continue
+        if text.lower().startswith("/status"):
+            include_probe = "probe" in text.lower()
+            snapshot = _collect_runtime_status(
+                session_file=Path(str(options["session_file"])),
+                profile_file=Path(settings.target_profile_file),
+                include_probe=include_probe,
+                execute_probe=False,
+                timeout_sec=6,
+                audit_log=Path(str(options["audit_log"])),
+            )
+            if _console:
+                _render_status_snapshot(snapshot)
+            else:
+                typer.echo(json.dumps(snapshot, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/fix "):
+            fix_text = text[5:].strip()
+            if not fix_text:
+                typer.echo("用法：/fix <问题描述>")
+                continue
+            text = fix_text
+        if text.lower() in {"/apply", "/apply-last"}:
+            _apply_last_fix_plan(
+                max_apply_steps=6,
+                execute=bool(options["execute"]),
+                approval_mode=str(options["approval_mode"]),
+                audit_log=str(options["audit_log"]),
+                model=str(options["model"]),
+                provider=str(options["provider"]),
+            )
+            continue
 
         if _looks_like_apply_request(text):
             _apply_last_fix_plan(
@@ -1575,7 +1815,7 @@ def main() -> None:
 def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     if len(argv) <= 1:
         return
-    commands = {"run", "chat", "fix", "pack", "target", "history", "--help", "-h"}
+    commands = {"run", "chat", "fix", "status", "pack", "target", "history", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",
@@ -1608,7 +1848,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
 def _should_launch_assistant(tokens: list[str]) -> bool:
     if not tokens:
         return True
-    commands = {"run", "chat", "fix", "pack", "target", "history", "--help", "-h"}
+    commands = {"run", "chat", "fix", "status", "pack", "target", "history", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",
