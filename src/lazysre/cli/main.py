@@ -32,8 +32,9 @@ from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.session import SessionStore
 from lazysre.cli.memory import IncidentMemoryStore, MemoryCase, format_memory_context
 from lazysre.cli.runbook import (
+    RunbookStore,
     RunbookTemplate,
-    builtin_runbooks,
+    all_runbooks,
     find_runbook,
     parse_runbook_vars,
     render_runbook_instruction,
@@ -1302,36 +1303,100 @@ def memory_search(
 
 
 @runbook_app.command("list")
-def runbook_list() -> None:
-    items = builtin_runbooks()
+def runbook_list(
+    runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
+    custom_only: Annotated[bool, typer.Option("--custom-only", help="Show custom runbooks only.")] = False,
+) -> None:
+    store = RunbookStore(Path(runbook_file))
+    items = store.list_custom() if custom_only else all_runbooks(store=store)
     if not (_console and Table):
         for item in items:
-            typer.echo(f"{item.name} [{item.mode}] {item.title}")
+            typer.echo(f"{item.name} [{item.mode}] ({item.source}) {item.title}")
         return
     table = Table(title="Runbooks")
     table.add_column("Name", style="cyan", no_wrap=True)
     table.add_column("Mode", style="magenta", no_wrap=True)
+    table.add_column("Source", style="yellow", no_wrap=True)
     table.add_column("Title", style="white")
     table.add_column("Description", style="green")
     for item in items:
-        table.add_row(item.name, item.mode, item.title, item.description)
+        table.add_row(item.name, item.mode, item.source, item.title, item.description)
     _console.print(table)
 
 
 @runbook_app.command("show")
-def runbook_show(name: Annotated[str, typer.Argument(help="Runbook name.")]) -> None:
-    item = find_runbook(name)
+def runbook_show(
+    name: Annotated[str, typer.Argument(help="Runbook name.")],
+    runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
+) -> None:
+    item = find_runbook(name, store=RunbookStore(Path(runbook_file)))
     if not item:
         raise typer.BadParameter(f"runbook not found: {name}")
     payload = {
         "name": item.name,
         "title": item.title,
         "mode": item.mode,
+        "source": item.source,
         "description": item.description,
         "instruction": item.instruction,
         "variables": item.variables,
     }
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@runbook_app.command("add")
+def runbook_add(
+    name: Annotated[str, typer.Argument(help="Runbook name.")],
+    title: Annotated[str, typer.Option("--title", help="Runbook title.")],
+    instruction: Annotated[str, typer.Option("--instruction", help="Instruction template (supports {vars}).")],
+    mode: Annotated[str, typer.Option("--mode", help="Runbook mode: diagnose|fix")] = "diagnose",
+    description: Annotated[str, typer.Option("--description", help="Short description.")] = "",
+    var: Annotated[list[str], typer.Option("--var", "-v", help="Default vars key=value, can be repeated.")] = [],
+    runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
+    force: Annotated[bool, typer.Option("--force", help="Overwrite if already exists (including builtin names).")] = False,
+) -> None:
+    store = RunbookStore(Path(runbook_file))
+    existing = find_runbook(name, store=store)
+    if existing and (not force):
+        raise typer.BadParameter(f"runbook already exists: {name}. use --force to overwrite.")
+    try:
+        default_vars = parse_runbook_vars(var)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    template = RunbookTemplate(
+        name=name.strip().lower(),
+        title=title.strip(),
+        mode=mode.strip().lower(),
+        instruction=instruction.strip(),
+        description=description.strip(),
+        variables=default_vars,
+        source="custom",
+    )
+    try:
+        store.upsert(template)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Saved runbook: {template.name} ({template.mode})")
+
+
+@runbook_app.command("remove")
+def runbook_remove(
+    name: Annotated[str, typer.Argument(help="Runbook name.")],
+    runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
+    yes: Annotated[bool, typer.Option("--yes", help="Skip confirmation prompt.")] = False,
+) -> None:
+    store = RunbookStore(Path(runbook_file))
+    custom = store.get_custom(name)
+    if not custom:
+        raise typer.BadParameter(f"custom runbook not found: {name}")
+    if not yes:
+        if not typer.confirm(f"确认删除自定义 runbook {name} 吗？", default=False):
+            typer.echo("Canceled.")
+            return
+    removed = store.remove(name)
+    if not removed:
+        raise typer.BadParameter(f"custom runbook not found: {name}")
+    typer.echo(f"Removed runbook: {name}")
 
 
 @runbook_app.command("run")
@@ -1341,6 +1406,7 @@ def runbook_run(
     apply: Annotated[bool, typer.Option("--apply", help="Apply generated fix steps (fix runbooks only).")] = False,
     var: Annotated[list[str], typer.Option("--var", "-v", help="Runbook variables in key=value format. Can be repeated.")] = [],
     extra: Annotated[str, typer.Option("--extra", help="Extra context appended to runbook instruction.")] = "",
+    runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
     execute: Annotated[bool | None, typer.Option("--execute", help="Override execution mode.")] = None,
     approve: Annotated[bool | None, typer.Option("--approve", help="Override approval flag.")] = None,
     interactive_approval: Annotated[bool | None, typer.Option("--interactive-approval/--no-interactive-approval", help="Override interactive approval prompt.")] = None,
@@ -1354,7 +1420,7 @@ def runbook_run(
     provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
     max_steps: Annotated[int | None, typer.Option(help="Override max function-calling iterations.")] = None,
 ) -> None:
-    template = find_runbook(name)
+    template = find_runbook(name, store=RunbookStore(Path(runbook_file)))
     if not template:
         raise typer.BadParameter(f"runbook not found: {name}")
     options = _merged_options(
@@ -2637,7 +2703,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             runbook_name = parts[0] if parts else ""
             runbook_var_items = [item for item in parts[1:] if "=" in item]
             runbook_extra = " ".join(item for item in parts[1:] if "=" not in item).strip()
-            template = find_runbook(runbook_name)
+            template = find_runbook(runbook_name, store=RunbookStore.default())
             if not template:
                 typer.echo(f"runbook not found: {tail}")
                 continue
