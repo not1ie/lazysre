@@ -225,6 +225,8 @@ def doctor(
     timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 6,
     dry_run_probe: Annotated[bool, typer.Option("--dry-run-probe", help="Run probe checks in dry-run mode.")] = False,
     auto_fix: Annotated[bool, typer.Option("--auto-fix", help="Apply safe auto-fixes for doctor findings.")] = False,
+    write_backup: Annotated[bool, typer.Option("--write-backup", help="Backup target profile before auto-fix updates.")] = False,
+    strict: Annotated[bool, typer.Option("--strict", help="Treat warnings as failure (CI-friendly).")] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print doctor report as JSON.")] = False,
 ) -> None:
     options = _merged_options(
@@ -255,7 +257,7 @@ def doctor(
         audit_log=Path(str(options["audit_log"])),
     )
     if auto_fix:
-        autofix = _apply_doctor_autofix(target_store, target)
+        autofix = _apply_doctor_autofix(target_store, target, write_backup=write_backup)
         target = target_store.load()
         report = _collect_doctor_report(
             target=target,
@@ -264,10 +266,19 @@ def doctor(
             audit_log=Path(str(options["audit_log"])),
         )
         report["autofix"] = autofix
+    summary_obj = report.get("summary", {})
+    if isinstance(summary_obj, dict):
+        strict_healthy = _doctor_is_healthy(summary_obj, strict=strict)
+        summary_obj["strict_mode"] = strict
+        summary_obj["strict_healthy"] = strict_healthy
+    else:
+        strict_healthy = True
     if as_json or (not _console):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
-        return
-    _render_doctor_report(report)
+    else:
+        _render_doctor_report(report)
+    if strict and (not strict_healthy):
+        raise typer.Exit(code=2)
 
 
 @app.command("approve")
@@ -1520,14 +1531,25 @@ def _doctor_target_checks(target) -> list[dict[str, object]]:
     return checks
 
 
-def _apply_doctor_autofix(target_store: TargetEnvStore, target) -> dict[str, object]:
+def _apply_doctor_autofix(
+    target_store: TargetEnvStore,
+    target,
+    *,
+    write_backup: bool = False,
+) -> dict[str, object]:
     updates, actions = _compute_doctor_autofix(target)
+    backup_path = ""
     if updates:
+        if write_backup:
+            backup_path = _backup_target_profile(target_store.path)
+            if backup_path:
+                actions.insert(0, f"backup target profile -> {backup_path}")
         target_store.update(**updates)
     return {
         "changed": bool(updates),
         "updates": updates,
         "applied": actions,
+        "backup_path": backup_path,
     }
 
 
@@ -1568,6 +1590,19 @@ def _detect_kubectl_current_context() -> str:
     if completed.returncode != 0:
         return ""
     return (completed.stdout or "").strip()
+
+
+def _backup_target_profile(path: Path) -> str:
+    if not path.exists():
+        return ""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.bak-{timestamp}")
+    try:
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, backup)
+    except Exception:
+        return ""
+    return str(backup)
 
 
 def _doctor_probe_check(name: str, payload: dict[str, object], *, dry_run_probe: bool) -> dict[str, object]:
@@ -1615,6 +1650,14 @@ def _summarize_doctor_checks(checks: list[dict[str, object]]) -> dict[str, int |
     }
 
 
+def _doctor_is_healthy(summary: dict[str, object], *, strict: bool) -> bool:
+    errors = int(summary.get("error", 0))
+    warns = int(summary.get("warn", 0))
+    if strict:
+        return (errors == 0) and (warns == 0)
+    return errors == 0
+
+
 def _render_doctor_report(report: dict[str, object]) -> None:
     if not (_console and Table):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
@@ -1624,6 +1667,8 @@ def _render_doctor_report(report: dict[str, object]) -> None:
         f"pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} "
         f"error={summary.get('error', 0)} healthy={summary.get('healthy', False)}"
     )
+    if bool(summary.get("strict_mode")):
+        summary_text = f"{summary_text} strict_healthy={summary.get('strict_healthy', False)}"
     autofix = report.get("autofix", {})
     if isinstance(autofix, dict) and ("changed" in autofix):
         summary_text = (
@@ -1862,6 +1907,7 @@ def _render_chat_short_help() -> None:
         "- /status probe: 追加目标探测摘要（dry-run）",
         "- /doctor: 运行环境预检（依赖/配置/连通性）",
         "- /doctor fix: 执行安全自动修复后再预检",
+        "- /doctor strict: 严格模式（warn 也视为不健康）",
         "- /fix <问题>: 进入修复计划模式",
         "- /apply: 执行最近一次修复计划",
         "- /approve: 查看审批队列",
@@ -1913,11 +1959,17 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
         if text.lower().startswith("/doctor"):
             doctor_text = text.lower()
             auto_fix = (" fix" in doctor_text) or ("--auto-fix" in doctor_text)
+            strict_mode = (" strict" in doctor_text) or ("--strict" in doctor_text)
+            write_backup = (" backup" in doctor_text) or ("--write-backup" in doctor_text)
             target_store = TargetEnvStore()
             target = target_store.load()
             autofix_payload: dict[str, object] | None = None
             if auto_fix:
-                autofix_payload = _apply_doctor_autofix(target_store, target)
+                autofix_payload = _apply_doctor_autofix(
+                    target_store,
+                    target,
+                    write_backup=write_backup,
+                )
                 target = target_store.load()
             report = _collect_doctor_report(
                 target=target,
@@ -1927,6 +1979,10 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             )
             if autofix_payload is not None:
                 report["autofix"] = autofix_payload
+            summary_obj = report.get("summary", {})
+            if isinstance(summary_obj, dict):
+                summary_obj["strict_mode"] = strict_mode
+                summary_obj["strict_healthy"] = _doctor_is_healthy(summary_obj, strict=strict_mode)
             if _console:
                 _render_doctor_report(report)
             else:

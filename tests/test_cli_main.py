@@ -2,8 +2,10 @@ import json
 from pathlib import Path
 
 from lazysre.cli.main import (
+    _backup_target_profile,
     _compute_doctor_autofix,
     _collect_runtime_status,
+    _doctor_is_healthy,
     _extract_command_candidates,
     _extract_named_field,
     _looks_like_apply_request,
@@ -201,6 +203,12 @@ def test_summarize_doctor_checks() -> None:
     assert summary["healthy"] is False
 
 
+def test_doctor_is_healthy_strict_and_non_strict() -> None:
+    summary = {"error": 0, "warn": 1}
+    assert _doctor_is_healthy(summary, strict=False) is True
+    assert _doctor_is_healthy(summary, strict=True) is False
+
+
 def test_compute_doctor_autofix_sets_safe_defaults(monkeypatch) -> None:
     monkeypatch.setattr(
         "lazysre.cli.main._detect_kubectl_current_context",
@@ -220,3 +228,13 @@ def test_compute_doctor_autofix_sets_safe_defaults(monkeypatch) -> None:
     assert "k8s_api_url" in updates
     assert updates.get("k8s_context") == "autofix-context"
     assert actions
+
+
+def test_backup_target_profile(tmp_path: Path) -> None:
+    profile = tmp_path / "target.json"
+    profile.write_text('{"k8s_namespace":"default"}', encoding="utf-8")
+    backup_path = _backup_target_profile(profile)
+    assert backup_path
+    backup = Path(backup_path)
+    assert backup.exists()
+    assert backup.read_text(encoding="utf-8") == profile.read_text(encoding="utf-8")
