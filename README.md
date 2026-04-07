@@ -26,7 +26,7 @@ lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
 # /help /status /status probe /doctor [/doctor fix] [/doctor strict]
-# /runbook [name] [k=v] /report /fix <问题> /apply /approve [1,3-4] /memory [query]
+# /runbook [list|show|render|name] [k=v] /report /fix <问题> /apply /approve [1,3-4] /memory [query]
 
 # 自动修复模式（先生成修复与回滚计划）
 lsre fix "为什么支付服务响应变慢了？"
@@ -61,6 +61,8 @@ lsre doctor --strict --json
 lsre runbook list
 lsre runbook list --custom-only
 lsre runbook show payment-latency-fix
+# 预览渲染（会自动注入当前 target 的 namespace/context 等变量）
+lsre runbook render payment-latency-fix
 lsre runbook run payment-latency-fix --var service=payment --var namespace=prod --var p95_ms=450
 lsre runbook run payment-latency-fix --apply --execute
 # 新增/覆盖自定义 runbook（可覆盖同名内置模板）

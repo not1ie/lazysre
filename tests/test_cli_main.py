@@ -22,8 +22,12 @@ from lazysre.cli.main import (
     _rewrite_argv_for_default_run,
     _summarize_doctor_checks,
     _push_report_to_git,
+    _resolve_runbook_vars,
+    _target_runbook_context_vars,
+    _prepare_runbook_instruction,
     _should_launch_assistant,
 )
+from lazysre.cli.runbook import find_runbook
 from lazysre.cli.target import TargetEnvironment
 
 
@@ -400,3 +404,79 @@ def test_push_report_to_git_no_changes(monkeypatch, tmp_path: Path) -> None:
         commit_message="chore(report): test",
     )
     assert ok is False
+
+
+def test_target_runbook_context_vars(tmp_path: Path, monkeypatch) -> None:
+    target_file = tmp_path / "target.json"
+    target_file.write_text(
+        json.dumps(
+            {
+                "prometheus_url": "http://127.0.0.1:9090",
+                "k8s_api_url": "https://127.0.0.1:6443",
+                "k8s_context": "dev",
+                "k8s_namespace": "payments",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("lazysre.cli.main.ClusterProfileStore.default", lambda: type("X", (), {"get_active": lambda self: "prod"})())
+    values = _target_runbook_context_vars(profile_file=target_file)
+    assert values["namespace"] == "payments"
+    assert values["k8s_context"] == "dev"
+    assert values["target_profile"] == "prod"
+
+
+def test_resolve_runbook_vars_prefers_cli_over_target(tmp_path: Path, monkeypatch) -> None:
+    target_file = tmp_path / "target.json"
+    target_file.write_text(
+        json.dumps(
+            {
+                "prometheus_url": "http://127.0.0.1:9090",
+                "k8s_api_url": "https://127.0.0.1:6443",
+                "k8s_context": "dev",
+                "k8s_namespace": "payments",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("lazysre.cli.main.ClusterProfileStore.default", lambda: type("X", (), {"get_active": lambda self: "prod"})())
+    template = find_runbook("payment-latency-fix")
+    assert template is not None
+    values = _resolve_runbook_vars(
+        template=template,
+        var_items=["namespace=checkout", "service=order"],
+        profile_file=target_file,
+    )
+    assert values["namespace"] == "checkout"
+    assert values["service"] == "order"
+    assert values["target_profile"] == "prod"
+
+
+def test_prepare_runbook_instruction_includes_vars_and_extra(tmp_path: Path, monkeypatch) -> None:
+    target_file = tmp_path / "target.json"
+    target_file.write_text(
+        json.dumps(
+            {
+                "prometheus_url": "http://127.0.0.1:9090",
+                "k8s_api_url": "https://127.0.0.1:6443",
+                "k8s_context": "dev",
+                "k8s_namespace": "payments",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("lazysre.cli.main.ClusterProfileStore.default", lambda: type("X", (), {"get_active": lambda self: "prod"})())
+    template = find_runbook("payment-latency-fix")
+    assert template is not None
+    rendered = _prepare_runbook_instruction(
+        template=template,
+        var_items=["service=order"],
+        extra="仅观察，不做变更",
+        profile_file=target_file,
+    )
+    assert "payments" in rendered
+    assert "service=order" in rendered
+    assert "[runbook-extra]" in rendered

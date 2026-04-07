@@ -1493,10 +1493,101 @@ def runbook_run(
         max_steps=max_steps,
     )
     try:
-        vars_payload = parse_runbook_vars(var)
-        instruction, resolved_vars = render_runbook_instruction(template, overrides=vars_payload)
+        instruction = _prepare_runbook_instruction(
+            template=template,
+            var_items=list(var),
+            extra=extra,
+            profile_file=Path(settings.target_profile_file),
+        )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    _execute_runbook(
+        template=template,
+        instruction=instruction,
+        apply=apply,
+        options=options,
+    )
+
+
+@runbook_app.command("render")
+def runbook_render(
+    name: Annotated[str, typer.Argument(help="Runbook name.")],
+    var: Annotated[list[str], typer.Option("--var", "-v", help="Runbook variables in key=value format. Can be repeated.")] = [],
+    extra: Annotated[str, typer.Option("--extra", help="Extra context appended to rendered instruction.")] = "",
+    runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
+    as_json: Annotated[bool, typer.Option("--json", help="Print rendered payload as JSON.")] = False,
+) -> None:
+    template = find_runbook(name, store=RunbookStore(Path(runbook_file)))
+    if not template:
+        raise typer.BadParameter(f"runbook not found: {name}")
+    try:
+        resolved = _resolve_runbook_vars(
+            template=template,
+            var_items=list(var),
+            profile_file=Path(settings.target_profile_file),
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    rendered = template.instruction.format(**resolved)
+    if extra.strip():
+        rendered = f"{rendered}\n\n[runbook-extra]\n{extra.strip()}"
+    payload = {
+        "name": template.name,
+        "mode": template.mode,
+        "source": template.source,
+        "resolved_vars": resolved,
+        "rendered_instruction": rendered,
+    }
+    if as_json or (not _console):
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    _console.print(Panel(rendered, title=f"Runbook Render: {template.name}", border_style="cyan"))
+
+
+def _target_runbook_context_vars(*, profile_file: Path) -> dict[str, str]:
+    target = TargetEnvStore(profile_file).load()
+    active_profile = ClusterProfileStore.default().get_active().strip()
+    values: dict[str, str] = {}
+    if target.k8s_namespace.strip():
+        values["namespace"] = target.k8s_namespace.strip()
+    if target.k8s_context.strip():
+        values["k8s_context"] = target.k8s_context.strip()
+    if target.k8s_api_url.strip():
+        values["k8s_api_url"] = target.k8s_api_url.strip()
+    if target.prometheus_url.strip():
+        values["prometheus_url"] = target.prometheus_url.strip()
+    if active_profile:
+        values["target_profile"] = active_profile
+    return values
+
+
+def _resolve_runbook_vars(
+    *,
+    template: RunbookTemplate,
+    var_items: list[str],
+    profile_file: Path,
+) -> dict[str, str]:
+    cli_vars = parse_runbook_vars(var_items)
+    context_vars = _target_runbook_context_vars(profile_file=profile_file)
+    merged_vars = dict(context_vars)
+    merged_vars.update(cli_vars)
+    _, resolved_vars = render_runbook_instruction(template, overrides=merged_vars)
+    return resolved_vars
+
+
+def _prepare_runbook_instruction(
+    *,
+    template: RunbookTemplate,
+    var_items: list[str],
+    extra: str,
+    profile_file: Path,
+) -> str:
+    resolved_vars = _resolve_runbook_vars(
+        template=template,
+        var_items=var_items,
+        profile_file=profile_file,
+    )
+    instruction = template.instruction.format(**resolved_vars)
     if extra.strip():
         instruction = f"{instruction}\n\n[runbook-extra]\n{extra.strip()}"
     if resolved_vars:
@@ -1504,12 +1595,7 @@ def runbook_run(
             f"{instruction}\n\n[runbook-vars]\n"
             + ", ".join(f"{k}={v}" for k, v in sorted(resolved_vars.items()))
         )
-    _execute_runbook(
-        template=template,
-        instruction=instruction,
-        apply=apply,
-        options=options,
-    )
+    return instruction
 
 
 def _build_system_prompt(*, conversation_context: str = "", memory_context: str = "") -> str:
@@ -2658,6 +2744,8 @@ def _render_chat_short_help() -> None:
         "- /doctor fix: 执行安全自动修复后再预检",
         "- /doctor strict: 严格模式（warn 也视为不健康）",
         "- /runbook list: 查看 runbook 模板",
+        "- /runbook show <name>: 查看 runbook 定义",
+        "- /runbook render <name> [k=v]: 预览渲染后的 runbook 指令",
         "- /runbook <name> [k=v]: 执行 runbook（支持变量覆盖）",
         "- /report: 导出复盘报告",
         "- /fix <问题>: 进入修复计划模式",
@@ -2680,7 +2768,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
     typer.echo(
         "快捷命令：/help /status [/status probe] /doctor [/doctor fix] "
-        "/runbook [name] [k=v] /report /fix <问题> /apply /approve [steps] /memory [query]"
+        "/runbook [list|show|render|name] [k=v] /report /fix <问题> /apply /approve [steps] /memory [query]"
     )
     while True:
         try:
@@ -2750,26 +2838,48 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 runbook_list()
                 continue
             parts = [p for p in tail.split(" ") if p.strip()]
-            runbook_name = parts[0] if parts else ""
-            runbook_var_items = [item for item in parts[1:] if "=" in item]
-            runbook_extra = " ".join(item for item in parts[1:] if "=" not in item).strip()
+            if not parts:
+                runbook_list()
+                continue
+            if parts[0].lower() in {"show", "render"} and len(parts) >= 2:
+                subcmd = parts[0].lower()
+                runbook_name = parts[1]
+                runbook_var_items = [item for item in parts[2:] if "=" in item]
+                runbook_extra = " ".join(item for item in parts[2:] if "=" not in item).strip()
+            else:
+                subcmd = "run"
+                runbook_name = parts[0]
+                runbook_var_items = [item for item in parts[1:] if "=" in item]
+                runbook_extra = " ".join(item for item in parts[1:] if "=" not in item).strip()
             template = find_runbook(runbook_name, store=RunbookStore.default())
             if not template:
-                typer.echo(f"runbook not found: {tail}")
+                typer.echo(f"runbook not found: {runbook_name}")
                 continue
             try:
-                overrides = parse_runbook_vars(runbook_var_items)
-                instruction, resolved_vars = render_runbook_instruction(template, overrides=overrides)
+                instruction = _prepare_runbook_instruction(
+                    template=template,
+                    var_items=runbook_var_items,
+                    extra=runbook_extra,
+                    profile_file=Path(settings.target_profile_file),
+                )
             except ValueError as exc:
                 typer.echo(str(exc))
                 continue
-            if runbook_extra:
-                instruction = f"{instruction}\n\n[runbook-extra]\n{runbook_extra}"
-            if resolved_vars:
-                instruction = (
-                    f"{instruction}\n\n[runbook-vars]\n"
-                    + ", ".join(f"{k}={v}" for k, v in sorted(resolved_vars.items()))
-                )
+            if subcmd == "show":
+                payload = {
+                    "name": template.name,
+                    "title": template.title,
+                    "mode": template.mode,
+                    "source": template.source,
+                    "description": template.description,
+                    "instruction": template.instruction,
+                    "rendered_instruction": instruction,
+                }
+                typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+                continue
+            if subcmd == "render":
+                typer.echo(instruction)
+                continue
             _execute_runbook(
                 template=template,
                 instruction=instruction,
