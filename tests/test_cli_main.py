@@ -1,12 +1,16 @@
 import json
+import os
+import subprocess
 from pathlib import Path
 
 from lazysre.cli.main import (
+    _archive_report_for_git,
     _backup_target_profile,
     _build_doctor_gate,
     _build_incident_report_payload,
     _compute_doctor_autofix,
     _collect_runtime_status,
+    _default_report_output_path,
     _doctor_is_healthy,
     _extract_command_candidates,
     _extract_named_field,
@@ -17,6 +21,7 @@ from lazysre.cli.main import (
     _render_incident_report_markdown,
     _rewrite_argv_for_default_run,
     _summarize_doctor_checks,
+    _push_report_to_git,
     _should_launch_assistant,
 )
 from lazysre.cli.target import TargetEnvironment
@@ -312,3 +317,86 @@ def test_build_report_payload_and_markdown(tmp_path: Path) -> None:
     md = _render_incident_report_markdown(payload)
     assert "LazySRE Incident Report" in md
     assert "Recent Session Turns" in md
+
+
+def test_default_report_output_path_switches_for_push() -> None:
+    normal = _default_report_output_path(fmt="markdown", stamp="20260407-010203", push_to_git=False)
+    pushed = _default_report_output_path(fmt="json", stamp="20260407-010203", push_to_git=True)
+    assert normal == ".data/lsre-report-20260407-010203.md"
+    assert pushed == "reports/lsre-report-20260407-010203.json"
+
+
+def test_archive_report_for_git_copies_into_reports(tmp_path: Path) -> None:
+    source = tmp_path / "out.md"
+    source.write_text("# report\n", encoding="utf-8")
+    old = Path.cwd()
+    try:
+        # archive path uses cwd/reports, so switch into tmp workspace for this test
+        os.chdir(tmp_path)
+        archived = _archive_report_for_git(source, stamp="20260407-010203")
+        assert archived.as_posix().startswith("reports/")
+        assert archived.exists()
+        assert archived.read_text(encoding="utf-8") == "# report\n"
+    finally:
+        os.chdir(old)
+
+
+def test_push_report_to_git_success(monkeypatch, tmp_path: Path) -> None:
+    archived = tmp_path / "reports" / "r.md"
+    archived.parent.mkdir(parents=True, exist_ok=True)
+    archived.write_text("ok\n", encoding="utf-8")
+
+    monkeypatch.setattr("lazysre.cli.main.shutil.which", lambda _: "/usr/bin/git")
+
+    calls: list[list[str]] = []
+
+    def _fake_git(args: list[str]):
+        calls.append(args)
+        if args[:2] == ["rev-parse", "--is-inside-work-tree"]:
+            return subprocess.CompletedProcess(["git", *args], 0, "true\n", "")
+        if args[0] == "add":
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        if args[0] == "commit":
+            return subprocess.CompletedProcess(["git", *args], 0, "[main] ok\n", "")
+        if args[0] == "push":
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        return subprocess.CompletedProcess(["git", *args], 1, "", "unexpected")
+
+    monkeypatch.setattr("lazysre.cli.main._run_git_command", _fake_git)
+    ok = _push_report_to_git(
+        archived_path=archived,
+        remote="origin",
+        commit_message="chore(report): test",
+    )
+    assert ok is True
+    assert any(cmd and cmd[0] == "push" for cmd in calls)
+
+
+def test_push_report_to_git_no_changes(monkeypatch, tmp_path: Path) -> None:
+    archived = tmp_path / "reports" / "r.md"
+    archived.parent.mkdir(parents=True, exist_ok=True)
+    archived.write_text("ok\n", encoding="utf-8")
+
+    monkeypatch.setattr("lazysre.cli.main.shutil.which", lambda _: "/usr/bin/git")
+
+    def _fake_git(args: list[str]):
+        if args[:2] == ["rev-parse", "--is-inside-work-tree"]:
+            return subprocess.CompletedProcess(["git", *args], 0, "true\n", "")
+        if args[0] == "add":
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        if args[0] == "commit":
+            return subprocess.CompletedProcess(
+                ["git", *args],
+                1,
+                "nothing to commit, working tree clean\n",
+                "",
+            )
+        return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+    monkeypatch.setattr("lazysre.cli.main._run_git_command", _fake_git)
+    ok = _push_report_to_git(
+        archived_path=archived,
+        remote="origin",
+        commit_message="chore(report): test",
+    )
+    assert ok is False

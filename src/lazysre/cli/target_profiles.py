@@ -48,6 +48,85 @@ class ClusterProfileStore:
             return []
         return sorted(str(k) for k in profiles.keys() if str(k).strip())
 
+    def export_payload(self, *, names: list[str] | None = None) -> dict[str, Any]:
+        payload = self.load()
+        profiles = payload.get("profiles", {})
+        if not isinstance(profiles, dict):
+            profiles = {}
+
+        selected_names = [x.strip() for x in (names or []) if x.strip()]
+        selected: dict[str, Any] = {}
+        if selected_names:
+            for name in selected_names:
+                raw = profiles.get(name, {})
+                if isinstance(raw, dict):
+                    selected[name] = asdict(_env_from_dict(raw))
+        else:
+            for name, raw in profiles.items():
+                if not str(name).strip() or (not isinstance(raw, dict)):
+                    continue
+                selected[str(name)] = asdict(_env_from_dict(raw))
+
+        active = str(payload.get("active", "")).strip()
+        if active not in selected:
+            active = ""
+        return {"version": 1, "active": active, "profiles": selected}
+
+    def import_payload(self, payload: dict[str, Any], *, merge: bool) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("invalid payload")
+
+        raw_profiles = payload.get("profiles", payload)
+        if not isinstance(raw_profiles, dict):
+            raise ValueError("invalid payload: profiles must be an object")
+
+        normalized: dict[str, Any] = {}
+        for name, raw in raw_profiles.items():
+            key = str(name).strip()
+            if not key or (not isinstance(raw, dict)):
+                continue
+            normalized[key] = asdict(_env_from_dict(raw))
+        if not normalized:
+            raise ValueError("no valid profiles found in payload")
+
+        current = self.load()
+        current_profiles = current.get("profiles", {})
+        if not isinstance(current_profiles, dict):
+            current_profiles = {}
+
+        before = {
+            str(name): asdict(_env_from_dict(raw))
+            for name, raw in current_profiles.items()
+            if str(name).strip() and isinstance(raw, dict)
+        }
+        result_profiles = dict(before) if merge else {}
+        created = 0
+        updated = 0
+        for name, env in normalized.items():
+            previous = result_profiles.get(name)
+            result_profiles[name] = env
+            if previous is None:
+                created += 1
+            elif previous != env:
+                updated += 1
+
+        incoming_active = str(payload.get("active", "")).strip()
+        if merge:
+            active = str(current.get("active", "")).strip()
+            if incoming_active and incoming_active in result_profiles:
+                active = incoming_active
+        else:
+            active = incoming_active if incoming_active in result_profiles else ""
+
+        self.save({"active": active, "profiles": result_profiles})
+        return {
+            "imported": len(normalized),
+            "created": created,
+            "updated": updated,
+            "active": active,
+            "total": len(result_profiles),
+        }
+
     def get_active(self) -> str:
         payload = self.load()
         return str(payload.get("active", "")).strip()

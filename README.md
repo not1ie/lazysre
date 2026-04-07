@@ -26,7 +26,7 @@ lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
 # /help /status /status probe /doctor [/doctor fix] [/doctor strict]
-# /runbook [name] /report /fix <问题> /apply /approve [1,3-4] /memory [query]
+# /runbook [name] [k=v] /report /fix <问题> /apply /approve [1,3-4] /memory [query]
 
 # 自动修复模式（先生成修复与回滚计划）
 lsre fix "为什么支付服务响应变慢了？"
@@ -60,6 +60,7 @@ lsre doctor --strict --json
 # Runbook 工作流
 lsre runbook list
 lsre runbook show payment-latency-fix
+lsre runbook run payment-latency-fix --var service=payment --var namespace=prod --var p95_ms=450
 lsre runbook run payment-latency-fix --apply --execute
 
 # 多集群 Target Profiles
@@ -68,10 +69,13 @@ lsre target profile list
 lsre target profile current
 lsre target profile use prod
 lsre target profile show @active
+lsre target profile export --output .data/profiles-share.json
+lsre target profile import --input .data/profiles-share.json --merge --activate @active
 
 # 复盘报告导出
 lsre report --format markdown
 lsre report --format json --include-doctor
+lsre report --format markdown --push-to-git
 
 # 会话历史
 lsre history show --limit 10

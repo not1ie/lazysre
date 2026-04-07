@@ -31,7 +31,13 @@ from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.session import SessionStore
 from lazysre.cli.memory import IncidentMemoryStore, MemoryCase, format_memory_context
-from lazysre.cli.runbook import RunbookTemplate, builtin_runbooks, find_runbook
+from lazysre.cli.runbook import (
+    RunbookTemplate,
+    builtin_runbooks,
+    find_runbook,
+    parse_runbook_vars,
+    render_runbook_instruction,
+)
 from lazysre.cli.target import TargetEnvStore, probe_target_environment
 from lazysre.cli.target_profiles import ClusterProfileStore
 from lazysre.cli.tools import build_default_registry
@@ -294,6 +300,9 @@ def report(
     limit: Annotated[int, typer.Option("--limit", help="Recent session turns to include.")] = 20,
     include_doctor: Annotated[bool, typer.Option("--include-doctor", help="Include doctor snapshot in report.")] = True,
     include_memory: Annotated[bool, typer.Option("--include-memory", help="Include recent memory cases in report.")] = True,
+    push_to_git: Annotated[bool, typer.Option("--push-to-git", help="Archive report to reports/ and git-push automatically.")] = False,
+    git_remote: Annotated[str, typer.Option("--git-remote", help="Git remote used by --push-to-git.")] = "origin",
+    git_message: Annotated[str, typer.Option("--git-message", help="Custom commit message for --push-to-git.")] = "",
 ) -> None:
     options = _merged_options(
         ctx,
@@ -326,9 +335,9 @@ def report(
     chosen = fmt.strip().lower()
     if chosen not in {"markdown", "json"}:
         raise typer.BadParameter("format must be markdown or json")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     if not output.strip():
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        output = f".data/lsre-report-{stamp}.{'md' if chosen == 'markdown' else 'json'}"
+        output = _default_report_output_path(fmt=chosen, stamp=stamp, push_to_git=push_to_git)
     out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if chosen == "json":
@@ -336,6 +345,18 @@ def report(
     else:
         out_path.write_text(_render_incident_report_markdown(payload), encoding="utf-8")
     typer.echo(f"Report exported: {out_path}")
+    if push_to_git:
+        archived_path = _archive_report_for_git(out_path, stamp=stamp)
+        commit_message = git_message.strip() or f"chore(report): archive incident report {stamp}"
+        pushed = _push_report_to_git(
+            archived_path=archived_path,
+            remote=git_remote.strip() or "origin",
+            commit_message=commit_message,
+        )
+        if pushed:
+            typer.echo(f"Report archived & pushed: {archived_path}")
+        else:
+            typer.echo(f"Report archived (no changes to push): {archived_path}")
 
 
 @app.command("approve")
@@ -1110,6 +1131,67 @@ def target_profile_remove(
     typer.echo(f"Removed profile: {name}")
 
 
+@target_profile_app.command("export")
+def target_profile_export(
+    output: Annotated[str, typer.Option("--output", help="Export file path (.json).")] = "",
+    name: Annotated[list[str], typer.Option("--name", help="Profile name filter. Can be repeated.")] = [],
+    profiles_file: Annotated[str, typer.Option("--profiles-file", help="Profiles store JSON path.")] = settings.target_profiles_file,
+) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out_path = Path(output.strip() or f".data/lsre-target-profiles-export-{stamp}.json")
+    store = ClusterProfileStore(Path(profiles_file))
+    payload = store.export_payload(names=list(name))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    count = len(payload.get("profiles", {})) if isinstance(payload.get("profiles", {}), dict) else 0
+    typer.echo(f"Exported {count} profiles -> {out_path}")
+
+
+@target_profile_app.command("import")
+def target_profile_import(
+    input_file: Annotated[str, typer.Option("--input", help="Import file path (.json).")],
+    merge: Annotated[bool, typer.Option("--merge/--replace", help="Merge into existing profiles or replace all.")] = True,
+    activate: Annotated[str, typer.Option("--activate", help="Activate profile after import. Use @active for imported active profile.")] = "",
+    profiles_file: Annotated[str, typer.Option("--profiles-file", help="Profiles store JSON path.")] = settings.target_profiles_file,
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Current target profile JSON path.")] = settings.target_profile_file,
+) -> None:
+    in_path = Path(input_file)
+    if not in_path.exists():
+        raise typer.BadParameter(f"import file not found: {input_file}")
+    try:
+        raw = json.loads(in_path.read_text(encoding="utf-8"))
+    except Exception:
+        raise typer.BadParameter(f"import file is not valid json: {input_file}") from None
+    if not isinstance(raw, dict):
+        raise typer.BadParameter("import payload must be a JSON object")
+
+    store = ClusterProfileStore(Path(profiles_file))
+    try:
+        result = store.import_payload(raw, merge=merge)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    activated = ""
+    activate_value = activate.strip()
+    if activate_value:
+        activated = str(result.get("active", "")).strip() if activate_value == "@active" else activate_value
+        if not activated:
+            raise typer.BadParameter("import payload has no active profile to activate")
+        ok = store.activate(activated, target_profile_file=Path(profile_file))
+        if not ok:
+            raise typer.BadParameter(f"profile not found after import: {activated}")
+
+    typer.echo(
+        "Imported profiles: "
+        f"imported={result.get('imported', 0)} "
+        f"created={result.get('created', 0)} "
+        f"updated={result.get('updated', 0)} "
+        f"total={result.get('total', 0)}"
+    )
+    if activated:
+        typer.echo(f"Activated profile: {activated}")
+
+
 @history_app.command("show")
 def history_show(
     ctx: typer.Context,
@@ -1247,6 +1329,7 @@ def runbook_show(name: Annotated[str, typer.Argument(help="Runbook name.")]) -> 
         "mode": item.mode,
         "description": item.description,
         "instruction": item.instruction,
+        "variables": item.variables,
     }
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
@@ -1256,6 +1339,7 @@ def runbook_run(
     ctx: typer.Context,
     name: Annotated[str, typer.Argument(help="Runbook name.")],
     apply: Annotated[bool, typer.Option("--apply", help="Apply generated fix steps (fix runbooks only).")] = False,
+    var: Annotated[list[str], typer.Option("--var", "-v", help="Runbook variables in key=value format. Can be repeated.")] = [],
     extra: Annotated[str, typer.Option("--extra", help="Extra context appended to runbook instruction.")] = "",
     execute: Annotated[bool | None, typer.Option("--execute", help="Override execution mode.")] = None,
     approve: Annotated[bool | None, typer.Option("--approve", help="Override approval flag.")] = None,
@@ -1292,9 +1376,18 @@ def runbook_run(
         provider=provider,
         max_steps=max_steps,
     )
-    instruction = template.instruction
+    try:
+        vars_payload = parse_runbook_vars(var)
+        instruction, resolved_vars = render_runbook_instruction(template, overrides=vars_payload)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if extra.strip():
         instruction = f"{instruction}\n\n[runbook-extra]\n{extra.strip()}"
+    if resolved_vars:
+        instruction = (
+            f"{instruction}\n\n[runbook-vars]\n"
+            + ", ".join(f"{k}={v}" for k, v in sorted(resolved_vars.items()))
+        )
     _execute_runbook(
         template=template,
         instruction=instruction,
@@ -1700,6 +1793,65 @@ def _render_incident_report_markdown(payload: dict[str, object]) -> str:
             lines.append(f"  root_cause={item.get('root_cause', '-')}")
     lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+
+def _default_report_output_path(*, fmt: str, stamp: str, push_to_git: bool) -> str:
+    suffix = "md" if fmt == "markdown" else "json"
+    if push_to_git:
+        return f"reports/lsre-report-{stamp}.{suffix}"
+    return f".data/lsre-report-{stamp}.{suffix}"
+
+
+def _archive_report_for_git(path: Path, *, stamp: str) -> Path:
+    if path.parts and path.parts[0] == "reports":
+        return path
+    archive_dir = Path("reports")
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived = archive_dir / f"lsre-report-{stamp}{path.suffix or '.md'}"
+    if path.resolve() == archived.resolve():
+        return archived
+    content = path.read_text(encoding="utf-8")
+    archived.write_text(content, encoding="utf-8")
+    return archived
+
+
+def _run_git_command(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _push_report_to_git(*, archived_path: Path, remote: str, commit_message: str) -> bool:
+    if not shutil.which("git"):
+        raise typer.BadParameter("git is not installed; cannot use --push-to-git")
+    if not archived_path.exists():
+        raise typer.BadParameter(f"report archive file not found: {archived_path}")
+
+    repo_check = _run_git_command(["rev-parse", "--is-inside-work-tree"])
+    if repo_check.returncode != 0:
+        raise typer.BadParameter("current directory is not a git repository")
+
+    add_result = _run_git_command(["add", "--", str(archived_path)])
+    if add_result.returncode != 0:
+        stderr = (add_result.stderr or add_result.stdout or "").strip()
+        raise typer.BadParameter(f"git add failed: {stderr or 'unknown error'}")
+
+    commit_result = _run_git_command(["commit", "-m", commit_message])
+    if commit_result.returncode != 0:
+        output = ((commit_result.stdout or "") + "\n" + (commit_result.stderr or "")).lower()
+        if ("nothing to commit" in output) or ("no changes added to commit" in output):
+            return False
+        stderr = (commit_result.stderr or commit_result.stdout or "").strip()
+        raise typer.BadParameter(f"git commit failed: {stderr or 'unknown error'}")
+
+    push_result = _run_git_command(["push", remote, "HEAD"])
+    if push_result.returncode != 0:
+        stderr = (push_result.stderr or push_result.stdout or "").strip()
+        raise typer.BadParameter(f"git push failed: {stderr or 'unknown error'}")
+    return True
 
 
 def _collect_runtime_status(
@@ -2390,7 +2542,7 @@ def _render_chat_short_help() -> None:
         "- /doctor fix: 执行安全自动修复后再预检",
         "- /doctor strict: 严格模式（warn 也视为不健康）",
         "- /runbook list: 查看 runbook 模板",
-        "- /runbook <name>: 执行 runbook",
+        "- /runbook <name> [k=v]: 执行 runbook（支持变量覆盖）",
         "- /report: 导出复盘报告",
         "- /fix <问题>: 进入修复计划模式",
         "- /apply: 执行最近一次修复计划",
@@ -2412,7 +2564,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
     typer.echo(
         "快捷命令：/help /status [/status probe] /doctor [/doctor fix] "
-        "/runbook [name] /report /fix <问题> /apply /approve [steps] /memory [query]"
+        "/runbook [name] [k=v] /report /fix <问题> /apply /approve [steps] /memory [query]"
     )
     while True:
         try:
@@ -2481,13 +2633,30 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             if (not tail) or (tail.lower() in {"list", "ls"}):
                 runbook_list()
                 continue
-            template = find_runbook(tail)
+            parts = [p for p in tail.split(" ") if p.strip()]
+            runbook_name = parts[0] if parts else ""
+            runbook_var_items = [item for item in parts[1:] if "=" in item]
+            runbook_extra = " ".join(item for item in parts[1:] if "=" not in item).strip()
+            template = find_runbook(runbook_name)
             if not template:
                 typer.echo(f"runbook not found: {tail}")
                 continue
+            try:
+                overrides = parse_runbook_vars(runbook_var_items)
+                instruction, resolved_vars = render_runbook_instruction(template, overrides=overrides)
+            except ValueError as exc:
+                typer.echo(str(exc))
+                continue
+            if runbook_extra:
+                instruction = f"{instruction}\n\n[runbook-extra]\n{runbook_extra}"
+            if resolved_vars:
+                instruction = (
+                    f"{instruction}\n\n[runbook-vars]\n"
+                    + ", ".join(f"{k}={v}" for k, v in sorted(resolved_vars.items()))
+                )
             _execute_runbook(
                 template=template,
-                instruction=template.instruction,
+                instruction=instruction,
                 apply=False,
                 options=options,
             )
