@@ -31,7 +31,9 @@ from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.session import SessionStore
 from lazysre.cli.memory import IncidentMemoryStore, MemoryCase, format_memory_context
+from lazysre.cli.runbook import RunbookTemplate, builtin_runbooks, find_runbook
 from lazysre.cli.target import TargetEnvStore, probe_target_environment
+from lazysre.cli.target_profiles import ClusterProfileStore
 from lazysre.cli.tools import build_default_registry
 from lazysre.cli.tools.marketplace import (
     LockedPack,
@@ -64,8 +66,10 @@ app = typer.Typer(
 )
 pack_app = typer.Typer(help="Tool pack marketplace and lock management.")
 target_app = typer.Typer(help="Target environment profile management.")
+target_profile_app = typer.Typer(help="Multi-cluster target profile management.")
 history_app = typer.Typer(help="Session history management.")
 memory_app = typer.Typer(help="Long-term incident memory management.")
+runbook_app = typer.Typer(help="Workflow runbook templates.")
 
 
 @app.callback(invoke_without_command=True)
@@ -280,6 +284,58 @@ def doctor(
         _render_doctor_report(report)
     if strict and (not strict_healthy):
         raise typer.Exit(code=2)
+
+
+@app.command("report")
+def report(
+    ctx: typer.Context,
+    output: Annotated[str, typer.Option("--output", help="Output report file path.")] = "",
+    fmt: Annotated[str, typer.Option("--format", help="Report format: markdown|json")] = "markdown",
+    limit: Annotated[int, typer.Option("--limit", help="Recent session turns to include.")] = 20,
+    include_doctor: Annotated[bool, typer.Option("--include-doctor", help="Include doctor snapshot in report.")] = True,
+    include_memory: Annotated[bool, typer.Option("--include-memory", help="Include recent memory cases in report.")] = True,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
+    payload = _build_incident_report_payload(
+        session_file=Path(str(options["session_file"])),
+        target_profile_file=Path(settings.target_profile_file),
+        include_doctor=include_doctor,
+        include_memory=include_memory,
+        memory_limit=5,
+        turn_limit=limit,
+        audit_log=Path(str(options["audit_log"])),
+    )
+    chosen = fmt.strip().lower()
+    if chosen not in {"markdown", "json"}:
+        raise typer.BadParameter("format must be markdown or json")
+    if not output.strip():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        output = f".data/lsre-report-{stamp}.{'md' if chosen == 'markdown' else 'json'}"
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if chosen == "json":
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        out_path.write_text(_render_incident_report_markdown(payload), encoding="utf-8")
+    typer.echo(f"Report exported: {out_path}")
 
 
 @app.command("approve")
@@ -965,6 +1021,95 @@ def target_probe(
     _render_probe_report(report)
 
 
+@target_profile_app.command("list")
+def target_profile_list(
+    profiles_file: Annotated[str, typer.Option("--profiles-file", help="Profiles store JSON path.")] = settings.target_profiles_file,
+) -> None:
+    store = ClusterProfileStore(Path(profiles_file))
+    active = store.get_active()
+    names = store.list_profiles()
+    if not (_console and Table):
+        typer.echo(json.dumps({"active": active, "profiles": names}, ensure_ascii=False, indent=2))
+        return
+    table = Table(title="Target Profiles")
+    table.add_column("Name", style="cyan")
+    table.add_column("Active", style="green", no_wrap=True)
+    for name in names:
+        table.add_row(name, "yes" if name == active else "")
+    _console.print(table)
+
+
+@target_profile_app.command("current")
+def target_profile_current(
+    profiles_file: Annotated[str, typer.Option("--profiles-file", help="Profiles store JSON path.")] = settings.target_profiles_file,
+) -> None:
+    store = ClusterProfileStore(Path(profiles_file))
+    active = store.get_active()
+    payload = {"active": active or "", "profiles_file": str(profiles_file)}
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@target_profile_app.command("save")
+def target_profile_save(
+    name: Annotated[str, typer.Argument(help="Profile name.")],
+    profiles_file: Annotated[str, typer.Option("--profiles-file", help="Profiles store JSON path.")] = settings.target_profiles_file,
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Current target profile JSON path.")] = settings.target_profile_file,
+    activate: Annotated[bool, typer.Option("--activate/--no-activate", help="Set saved profile as active.")] = True,
+) -> None:
+    env = TargetEnvStore(Path(profile_file)).load()
+    store = ClusterProfileStore(Path(profiles_file))
+    store.upsert_profile(name, env, activate=activate)
+    typer.echo(f"Saved profile: {name} (activate={activate})")
+
+
+@target_profile_app.command("use")
+def target_profile_use(
+    name: Annotated[str, typer.Argument(help="Profile name to activate.")],
+    profiles_file: Annotated[str, typer.Option("--profiles-file", help="Profiles store JSON path.")] = settings.target_profiles_file,
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Current target profile JSON path.")] = settings.target_profile_file,
+) -> None:
+    store = ClusterProfileStore(Path(profiles_file))
+    ok = store.activate(name, target_profile_file=Path(profile_file))
+    if not ok:
+        raise typer.BadParameter(f"profile not found: {name}")
+    typer.echo(f"Activated profile: {name}")
+
+
+@target_profile_app.command("show")
+def target_profile_show(
+    name: Annotated[str, typer.Argument(help="Profile name. Use @active for active profile.")],
+    profiles_file: Annotated[str, typer.Option("--profiles-file", help="Profiles store JSON path.")] = settings.target_profiles_file,
+) -> None:
+    store = ClusterProfileStore(Path(profiles_file))
+    key = name
+    if name.strip() == "@active":
+        key = store.get_active()
+    env = store.get_profile(key)
+    if not env:
+        raise typer.BadParameter(f"profile not found: {name}")
+    payload = env.to_safe_dict()
+    payload["name"] = key
+    payload["active"] = (key == store.get_active())
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@target_profile_app.command("remove")
+def target_profile_remove(
+    name: Annotated[str, typer.Argument(help="Profile name.")],
+    profiles_file: Annotated[str, typer.Option("--profiles-file", help="Profiles store JSON path.")] = settings.target_profiles_file,
+    yes: Annotated[bool, typer.Option("--yes", help="Skip confirmation prompt.")] = False,
+) -> None:
+    if not yes:
+        if not typer.confirm(f"确认删除 profile {name} 吗？", default=False):
+            typer.echo("Canceled.")
+            return
+    store = ClusterProfileStore(Path(profiles_file))
+    removed = store.remove_profile(name)
+    if not removed:
+        raise typer.BadParameter(f"profile not found: {name}")
+    typer.echo(f"Removed profile: {name}")
+
+
 @history_app.command("show")
 def history_show(
     ctx: typer.Context,
@@ -1074,9 +1219,95 @@ def memory_search(
     _render_memory_cases(rows, title=f"Incident Memory Search: {query}")
 
 
+@runbook_app.command("list")
+def runbook_list() -> None:
+    items = builtin_runbooks()
+    if not (_console and Table):
+        for item in items:
+            typer.echo(f"{item.name} [{item.mode}] {item.title}")
+        return
+    table = Table(title="Runbooks")
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Mode", style="magenta", no_wrap=True)
+    table.add_column("Title", style="white")
+    table.add_column("Description", style="green")
+    for item in items:
+        table.add_row(item.name, item.mode, item.title, item.description)
+    _console.print(table)
+
+
+@runbook_app.command("show")
+def runbook_show(name: Annotated[str, typer.Argument(help="Runbook name.")]) -> None:
+    item = find_runbook(name)
+    if not item:
+        raise typer.BadParameter(f"runbook not found: {name}")
+    payload = {
+        "name": item.name,
+        "title": item.title,
+        "mode": item.mode,
+        "description": item.description,
+        "instruction": item.instruction,
+    }
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@runbook_app.command("run")
+def runbook_run(
+    ctx: typer.Context,
+    name: Annotated[str, typer.Argument(help="Runbook name.")],
+    apply: Annotated[bool, typer.Option("--apply", help="Apply generated fix steps (fix runbooks only).")] = False,
+    extra: Annotated[str, typer.Option("--extra", help="Extra context appended to runbook instruction.")] = "",
+    execute: Annotated[bool | None, typer.Option("--execute", help="Override execution mode.")] = None,
+    approve: Annotated[bool | None, typer.Option("--approve", help="Override approval flag.")] = None,
+    interactive_approval: Annotated[bool | None, typer.Option("--interactive-approval/--no-interactive-approval", help="Override interactive approval prompt.")] = None,
+    stream_output: Annotated[bool | None, typer.Option("--stream-output/--no-stream-output", help="Override stream output mode.")] = None,
+    verbose_reasoning: Annotated[bool | None, typer.Option("--verbose-reasoning/--no-verbose-reasoning", help="Override reasoning verbosity.")] = None,
+    approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
+    audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
+    lock_file: Annotated[str | None, typer.Option(help="Override tool pack lock file path.")] = None,
+    session_file: Annotated[str | None, typer.Option(help="Override session file path.")] = None,
+    model: Annotated[str | None, typer.Option(help="Override model.")] = None,
+    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+    max_steps: Annotated[int | None, typer.Option(help="Override max function-calling iterations.")] = None,
+) -> None:
+    template = find_runbook(name)
+    if not template:
+        raise typer.BadParameter(f"runbook not found: {name}")
+    options = _merged_options(
+        ctx,
+        execute=execute,
+        approve=approve,
+        interactive_approval=interactive_approval,
+        stream_output=stream_output,
+        verbose_reasoning=verbose_reasoning,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        lock_file=lock_file,
+        session_file=session_file,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=model,
+        provider=provider,
+        max_steps=max_steps,
+    )
+    instruction = template.instruction
+    if extra.strip():
+        instruction = f"{instruction}\n\n[runbook-extra]\n{extra.strip()}"
+    _execute_runbook(
+        template=template,
+        instruction=instruction,
+        apply=apply,
+        options=options,
+    )
+
+
 def _build_system_prompt(*, conversation_context: str = "", memory_context: str = "") -> str:
     env = TargetEnvStore().load()
+    active_profile = ClusterProfileStore.default().get_active() or "(none)"
     target_summary = (
+        f"target_profile={active_profile}\n"
         f"prometheus_url={env.prometheus_url or '(unset)'}\n"
         f"k8s_api_url={env.k8s_api_url or '(unset)'}\n"
         f"k8s_context={env.k8s_context or '(unset)'}\n"
@@ -1177,9 +1408,11 @@ def _resolve_lock_file(ctx: typer.Context, lock_file: str | None) -> Path:
 
 
 app.add_typer(pack_app, name="pack")
+target_app.add_typer(target_profile_app, name="profile")
 app.add_typer(target_app, name="target")
 app.add_typer(history_app, name="history")
 app.add_typer(memory_app, name="memory")
+app.add_typer(runbook_app, name="runbook")
 
 
 def _render_timeline(events) -> None:
@@ -1259,6 +1492,216 @@ def _render_memory_cases(cases: list[MemoryCase], *, title: str) -> None:
     _console.print(table)
 
 
+def _execute_runbook(
+    *,
+    template: RunbookTemplate,
+    instruction: str,
+    apply: bool,
+    options: dict[str, object],
+) -> None:
+    typer.echo(f"Running runbook: {template.name} ({template.mode}) - {template.title}")
+    if template.mode == "fix":
+        _run_fix(
+            instruction=instruction,
+            apply=apply,
+            max_apply_steps=6,
+            allow_high_risk=False,
+            auto_approve_low_risk=False,
+            export_plan_md="",
+            export_plan_json="",
+            execute=bool(options["execute"]),
+            approve=bool(options["approve"]),
+            interactive_approval=bool(options["interactive_approval"]),
+            stream_output=bool(options["stream_output"]),
+            verbose_reasoning=bool(options["verbose_reasoning"]),
+            approval_mode=str(options["approval_mode"]),
+            audit_log=str(options["audit_log"]),
+            lock_file=str(options["lock_file"]),
+            session_file=str(options["session_file"]),
+            deny_tool=list(options["deny_tool"]),
+            deny_prefix=list(options["deny_prefix"]),
+            tool_pack=list(options["tool_pack"]),
+            remote_gateway=list(options["remote_gateway"]),
+            model=str(options["model"]),
+            provider=str(options["provider"]),
+            max_steps=int(options["max_steps"]),
+        )
+        return
+    _run_once(
+        instruction=instruction,
+        execute=bool(options["execute"]),
+        approve=bool(options["approve"]),
+        interactive_approval=bool(options["interactive_approval"]),
+        stream_output=bool(options["stream_output"]),
+        verbose_reasoning=bool(options["verbose_reasoning"]),
+        approval_mode=str(options["approval_mode"]),
+        audit_log=str(options["audit_log"]),
+        lock_file=str(options["lock_file"]),
+        session_file=str(options["session_file"]),
+        deny_tool=list(options["deny_tool"]),
+        deny_prefix=list(options["deny_prefix"]),
+        tool_pack=list(options["tool_pack"]),
+        remote_gateway=list(options["remote_gateway"]),
+        model=str(options["model"]),
+        provider=str(options["provider"]),
+        max_steps=int(options["max_steps"]),
+    )
+
+
+def _build_incident_report_payload(
+    *,
+    session_file: Path,
+    target_profile_file: Path,
+    include_doctor: bool,
+    include_memory: bool,
+    memory_limit: int,
+    turn_limit: int,
+    audit_log: Path,
+) -> dict[str, object]:
+    session = SessionStore(session_file)
+    turns = session.recent_turns(limit=turn_limit)
+    target = TargetEnvStore(target_profile_file).load()
+    active_profile = ClusterProfileStore.default().get_active()
+
+    last_fix_payload: dict[str, object] = {}
+    fix_path = Path(".data/lsre-fix-last.json")
+    if fix_path.exists():
+        try:
+            raw = json.loads(fix_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                last_fix_payload = raw
+        except Exception:
+            last_fix_payload = {}
+
+    doctor_payload: dict[str, object] | None = None
+    if include_doctor:
+        doctor_payload = _collect_doctor_report(
+            target=target,
+            timeout_sec=4,
+            dry_run_probe=True,
+            audit_log=audit_log,
+        )
+        doctor_summary = doctor_payload.get("summary", {})
+        if isinstance(doctor_summary, dict):
+            doctor_summary["strict_mode"] = False
+            doctor_summary["strict_healthy"] = _doctor_is_healthy(doctor_summary, strict=False)
+        doctor_payload["gate"] = _build_doctor_gate(doctor_payload, strict=False)
+
+    memory_rows: list[dict[str, object]] = []
+    if include_memory:
+        store = _open_incident_memory_store()
+        if store:
+            for item in store.list_recent(limit=memory_limit):
+                memory_rows.append(
+                    {
+                        "id": item.id,
+                        "created_at": item.created_at,
+                        "score": item.score,
+                        "symptom": item.symptom,
+                        "root_cause": item.root_cause,
+                        "fix_commands": item.fix_commands,
+                    }
+                )
+
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "active_target_profile": active_profile,
+        "target": target.to_safe_dict(),
+        "session": {
+            "session_file": str(session_file),
+            "turns": turns,
+            "turn_count": len(turns),
+        },
+        "last_fix_plan": last_fix_payload,
+        "doctor": doctor_payload,
+        "memory_recent": memory_rows,
+    }
+
+
+def _render_incident_report_markdown(payload: dict[str, object]) -> str:
+    lines = ["# LazySRE Incident Report", ""]
+    lines.append(f"- Generated(UTC): {payload.get('generated_at_utc', '-')}")
+    lines.append(f"- Active Target Profile: {payload.get('active_target_profile', '-') or '(none)'}")
+    lines.append("")
+
+    target = payload.get("target", {})
+    if isinstance(target, dict):
+        lines.append("## Target Environment")
+        lines.append("")
+        lines.append(f"- Prometheus: {target.get('prometheus_url', '(unset)')}")
+        lines.append(f"- K8s API: {target.get('k8s_api_url', '(unset)')}")
+        lines.append(f"- K8s Context: {target.get('k8s_context', '(unset)')}")
+        lines.append(f"- K8s Namespace: {target.get('k8s_namespace', '(unset)')}")
+        lines.append("")
+
+    last_fix = payload.get("last_fix_plan", {})
+    if isinstance(last_fix, dict) and last_fix:
+        lines.append("## Last Fix Plan")
+        lines.append("")
+        lines.append(f"- Instruction: {last_fix.get('instruction', '-')}")
+        lines.append(f"- Generated At: {last_fix.get('generated_at', '-')}")
+        plan_obj = last_fix.get("plan", {})
+        if isinstance(plan_obj, dict):
+            apply_cmds = plan_obj.get("apply_commands", [])
+            rollback_cmds = plan_obj.get("rollback_commands", [])
+            lines.append(f"- Apply Commands: {len(apply_cmds) if isinstance(apply_cmds, list) else 0}")
+            lines.append(f"- Rollback Commands: {len(rollback_cmds) if isinstance(rollback_cmds, list) else 0}")
+        lines.append("")
+
+    doctor = payload.get("doctor", {})
+    if isinstance(doctor, dict) and doctor:
+        summary = doctor.get("summary", {})
+        gate = doctor.get("gate", {})
+        lines.append("## Doctor Snapshot")
+        lines.append("")
+        if isinstance(summary, dict):
+            lines.append(
+                f"- Summary: pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} error={summary.get('error', 0)}"
+            )
+        if isinstance(gate, dict):
+            lines.append(
+                f"- Gate: healthy={gate.get('healthy', False)} blocking={gate.get('blocking_count', 0)} exit_code_advice={gate.get('exit_code_advice', 0)}"
+            )
+        lines.append("")
+
+    turns_block = payload.get("session", {})
+    turns = []
+    if isinstance(turns_block, dict):
+        raw_turns = turns_block.get("turns", [])
+        if isinstance(raw_turns, list):
+            turns = raw_turns
+    lines.append("## Recent Session Turns")
+    lines.append("")
+    if not turns:
+        lines.append("(empty)")
+        lines.append("")
+    else:
+        for idx, item in enumerate(turns, 1):
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"### Turn {idx}")
+            lines.append("")
+            lines.append(f"User: {str(item.get('user', ''))}")
+            lines.append("")
+            lines.append(f"Assistant: {str(item.get('assistant', ''))[:500]}")
+            lines.append("")
+
+    memory_recent = payload.get("memory_recent", [])
+    lines.append("## Memory Cases")
+    lines.append("")
+    if not isinstance(memory_recent, list) or (not memory_recent):
+        lines.append("(empty)")
+        lines.append("")
+    else:
+        for item in memory_recent:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"- #{item.get('id', '-')}: {item.get('symptom', '-')}")
+            lines.append(f"  root_cause={item.get('root_cause', '-')}")
+    lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
 def _collect_runtime_status(
     *,
     session_file: Path,
@@ -1280,9 +1723,11 @@ def _collect_runtime_status(
     target_store = TargetEnvStore(profile_file)
     target = target_store.load()
     memory_db = _resolve_memory_db_path()
+    active_profile = ClusterProfileStore.default().get_active()
 
     snapshot: dict[str, object] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "active_target_profile": active_profile,
         "target_profile_file": str(profile_file),
         "session_file": str(session_file),
         "target": target.to_safe_dict(),
@@ -1394,6 +1839,7 @@ def _render_status_snapshot(snapshot: dict[str, object]) -> None:
     target_payload = target if isinstance(target, dict) else {}
 
     table.add_row("Generated", str(snapshot.get("generated_at_utc", "-")))
+    table.add_row("Active Target Profile", str(snapshot.get("active_target_profile", "-") or "(none)"))
     table.add_row("Session Turns", session_turns)
     table.add_row("Last User Input", session_last or "-")
     table.add_row("Prometheus", str(target_payload.get("prometheus_url", "-") or "-"))
@@ -1943,6 +2389,9 @@ def _render_chat_short_help() -> None:
         "- /doctor: 运行环境预检（依赖/配置/连通性）",
         "- /doctor fix: 执行安全自动修复后再预检",
         "- /doctor strict: 严格模式（warn 也视为不健康）",
+        "- /runbook list: 查看 runbook 模板",
+        "- /runbook <name>: 执行 runbook",
+        "- /report: 导出复盘报告",
         "- /fix <问题>: 进入修复计划模式",
         "- /apply: 执行最近一次修复计划",
         "- /approve: 查看审批队列",
@@ -1961,7 +2410,10 @@ def _render_chat_short_help() -> None:
 def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("LazySRE 自然语言助手已启动。直接输入问题即可，输入 exit/quit 退出。")
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
-    typer.echo("快捷命令：/help /status [/status probe] /doctor [/doctor fix] /fix <问题> /apply /approve [steps] /memory [query]")
+    typer.echo(
+        "快捷命令：/help /status [/status probe] /doctor [/doctor fix] "
+        "/runbook [name] /report /fix <问题> /apply /approve [steps] /memory [query]"
+    )
     while True:
         try:
             line = typer.prompt("lsre")
@@ -2023,6 +2475,38 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 _render_doctor_report(report)
             else:
                 typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/runbook"):
+            tail = text[len("/runbook") :].strip()
+            if (not tail) or (tail.lower() in {"list", "ls"}):
+                runbook_list()
+                continue
+            template = find_runbook(tail)
+            if not template:
+                typer.echo(f"runbook not found: {tail}")
+                continue
+            _execute_runbook(
+                template=template,
+                instruction=template.instruction,
+                apply=False,
+                options=options,
+            )
+            continue
+        if text.lower().startswith("/report"):
+            payload = _build_incident_report_payload(
+                session_file=Path(str(options["session_file"])),
+                target_profile_file=Path(settings.target_profile_file),
+                include_doctor=True,
+                include_memory=True,
+                memory_limit=5,
+                turn_limit=20,
+                audit_log=Path(str(options["audit_log"])),
+            )
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            out_path = Path(f".data/lsre-report-{stamp}.md")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(_render_incident_report_markdown(payload), encoding="utf-8")
+            typer.echo(f"Report exported: {out_path}")
             continue
         if text.lower().startswith("/fix "):
             fix_text = text[5:].strip()
@@ -2601,7 +3085,7 @@ def main() -> None:
 def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     if len(argv) <= 1:
         return
-    commands = {"run", "chat", "fix", "approve", "status", "doctor", "pack", "target", "history", "memory", "--help", "-h"}
+    commands = {"run", "chat", "fix", "approve", "status", "doctor", "report", "runbook", "pack", "target", "history", "memory", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",
@@ -2634,7 +3118,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
 def _should_launch_assistant(tokens: list[str]) -> bool:
     if not tokens:
         return True
-    commands = {"run", "chat", "fix", "approve", "status", "doctor", "pack", "target", "history", "memory", "--help", "-h"}
+    commands = {"run", "chat", "fix", "approve", "status", "doctor", "report", "runbook", "pack", "target", "history", "memory", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",

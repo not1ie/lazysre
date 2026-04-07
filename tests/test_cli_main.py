@@ -4,6 +4,7 @@ from pathlib import Path
 from lazysre.cli.main import (
     _backup_target_profile,
     _build_doctor_gate,
+    _build_incident_report_payload,
     _compute_doctor_autofix,
     _collect_runtime_status,
     _doctor_is_healthy,
@@ -13,6 +14,7 @@ from lazysre.cli.main import (
     _looks_like_fix_request,
     _parse_step_selection,
     _read_last_fix_plan_summary,
+    _render_incident_report_markdown,
     _rewrite_argv_for_default_run,
     _summarize_doctor_checks,
     _should_launch_assistant,
@@ -86,6 +88,15 @@ def test_rewrite_argv_preserves_doctor_subcommand() -> None:
     assert argv == ["lsre", "doctor", "--json"]
 
 
+def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
+    argv1 = ["lsre", "report", "--format", "json"]
+    _rewrite_argv_for_default_run(argv1)
+    assert argv1 == ["lsre", "report", "--format", "json"]
+    argv2 = ["lsre", "runbook", "list"]
+    _rewrite_argv_for_default_run(argv2)
+    assert argv2 == ["lsre", "runbook", "list"]
+
+
 def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_fix_request("请帮我修复支付服务")
     assert _looks_like_fix_request("fix payment service latency")
@@ -101,6 +112,8 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["chat"]) is False
     assert _should_launch_assistant(["status"]) is False
     assert _should_launch_assistant(["doctor"]) is False
+    assert _should_launch_assistant(["report"]) is False
+    assert _should_launch_assistant(["runbook"]) is False
     assert _should_launch_assistant(["approve"]) is False
     assert _should_launch_assistant(["memory"]) is False
     assert _should_launch_assistant(["检查k8s"]) is False
@@ -256,3 +269,46 @@ def test_build_doctor_gate_strict_and_non_strict() -> None:
     gate_strict = _build_doctor_gate(report, strict=True)
     assert gate_strict["blocking_count"] == 2
     assert gate_strict["exit_code_advice"] == 2
+
+
+def test_build_report_payload_and_markdown(tmp_path: Path) -> None:
+    session_file = tmp_path / "session.json"
+    session_file.write_text(
+        json.dumps(
+            {
+                "turns": [
+                    {"user": "排查支付延迟", "assistant": "先看 metrics"},
+                    {"user": "执行修复", "assistant": "建议 rollout restart"},
+                ],
+                "entities": {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    profile_file = tmp_path / "target.json"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "prometheus_url": "http://127.0.0.1:9090",
+                "k8s_api_url": "https://127.0.0.1:6443",
+                "k8s_context": "dev",
+                "k8s_namespace": "default",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    payload = _build_incident_report_payload(
+        session_file=session_file,
+        target_profile_file=profile_file,
+        include_doctor=False,
+        include_memory=False,
+        memory_limit=3,
+        turn_limit=5,
+        audit_log=tmp_path / "audit.jsonl",
+    )
+    assert payload["session"]
+    md = _render_incident_report_markdown(payload)
+    assert "LazySRE Incident Report" in md
+    assert "Recent Session Turns" in md

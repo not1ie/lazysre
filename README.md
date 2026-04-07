@@ -11,6 +11,8 @@ LazySRE 是一个纯 AI 驱动的 SRE/运维 CLI 工具。
 - 观察者工具集：内置 K8s / Logs / Metrics 观测能力
 - 安全执行器：支持 Dry-run、风险分级、审批确认、审计日志
 - ReAct 风格修复：支持自动生成修复计划与回滚命令
+- Runbook 工作流：内置模板化诊断/修复，一键执行标准排障流程
+- 多集群 Profile：支持保存/切换多套目标环境配置
 - 长期记忆 RAG：成功修复案例会写入 `~/.lazysre/history_db`，后续诊断优先检索相似历史
 - 会话记忆：支持上下文延续（如“重启它”）
 - 终端体验：支持流式输出与执行时间线
@@ -23,7 +25,8 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /status /status probe /doctor [/doctor fix] [/doctor strict] /fix <问题> /apply /approve [1,3-4] /memory [query]
+# /help /status /status probe /doctor [/doctor fix] [/doctor strict]
+# /runbook [name] /report /fix <问题> /apply /approve [1,3-4] /memory [query]
 
 # 自动修复模式（先生成修复与回滚计划）
 lsre fix "为什么支付服务响应变慢了？"
@@ -53,6 +56,22 @@ lsre doctor --auto-fix --write-backup
 lsre doctor --strict
 # CI 可读取 gate 字段：blocking_checks / exit_code_advice
 lsre doctor --strict --json
+
+# Runbook 工作流
+lsre runbook list
+lsre runbook show payment-latency-fix
+lsre runbook run payment-latency-fix --apply --execute
+
+# 多集群 Target Profiles
+lsre target profile save prod --activate
+lsre target profile list
+lsre target profile current
+lsre target profile use prod
+lsre target profile show @active
+
+# 复盘报告导出
+lsre report --format markdown
+lsre report --format json --include-doctor
 
 # 会话历史
 lsre history show --limit 10
