@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,8 @@ from lazysre.cli.main import (
     _parse_chat_runbook_command,
     _parse_chat_runbook_var_extra,
     _parse_chat_report_command,
+    _collect_install_doctor_report,
+    _safe_run_command,
     _should_launch_assistant,
 )
 from lazysre.cli.runbook import find_runbook
@@ -109,6 +112,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv2 = ["lsre", "runbook", "list"]
     _rewrite_argv_for_default_run(argv2)
     assert argv2 == ["lsre", "runbook", "list"]
+    argv3 = ["lsre", "install-doctor", "--json"]
+    _rewrite_argv_for_default_run(argv3)
+    assert argv3 == ["lsre", "install-doctor", "--json"]
 
 
 def test_detect_fix_and_apply_intent() -> None:
@@ -126,6 +132,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["chat"]) is False
     assert _should_launch_assistant(["status"]) is False
     assert _should_launch_assistant(["doctor"]) is False
+    assert _should_launch_assistant(["install-doctor"]) is False
     assert _should_launch_assistant(["report"]) is False
     assert _should_launch_assistant(["runbook"]) is False
     assert _should_launch_assistant(["approve"]) is False
@@ -566,3 +573,24 @@ def test_parse_chat_report_command_errors() -> None:
         _parse_chat_report_command("--limit abc")
     with pytest.raises(ValueError):
         _parse_chat_report_command("--unknown")
+
+
+def test_safe_run_command_success_and_failure() -> None:
+    ok = _safe_run_command([sys.executable, "-c", "print('ok')"], timeout_sec=3)
+    assert ok["ok"] is True
+    assert "ok" in str(ok["stdout"])
+
+    bad = _safe_run_command([sys.executable, "-c", "import sys; sys.exit(7)"], timeout_sec=3)
+    assert bad["ok"] is False
+    assert bad["exit_code"] == 7
+
+
+def test_collect_install_doctor_report_shape() -> None:
+    report = _collect_install_doctor_report()
+    assert "checks" in report
+    assert "summary" in report
+    checks = report["checks"]
+    assert isinstance(checks, list)
+    names = {str(x.get("name", "")) for x in checks if isinstance(x, dict)}
+    assert "runtime.python_version" in names
+    assert "runtime.lazysre_import" in names

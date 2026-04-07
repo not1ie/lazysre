@@ -21,9 +21,16 @@ lazysre
 lsre
 # 或 python 模块方式
 python -m lazysre
+# 安装环境自检
+lazysre install-doctor
 ```
 
 说明：`npm install -g lazysre` 安装的是跨平台启动器；首次运行会自动检查并安装 Python 版 LazySRE 内核。
+可选环境变量：
+- `LAZYSRE_PIP_INDEX_URL`：指定 pip 镜像源
+- `LAZYSRE_PIP_EXTRA_INDEX_URL`：额外镜像源
+- `LAZYSRE_PIP_TRUSTED_HOST`：可信 host（逗号分隔）
+- `LAZYSRE_NO_AUTO_INSTALL=1`：禁止启动器自动安装 Python 内核
 
 ## npm 发布（维护者）
 
@@ -95,6 +102,8 @@ lsre doctor --json
 lsre doctor --auto-fix
 lsre doctor --auto-fix --write-backup
 lsre doctor --strict
+# 安装/发布环境自检（python/node/npm/gh）
+lsre install-doctor
 # CI 可读取 gate 字段：blocking_checks / exit_code_advice
 lsre doctor --strict --json
 

@@ -293,6 +293,18 @@ def doctor(
         raise typer.Exit(code=2)
 
 
+@app.command("install-doctor")
+def install_doctor(
+    as_json: Annotated[bool, typer.Option("--json", help="Print install doctor report as JSON.")] = False,
+) -> None:
+    report = _collect_install_doctor_report()
+    report["gate"] = _build_doctor_gate(report, strict=False)
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_doctor_report(report)
+
+
 @app.command("report")
 def report(
     ctx: typer.Context,
@@ -2630,6 +2642,139 @@ def _render_status_snapshot(snapshot: dict[str, object]) -> None:
     _console.print(table)
 
 
+def _collect_install_doctor_report() -> dict[str, object]:
+    checks: list[dict[str, object]] = []
+
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    py_ok = (sys.version_info.major, sys.version_info.minor) >= (3, 11)
+    checks.append(
+        {
+            "name": "runtime.python_version",
+            "ok": py_ok,
+            "severity": "pass" if py_ok else "error",
+            "detail": f"{py_ver} ({sys.executable})",
+            "hint": "" if py_ok else "请安装 Python 3.11+",
+        }
+    )
+
+    try:
+        import lazysre as _lazy_mod  # noqa: F401
+
+        checks.append(
+            {
+                "name": "runtime.lazysre_import",
+                "ok": True,
+                "severity": "pass",
+                "detail": "import lazysre ok",
+                "hint": "",
+            }
+        )
+    except Exception as exc:
+        checks.append(
+            {
+                "name": "runtime.lazysre_import",
+                "ok": False,
+                "severity": "error",
+                "detail": str(exc)[:220],
+                "hint": "执行 python -m pip install lazysre 或重新安装项目",
+            }
+        )
+
+    node_path = shutil.which("node") or ""
+    node_ok = bool(node_path)
+    checks.append(
+        {
+            "name": "runtime.node_binary",
+            "ok": node_ok,
+            "severity": "pass" if node_ok else "warn",
+            "detail": node_path or "(not found)",
+            "hint": "" if node_ok else "如需 npm 全局安装，请安装 Node.js 18+",
+        }
+    )
+
+    npm_path = shutil.which("npm") or ""
+    npm_ok = bool(npm_path)
+    checks.append(
+        {
+            "name": "runtime.npm_binary",
+            "ok": npm_ok,
+            "severity": "pass" if npm_ok else "warn",
+            "detail": npm_path or "(not found)",
+            "hint": "" if npm_ok else "如需 npm 全局安装，请安装 npm",
+        }
+    )
+
+    if npm_ok:
+        npm_probe = _safe_run_command([npm_path, "-v"], timeout_sec=5)
+        checks.append(
+            {
+                "name": "runtime.npm_version",
+                "ok": bool(npm_probe.get("ok")),
+                "severity": "pass" if bool(npm_probe.get("ok")) else "warn",
+                "detail": str(npm_probe.get("stdout", "") or npm_probe.get("stderr", ""))[:200],
+                "hint": "" if bool(npm_probe.get("ok")) else "检查 npm 与 node 是否同时可用",
+            }
+        )
+        auth_probe = _safe_run_command([npm_path, "whoami"], timeout_sec=6)
+        checks.append(
+            {
+                "name": "runtime.npm_auth",
+                "ok": bool(auth_probe.get("ok")),
+                "severity": "pass" if bool(auth_probe.get("ok")) else "warn",
+                "detail": str(auth_probe.get("stdout", "") or auth_probe.get("stderr", ""))[:220],
+                "hint": "" if bool(auth_probe.get("ok")) else "仅在本地直发 npm 时需要 npm 登录；GitHub Actions 可使用 NPM_TOKEN",
+            }
+        )
+
+    gh_path = shutil.which("gh") or ""
+    gh_ok = bool(gh_path)
+    checks.append(
+        {
+            "name": "runtime.gh_cli",
+            "ok": gh_ok,
+            "severity": "pass" if gh_ok else "warn",
+            "detail": gh_path or "(not found)",
+            "hint": "" if gh_ok else "建议安装 gh 以便检查仓库 Secrets 与 workflow",
+        }
+    )
+    if gh_ok:
+        gh_probe = _safe_run_command([gh_path, "auth", "status"], timeout_sec=7)
+        checks.append(
+            {
+                "name": "runtime.gh_auth",
+                "ok": bool(gh_probe.get("ok")),
+                "severity": "pass" if bool(gh_probe.get("ok")) else "warn",
+                "detail": str(gh_probe.get("stdout", "") or gh_probe.get("stderr", ""))[:220],
+                "hint": "" if bool(gh_probe.get("ok")) else "执行 gh auth login 后可自动检查 NPM_TOKEN 等配置",
+            }
+        )
+
+    summary = _summarize_doctor_checks(checks)
+    return {
+        "checks": checks,
+        "summary": summary,
+    }
+
+
+def _safe_run_command(command: list[str], *, timeout_sec: int) -> dict[str, object]:
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=float(timeout_sec),
+            check=False,
+        )
+    except Exception as exc:
+        return {"ok": False, "stdout": "", "stderr": str(exc), "exit_code": -1}
+    return {
+        "ok": completed.returncode == 0,
+        "stdout": (completed.stdout or "").strip(),
+        "stderr": (completed.stderr or "").strip(),
+        "exit_code": int(completed.returncode),
+    }
+
+
 def _collect_doctor_report(
     *,
     target,
@@ -3150,6 +3295,7 @@ def _render_chat_short_help() -> None:
         "- /status: 查看当前会话、目标配置、最近修复计划",
         "- /status probe: 追加目标探测摘要（dry-run）",
         "- /doctor: 运行环境预检（依赖/配置/连通性）",
+        "- /doctor install: 安装环境自检（python/node/npm/gh）",
         "- /doctor fix: 执行安全自动修复后再预检",
         "- /doctor strict: 严格模式（warn 也视为不健康）",
         "- /runbook list: 查看 runbook 模板",
@@ -3182,6 +3328,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
     typer.echo(
         "快捷命令：/help /status [/status probe] /doctor [/doctor fix] "
+        "[/doctor install] "
         "/runbook [list|show|render|run|add|remove|export|import|name] [args] "
         "/report [args] /fix <问题> /apply /approve [steps] /memory [query]"
     )
@@ -3216,6 +3363,14 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower().startswith("/doctor"):
             doctor_text = text.lower()
+            if " install" in doctor_text or "--install" in doctor_text:
+                report = _collect_install_doctor_report()
+                report["gate"] = _build_doctor_gate(report, strict=False)
+                if _console:
+                    _render_doctor_report(report)
+                else:
+                    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+                continue
             auto_fix = (" fix" in doctor_text) or ("--auto-fix" in doctor_text)
             strict_mode = (" strict" in doctor_text) or ("--strict" in doctor_text)
             write_backup = (" backup" in doctor_text) or ("--write-backup" in doctor_text)
@@ -3956,7 +4111,23 @@ def main() -> None:
 def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     if len(argv) <= 1:
         return
-    commands = {"run", "chat", "fix", "approve", "status", "doctor", "report", "runbook", "pack", "target", "history", "memory", "--help", "-h"}
+    commands = {
+        "run",
+        "chat",
+        "fix",
+        "approve",
+        "status",
+        "doctor",
+        "install-doctor",
+        "report",
+        "runbook",
+        "pack",
+        "target",
+        "history",
+        "memory",
+        "--help",
+        "-h",
+    }
     options_with_value = {
         "--approval-mode",
         "--audit-log",
@@ -3989,7 +4160,23 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
 def _should_launch_assistant(tokens: list[str]) -> bool:
     if not tokens:
         return True
-    commands = {"run", "chat", "fix", "approve", "status", "doctor", "report", "runbook", "pack", "target", "history", "memory", "--help", "-h"}
+    commands = {
+        "run",
+        "chat",
+        "fix",
+        "approve",
+        "status",
+        "doctor",
+        "install-doctor",
+        "report",
+        "runbook",
+        "pack",
+        "target",
+        "history",
+        "memory",
+        "--help",
+        "-h",
+    }
     options_with_value = {
         "--approval-mode",
         "--audit-log",
