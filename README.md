@@ -23,7 +23,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /status /status probe /fix <问题> /apply /approve [1,3-4]
+# /help /status /status probe /fix <问题> /apply /approve [1,3-4] /memory [query]
 
 # 自动修复模式（先生成修复与回滚计划）
 lsre fix "为什么支付服务响应变慢了？"
@@ -49,6 +49,9 @@ lsre status --probe --json
 # 会话历史
 lsre history show --limit 10
 lsre history export --output .data/lsre-session-history.md
+# 长期记忆库（RAG 案例）
+lsre memory show --limit 10
+lsre memory search "payment latency" --limit 5
 ```
 
 说明：直接运行 `lsre` 会进入自然语言助手模式。  

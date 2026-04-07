@@ -68,6 +68,12 @@ def test_rewrite_argv_preserves_approve_subcommand() -> None:
     assert argv == ["lsre", "approve", "--steps", "1,3-4", "--execute"]
 
 
+def test_rewrite_argv_preserves_memory_subcommand() -> None:
+    argv = ["lsre", "memory", "show", "--limit", "5"]
+    _rewrite_argv_for_default_run(argv)
+    assert argv == ["lsre", "memory", "show", "--limit", "5"]
+
+
 def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_fix_request("请帮我修复支付服务")
     assert _looks_like_fix_request("fix payment service latency")
@@ -83,6 +89,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["chat"]) is False
     assert _should_launch_assistant(["status"]) is False
     assert _should_launch_assistant(["approve"]) is False
+    assert _should_launch_assistant(["memory"]) is False
     assert _should_launch_assistant(["检查k8s"]) is False
 
 

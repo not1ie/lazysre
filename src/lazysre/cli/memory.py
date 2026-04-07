@@ -118,6 +118,34 @@ class IncidentMemoryStore:
         ranked.sort(key=lambda x: x.score, reverse=True)
         return ranked[: max(1, min(limit, 8))]
 
+    def list_recent(self, *, limit: int = 10) -> list[MemoryCase]:
+        cap = max(1, min(limit, 100))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, created_at, symptom, root_cause, fix_commands_json, rollback_commands_json, metadata_json
+                FROM incident_memory
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (cap,),
+            ).fetchall()
+        items: list[MemoryCase] = []
+        for row in rows:
+            items.append(
+                MemoryCase(
+                    id=int(row["id"]),
+                    created_at=str(row["created_at"]),
+                    symptom=str(row["symptom"]),
+                    root_cause=str(row["root_cause"]),
+                    fix_commands=_safe_list(row["fix_commands_json"]),
+                    rollback_commands=_safe_list(row["rollback_commands_json"]),
+                    metadata=_safe_dict(row["metadata_json"]),
+                    score=1.0,
+                )
+            )
+        return items
+
 
 def format_memory_context(cases: list[MemoryCase]) -> str:
     if not cases:

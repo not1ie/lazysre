@@ -40,6 +40,9 @@ def test_memory_store_add_and_search(tmp_path: Path) -> None:
     assert rows
     context = format_memory_context(rows)
     assert "payment" in context.lower()
+    recent = store.list_recent(limit=5)
+    assert recent
+    assert recent[0].symptom.startswith("payment")
 
 
 def test_compact_conversation_includes_trace() -> None:

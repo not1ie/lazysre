@@ -28,7 +28,7 @@ from lazysre.cli.llm import MockFunctionCallingLLM, OpenAIResponsesLLM
 from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.session import SessionStore
-from lazysre.cli.memory import IncidentMemoryStore, format_memory_context
+from lazysre.cli.memory import IncidentMemoryStore, MemoryCase, format_memory_context
 from lazysre.cli.target import TargetEnvStore, probe_target_environment
 from lazysre.cli.tools import build_default_registry
 from lazysre.cli.tools.marketplace import (
@@ -63,6 +63,7 @@ app = typer.Typer(
 pack_app = typer.Typer(help="Tool pack marketplace and lock management.")
 target_app = typer.Typer(help="Target environment profile management.")
 history_app = typer.Typer(help="Session history management.")
+memory_app = typer.Typer(help="Long-term incident memory management.")
 
 
 @app.callback(invoke_without_command=True)
@@ -949,6 +950,64 @@ def history_export(
     typer.echo(f"Exported: {out_path}")
 
 
+@memory_app.command("show")
+def memory_show(
+    limit: Annotated[int, typer.Option("--limit", help="Number of memory cases to display.")] = 10,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = _open_incident_memory_store()
+    if not store:
+        typer.echo("memory store is unavailable.")
+        return
+    rows = store.list_recent(limit=limit)
+    if as_json or (not _console):
+        payload = [
+            {
+                "id": item.id,
+                "created_at": item.created_at,
+                "symptom": item.symptom,
+                "root_cause": item.root_cause,
+                "fix_commands": item.fix_commands,
+                "rollback_commands": item.rollback_commands,
+                "metadata": item.metadata,
+            }
+            for item in rows
+        ]
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    _render_memory_cases(rows, title="Incident Memory (Recent)")
+
+
+@memory_app.command("search")
+def memory_search(
+    query: Annotated[str, typer.Argument(help="Search query for similar incidents.")],
+    limit: Annotated[int, typer.Option("--limit", help="Max similar cases to return.")] = 5,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = _open_incident_memory_store()
+    if not store:
+        typer.echo("memory store is unavailable.")
+        return
+    rows = store.search_similar(query, limit=limit)
+    if as_json or (not _console):
+        payload = [
+            {
+                "id": item.id,
+                "created_at": item.created_at,
+                "score": item.score,
+                "symptom": item.symptom,
+                "root_cause": item.root_cause,
+                "fix_commands": item.fix_commands,
+                "rollback_commands": item.rollback_commands,
+                "metadata": item.metadata,
+            }
+            for item in rows
+        ]
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    _render_memory_cases(rows, title=f"Incident Memory Search: {query}")
+
+
 def _build_system_prompt(*, conversation_context: str = "", memory_context: str = "") -> str:
     env = TargetEnvStore().load()
     target_summary = (
@@ -1054,6 +1113,7 @@ def _resolve_lock_file(ctx: typer.Context, lock_file: str | None) -> Path:
 app.add_typer(pack_app, name="pack")
 app.add_typer(target_app, name="target")
 app.add_typer(history_app, name="history")
+app.add_typer(memory_app, name="memory")
 
 
 def _render_timeline(events) -> None:
@@ -1102,6 +1162,37 @@ def _render_probe_report(report: dict[str, object]) -> None:
     _console.print(table)
 
 
+def _render_memory_cases(cases: list[MemoryCase], *, title: str) -> None:
+    if not (_console and Table):
+        if not cases:
+            typer.echo("No memory cases found.")
+            return
+        for item in cases:
+            typer.echo(
+                f"- id={item.id} score={item.score:.2f} symptom={item.symptom} "
+                f"root_cause={item.root_cause}"
+            )
+        return
+    table = Table(title=title)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Score", style="magenta", no_wrap=True)
+    table.add_column("Symptom", style="white")
+    table.add_column("Root Cause", style="green")
+    table.add_column("Fix Cmds", style="yellow", no_wrap=True)
+    if not cases:
+        _console.print(table)
+        return
+    for item in cases:
+        table.add_row(
+            str(item.id),
+            f"{item.score:.2f}",
+            item.symptom[:120],
+            item.root_cause[:140],
+            str(len(item.fix_commands)),
+        )
+    _console.print(table)
+
+
 def _collect_runtime_status(
     *,
     session_file: Path,
@@ -1122,6 +1213,7 @@ def _collect_runtime_status(
 
     target_store = TargetEnvStore(profile_file)
     target = target_store.load()
+    memory_db = _resolve_memory_db_path()
 
     snapshot: dict[str, object] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1134,8 +1226,8 @@ def _collect_runtime_status(
         },
         "last_fix_plan": _read_last_fix_plan_summary(Path(".data/lsre-fix-last.json")),
         "memory": {
-            "db_path": str(_default_memory_db_path()),
-            "cases": _count_memory_cases(_default_memory_db_path()),
+            "db_path": str(memory_db),
+            "cases": _count_memory_cases(memory_db),
         },
     }
 
@@ -1163,6 +1255,24 @@ def _collect_runtime_status(
 
 def _default_memory_db_path() -> Path:
     return Path.home() / ".lazysre" / "history_db"
+
+
+def _resolve_memory_db_path() -> Path:
+    primary = _default_memory_db_path()
+    try:
+        primary.parent.mkdir(parents=True, exist_ok=True)
+        return primary
+    except Exception:
+        fallback = Path(".data/lsre-history_db")
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def _open_incident_memory_store() -> IncidentMemoryStore | None:
+    try:
+        return IncidentMemoryStore(_resolve_memory_db_path())
+    except Exception:
+        return None
 
 
 def _count_memory_cases(path: Path) -> int:
@@ -1453,6 +1563,8 @@ def _render_chat_short_help() -> None:
         "- /apply: 执行最近一次修复计划",
         "- /approve: 查看审批队列",
         "- /approve 1,3-4: 执行指定步骤",
+        "- /memory: 查看最近故障记忆",
+        "- /memory <query>: 检索相似历史案例",
         "- exit / quit: 退出",
     ]
     text = "\n".join(lines)
@@ -1465,7 +1577,7 @@ def _render_chat_short_help() -> None:
 def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("LazySRE 自然语言助手已启动。直接输入问题即可，输入 exit/quit 退出。")
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
-    typer.echo("快捷命令：/help /status [/status probe] /fix <问题> /apply /approve [steps]")
+    typer.echo("快捷命令：/help /status [/status probe] /fix <问题> /apply /approve [steps] /memory [query]")
     while True:
         try:
             line = typer.prompt("lsre")
@@ -1515,6 +1627,19 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 model=str(options["model"]),
                 provider=str(options["provider"]),
             )
+            continue
+        if text.lower().startswith("/memory"):
+            tail = text[len("/memory") :].strip()
+            store = _open_incident_memory_store()
+            if not store:
+                typer.echo("memory store is unavailable.")
+                continue
+            if tail:
+                rows = store.search_similar(tail, limit=5)
+                _render_memory_cases(rows, title=f"Incident Memory Search: {tail}")
+            else:
+                rows = store.list_recent(limit=8)
+                _render_memory_cases(rows, title="Incident Memory (Recent)")
             continue
         if text.lower() in {"/apply", "/apply-last"}:
             _apply_last_fix_plan(
@@ -1924,7 +2049,9 @@ def _looks_like_apply_request(text: str) -> bool:
 
 def _build_memory_context(instruction: str) -> str:
     try:
-        store = IncidentMemoryStore()
+        store = _open_incident_memory_store()
+        if not store:
+            return ""
         return format_memory_context(store.search_similar(instruction, limit=3))
     except Exception:
         return ""
@@ -1952,7 +2079,11 @@ def _persist_successful_fix_case(
     if not root_cause:
         root_cause = "unknown"
     try:
-        IncidentMemoryStore().add_case(
+        store = _open_incident_memory_store()
+        if not store:
+            typer.echo("长期记忆不可用（已忽略）")
+            return
+        store.add_case(
             symptom=instruction,
             root_cause=root_cause,
             fix_commands=plan.apply_commands,
@@ -1963,7 +2094,7 @@ def _persist_successful_fix_case(
                 "executed_steps": int(exec_summary.get("executed", 0)),
             },
         )
-        typer.echo("已写入长期记忆库：~/.lazysre/history_db")
+        typer.echo(f"已写入长期记忆库：{store.path}")
     except Exception as exc:
         typer.echo(f"长期记忆写入失败（已忽略）: {exc}")
 
@@ -2053,7 +2184,7 @@ def main() -> None:
 def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     if len(argv) <= 1:
         return
-    commands = {"run", "chat", "fix", "approve", "status", "pack", "target", "history", "--help", "-h"}
+    commands = {"run", "chat", "fix", "approve", "status", "pack", "target", "history", "memory", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",
@@ -2086,7 +2217,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
 def _should_launch_assistant(tokens: list[str]) -> bool:
     if not tokens:
         return True
-    commands = {"run", "chat", "fix", "approve", "status", "pack", "target", "history", "--help", "-h"}
+    commands = {"run", "chat", "fix", "approve", "status", "pack", "target", "history", "memory", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",
