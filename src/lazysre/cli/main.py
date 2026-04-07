@@ -6,6 +6,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -223,6 +224,7 @@ def doctor(
     profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
     timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 6,
     dry_run_probe: Annotated[bool, typer.Option("--dry-run-probe", help="Run probe checks in dry-run mode.")] = False,
+    auto_fix: Annotated[bool, typer.Option("--auto-fix", help="Apply safe auto-fixes for doctor findings.")] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print doctor report as JSON.")] = False,
 ) -> None:
     options = _merged_options(
@@ -244,13 +246,24 @@ def doctor(
         provider=None,
         max_steps=None,
     )
-    target = TargetEnvStore(Path(profile_file)).load()
+    target_store = TargetEnvStore(Path(profile_file))
+    target = target_store.load()
     report = _collect_doctor_report(
         target=target,
         timeout_sec=timeout_sec,
         dry_run_probe=dry_run_probe,
         audit_log=Path(str(options["audit_log"])),
     )
+    if auto_fix:
+        autofix = _apply_doctor_autofix(target_store, target)
+        target = target_store.load()
+        report = _collect_doctor_report(
+            target=target,
+            timeout_sec=timeout_sec,
+            dry_run_probe=dry_run_probe,
+            audit_log=Path(str(options["audit_log"])),
+        )
+        report["autofix"] = autofix
     if as_json or (not _console):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return
@@ -1507,6 +1520,56 @@ def _doctor_target_checks(target) -> list[dict[str, object]]:
     return checks
 
 
+def _apply_doctor_autofix(target_store: TargetEnvStore, target) -> dict[str, object]:
+    updates, actions = _compute_doctor_autofix(target)
+    if updates:
+        target_store.update(**updates)
+    return {
+        "changed": bool(updates),
+        "updates": updates,
+        "applied": actions,
+    }
+
+
+def _compute_doctor_autofix(target) -> tuple[dict[str, object], list[str]]:
+    updates: dict[str, object] = {}
+    actions: list[str] = []
+
+    if not str(target.k8s_namespace or "").strip():
+        updates["k8s_namespace"] = "default"
+        actions.append("set k8s_namespace=default")
+    if not str(target.prometheus_url or "").strip() and settings.target_prometheus_url.strip():
+        updates["prometheus_url"] = settings.target_prometheus_url.strip()
+        actions.append("set prometheus_url from default settings")
+    if not str(target.k8s_api_url or "").strip() and settings.target_k8s_api_url.strip():
+        updates["k8s_api_url"] = settings.target_k8s_api_url.strip()
+        actions.append("set k8s_api_url from default settings")
+    if not str(target.k8s_context or "").strip():
+        detected = _detect_kubectl_current_context()
+        if detected:
+            updates["k8s_context"] = detected
+            actions.append(f"set k8s_context={detected}")
+    return updates, actions
+
+
+def _detect_kubectl_current_context() -> str:
+    if not shutil.which("kubectl"):
+        return ""
+    try:
+        completed = subprocess.run(
+            ["kubectl", "config", "current-context"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return (completed.stdout or "").strip()
+
+
 def _doctor_probe_check(name: str, payload: dict[str, object], *, dry_run_probe: bool) -> dict[str, object]:
     ok = bool(payload.get("ok"))
     stderr_text = str(payload.get("stderr_preview", "")).lower()
@@ -1561,6 +1624,11 @@ def _render_doctor_report(report: dict[str, object]) -> None:
         f"pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} "
         f"error={summary.get('error', 0)} healthy={summary.get('healthy', False)}"
     )
+    autofix = report.get("autofix", {})
+    if isinstance(autofix, dict) and ("changed" in autofix):
+        summary_text = (
+            f"{summary_text} autofix_changed={autofix.get('changed', False)}"
+        )
     if Panel:
         _console.print(Panel(summary_text, title="Doctor Summary", border_style="cyan"))
     checks = report.get("checks", [])
@@ -1580,6 +1648,12 @@ def _render_doctor_report(report: dict[str, object]) -> None:
                 str(item.get("hint", ""))[:180],
             )
     _console.print(table)
+    if isinstance(autofix, dict):
+        applied = autofix.get("applied", [])
+        if isinstance(applied, list) and applied:
+            lines = [str(x) for x in applied if str(x).strip()]
+            if lines and Panel:
+                _console.print(Panel("\n".join(lines), title="Auto Fix Applied", border_style="green"))
 
 
 def _render_fix_summary(plan: FixPlan, *, max_apply_steps: int) -> None:
@@ -1787,6 +1861,7 @@ def _render_chat_short_help() -> None:
         "- /status: 查看当前会话、目标配置、最近修复计划",
         "- /status probe: 追加目标探测摘要（dry-run）",
         "- /doctor: 运行环境预检（依赖/配置/连通性）",
+        "- /doctor fix: 执行安全自动修复后再预检",
         "- /fix <问题>: 进入修复计划模式",
         "- /apply: 执行最近一次修复计划",
         "- /approve: 查看审批队列",
@@ -1805,7 +1880,7 @@ def _render_chat_short_help() -> None:
 def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("LazySRE 自然语言助手已启动。直接输入问题即可，输入 exit/quit 退出。")
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
-    typer.echo("快捷命令：/help /status [/status probe] /doctor /fix <问题> /apply /approve [steps] /memory [query]")
+    typer.echo("快捷命令：/help /status [/status probe] /doctor [/doctor fix] /fix <问题> /apply /approve [steps] /memory [query]")
     while True:
         try:
             line = typer.prompt("lsre")
@@ -1836,12 +1911,22 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 typer.echo(json.dumps(snapshot, ensure_ascii=False, indent=2))
             continue
         if text.lower().startswith("/doctor"):
+            doctor_text = text.lower()
+            auto_fix = (" fix" in doctor_text) or ("--auto-fix" in doctor_text)
+            target_store = TargetEnvStore()
+            target = target_store.load()
+            autofix_payload: dict[str, object] | None = None
+            if auto_fix:
+                autofix_payload = _apply_doctor_autofix(target_store, target)
+                target = target_store.load()
             report = _collect_doctor_report(
-                target=TargetEnvStore().load(),
+                target=target,
                 timeout_sec=6,
                 dry_run_probe=False,
                 audit_log=Path(str(options["audit_log"])),
             )
+            if autofix_payload is not None:
+                report["autofix"] = autofix_payload
             if _console:
                 _render_doctor_report(report)
             else:

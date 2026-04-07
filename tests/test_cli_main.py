@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from lazysre.cli.main import (
+    _compute_doctor_autofix,
     _collect_runtime_status,
     _extract_command_candidates,
     _extract_named_field,
@@ -13,6 +14,7 @@ from lazysre.cli.main import (
     _summarize_doctor_checks,
     _should_launch_assistant,
 )
+from lazysre.cli.target import TargetEnvironment
 
 
 def test_rewrite_argv_default_run_simple_instruction() -> None:
@@ -197,3 +199,24 @@ def test_summarize_doctor_checks() -> None:
     assert summary["warn"] == 1
     assert summary["error"] == 2
     assert summary["healthy"] is False
+
+
+def test_compute_doctor_autofix_sets_safe_defaults(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "lazysre.cli.main._detect_kubectl_current_context",
+        lambda: "autofix-context",
+    )
+    target = TargetEnvironment(
+        prometheus_url="",
+        k8s_api_url="",
+        k8s_context="",
+        k8s_namespace="",
+        k8s_bearer_token="",
+        k8s_verify_tls=False,
+    )
+    updates, actions = _compute_doctor_autofix(target)
+    assert updates.get("k8s_namespace") == "default"
+    assert "prometheus_url" in updates
+    assert "k8s_api_url" in updates
+    assert updates.get("k8s_context") == "autofix-context"
+    assert actions

@@ -23,7 +23,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /status /status probe /doctor /fix <问题> /apply /approve [1,3-4] /memory [query]
+# /help /status /status probe /doctor [/doctor fix] /fix <问题> /apply /approve [1,3-4] /memory [query]
 
 # 自动修复模式（先生成修复与回滚计划）
 lsre fix "为什么支付服务响应变慢了？"
@@ -48,6 +48,7 @@ lsre status --probe --json
 # 环境预检（依赖/配置/连通性）
 lsre doctor
 lsre doctor --json
+lsre doctor --auto-fix
 
 # 会话历史
 lsre history show --limit 10
