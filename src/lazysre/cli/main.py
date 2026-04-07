@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import shlex
+import shutil
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -214,6 +215,46 @@ def status(
         typer.echo(json.dumps(snapshot, ensure_ascii=False, indent=2))
         return
     _render_status_snapshot(snapshot)
+
+
+@app.command("doctor")
+def doctor(
+    ctx: typer.Context,
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 6,
+    dry_run_probe: Annotated[bool, typer.Option("--dry-run-probe", help="Run probe checks in dry-run mode.")] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="Print doctor report as JSON.")] = False,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
+    target = TargetEnvStore(Path(profile_file)).load()
+    report = _collect_doctor_report(
+        target=target,
+        timeout_sec=timeout_sec,
+        dry_run_probe=dry_run_probe,
+        audit_log=Path(str(options["audit_log"])),
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_doctor_report(report)
 
 
 @app.command("approve")
@@ -1355,6 +1396,192 @@ def _render_status_snapshot(snapshot: dict[str, object]) -> None:
     _console.print(table)
 
 
+def _collect_doctor_report(
+    *,
+    target,
+    timeout_sec: int,
+    dry_run_probe: bool,
+    audit_log: Path,
+) -> dict[str, object]:
+    checks: list[dict[str, object]] = []
+    checks.append(_doctor_python_check())
+    for name in ("kubectl", "docker", "curl"):
+        checks.append(_doctor_binary_check(name))
+    checks.extend(_doctor_target_checks(target))
+    probe_report = asyncio.run(
+        probe_target_environment(
+            target,
+            executor=SafeExecutor(
+                dry_run=dry_run_probe,
+                approval_mode="permissive",
+                approval_granted=True,
+                audit_logger=AuditLogger(audit_log),
+            ),
+            timeout_sec=timeout_sec,
+        )
+    )
+    probe_checks = probe_report.get("checks", {})
+    if isinstance(probe_checks, dict):
+        for name, row in probe_checks.items():
+            if isinstance(row, dict):
+                checks.append(_doctor_probe_check(str(name), row, dry_run_probe=dry_run_probe))
+    summary = _summarize_doctor_checks(checks)
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "probe_mode": "dry-run" if dry_run_probe else "execute",
+        "target": target.to_safe_dict(),
+        "checks": checks,
+        "summary": summary,
+    }
+
+
+def _doctor_python_check() -> dict[str, object]:
+    ok = (sys.version_info.major, sys.version_info.minor) >= (3, 11)
+    severity = "pass" if ok else "error"
+    hint = "" if ok else "请升级到 Python 3.11+"
+    return {
+        "name": "python.version",
+        "ok": ok,
+        "severity": severity,
+        "detail": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "hint": hint,
+    }
+
+
+def _doctor_binary_check(name: str) -> dict[str, object]:
+    path = shutil.which(name)
+    ok = bool(path)
+    severity = "pass" if ok else "error"
+    hint = "" if ok else f"请安装 {name} 并确保在 PATH 中可用"
+    return {
+        "name": f"binary.{name}",
+        "ok": ok,
+        "severity": severity,
+        "detail": path or "not found",
+        "hint": hint,
+    }
+
+
+def _doctor_target_checks(target) -> list[dict[str, object]]:
+    checks: list[dict[str, object]] = []
+    prom = (target.prometheus_url or "").strip()
+    checks.append(
+        {
+            "name": "target.prometheus_url",
+            "ok": bool(prom),
+            "severity": "pass" if prom else "warn",
+            "detail": prom or "(unset)",
+            "hint": "" if prom else "使用 lsre target set --prometheus-url <url> 配置",
+        }
+    )
+    k8s_api = (target.k8s_api_url or "").strip()
+    checks.append(
+        {
+            "name": "target.k8s_api_url",
+            "ok": bool(k8s_api),
+            "severity": "pass" if k8s_api else "warn",
+            "detail": k8s_api or "(unset)",
+            "hint": "" if k8s_api else "使用 lsre target set --k8s-api-url <url> 配置",
+        }
+    )
+    ns = (target.k8s_namespace or "").strip()
+    checks.append(
+        {
+            "name": "target.k8s_namespace",
+            "ok": bool(ns),
+            "severity": "pass" if ns else "warn",
+            "detail": ns or "(unset)",
+            "hint": "" if ns else "使用 lsre target set --k8s-namespace <ns> 配置",
+        }
+    )
+    has_auth = bool((target.k8s_context or "").strip() or (target.k8s_bearer_token or "").strip())
+    checks.append(
+        {
+            "name": "target.k8s_auth",
+            "ok": has_auth,
+            "severity": "pass" if has_auth else "warn",
+            "detail": "context/token present" if has_auth else "missing context and token",
+            "hint": "" if has_auth else "建议配置 k8s context 或 bearer token",
+        }
+    )
+    return checks
+
+
+def _doctor_probe_check(name: str, payload: dict[str, object], *, dry_run_probe: bool) -> dict[str, object]:
+    ok = bool(payload.get("ok"))
+    stderr_text = str(payload.get("stderr_preview", "")).lower()
+    detail = str(payload.get("stdout_preview", "") or payload.get("stderr_preview", "") or "")
+    if ok:
+        severity = "pass"
+        hint = ""
+    elif ("empty" in stderr_text) or ("not configured" in stderr_text):
+        severity = "warn"
+        hint = "先补齐 target 配置，再执行 doctor"
+    else:
+        severity = "warn" if dry_run_probe else "error"
+        hint = "检查网络连通性、账号权限与 API 地址"
+    return {
+        "name": f"probe.{name}",
+        "ok": ok,
+        "severity": severity,
+        "detail": detail[:220],
+        "hint": hint,
+    }
+
+
+def _summarize_doctor_checks(checks: list[dict[str, object]]) -> dict[str, int | bool]:
+    passed = 0
+    warned = 0
+    errored = 0
+    for item in checks:
+        sev = str(item.get("severity", "")).strip().lower()
+        if sev == "pass":
+            passed += 1
+        elif sev == "warn":
+            warned += 1
+        else:
+            errored += 1
+    total = len(checks)
+    healthy = errored == 0
+    return {
+        "total": total,
+        "pass": passed,
+        "warn": warned,
+        "error": errored,
+        "healthy": healthy,
+    }
+
+
+def _render_doctor_report(report: dict[str, object]) -> None:
+    if not (_console and Table):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    summary = report.get("summary", {})
+    summary_text = (
+        f"pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} "
+        f"error={summary.get('error', 0)} healthy={summary.get('healthy', False)}"
+    )
+    if Panel:
+        _console.print(Panel(summary_text, title="Doctor Summary", border_style="cyan"))
+    checks = report.get("checks", [])
+    table = Table(title="Doctor Checks")
+    table.add_column("Check", style="cyan")
+    table.add_column("Severity", style="white", no_wrap=True)
+    table.add_column("Detail", style="white")
+    table.add_column("Hint", style="yellow")
+    if isinstance(checks, list):
+        for raw in checks:
+            item = raw if isinstance(raw, dict) else {}
+            sev = str(item.get("severity", "-"))
+            table.add_row(
+                str(item.get("name", "-")),
+                sev,
+                str(item.get("detail", "-"))[:180],
+                str(item.get("hint", ""))[:180],
+            )
+    _console.print(table)
+
+
 def _render_fix_summary(plan: FixPlan, *, max_apply_steps: int) -> None:
     apply_preview = plan.apply_commands[:max_apply_steps]
     if _console and Table:
@@ -1559,6 +1786,7 @@ def _render_chat_short_help() -> None:
         "- /help: 查看帮助",
         "- /status: 查看当前会话、目标配置、最近修复计划",
         "- /status probe: 追加目标探测摘要（dry-run）",
+        "- /doctor: 运行环境预检（依赖/配置/连通性）",
         "- /fix <问题>: 进入修复计划模式",
         "- /apply: 执行最近一次修复计划",
         "- /approve: 查看审批队列",
@@ -1577,7 +1805,7 @@ def _render_chat_short_help() -> None:
 def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("LazySRE 自然语言助手已启动。直接输入问题即可，输入 exit/quit 退出。")
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
-    typer.echo("快捷命令：/help /status [/status probe] /fix <问题> /apply /approve [steps] /memory [query]")
+    typer.echo("快捷命令：/help /status [/status probe] /doctor /fix <问题> /apply /approve [steps] /memory [query]")
     while True:
         try:
             line = typer.prompt("lsre")
@@ -1606,6 +1834,18 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 _render_status_snapshot(snapshot)
             else:
                 typer.echo(json.dumps(snapshot, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/doctor"):
+            report = _collect_doctor_report(
+                target=TargetEnvStore().load(),
+                timeout_sec=6,
+                dry_run_probe=False,
+                audit_log=Path(str(options["audit_log"])),
+            )
+            if _console:
+                _render_doctor_report(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
             continue
         if text.lower().startswith("/fix "):
             fix_text = text[5:].strip()
@@ -2184,7 +2424,7 @@ def main() -> None:
 def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     if len(argv) <= 1:
         return
-    commands = {"run", "chat", "fix", "approve", "status", "pack", "target", "history", "memory", "--help", "-h"}
+    commands = {"run", "chat", "fix", "approve", "status", "doctor", "pack", "target", "history", "memory", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",
@@ -2217,7 +2457,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
 def _should_launch_assistant(tokens: list[str]) -> bool:
     if not tokens:
         return True
-    commands = {"run", "chat", "fix", "approve", "status", "pack", "target", "history", "memory", "--help", "-h"}
+    commands = {"run", "chat", "fix", "approve", "status", "doctor", "pack", "target", "history", "memory", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",
