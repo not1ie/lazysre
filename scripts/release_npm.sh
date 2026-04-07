@@ -27,6 +27,11 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ -x "./scripts/check_npm_release.sh" ]]; then
+  echo "[release] running npm preflight checks..."
+  ./scripts/check_npm_release.sh "${VERSION}"
+fi
+
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "Working tree is not clean. Commit or stash changes first."
   exit 1

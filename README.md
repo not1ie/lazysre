@@ -28,8 +28,11 @@ python -m lazysre
 ## npm 发布（维护者）
 
 ```bash
-# 1) 配置仓库 Secret: NPM_TOKEN
-# 2) 本地执行发版脚本（会更新 package.json、打 tag、推送）
+# 1) 首次先跑发布前检查（Node/npm、pack、npm auth、NPM_TOKEN 等）
+./scripts/check_npm_release.sh
+
+# 2) 配置仓库 Secret: NPM_TOKEN
+# 3) 本地执行发版脚本（会先做 preflight，然后更新 package.json、打 tag、推送）
 ./scripts/release_npm.sh 0.1.1
 ```
 
