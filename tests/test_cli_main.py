@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from lazysre.cli.main import (
     _archive_report_for_git,
     _backup_target_profile,
@@ -27,6 +29,7 @@ from lazysre.cli.main import (
     _prepare_runbook_instruction,
     _parse_chat_runbook_command,
     _parse_chat_runbook_var_extra,
+    _parse_chat_report_command,
     _should_launch_assistant,
 )
 from lazysre.cli.runbook import find_runbook
@@ -498,11 +501,20 @@ def test_parse_chat_runbook_command_run_and_render() -> None:
     parsed_run = _parse_chat_runbook_command("payment-latency-fix service=order namespace=prod")
     assert parsed_run["action"] == "run"
     assert parsed_run["name"] == "payment-latency-fix"
+    assert parsed_run["apply"] is False
 
     parsed_render = _parse_chat_runbook_command("render payment-latency-fix --var service=order")
     assert parsed_render["action"] == "render"
     assert parsed_render["name"] == "payment-latency-fix"
     assert "service=order" in parsed_render["var_items"]
+
+    parsed_run_apply = _parse_chat_runbook_command(
+        "run payment-latency-fix --apply --runbook-file /tmp/rb.json service=order"
+    )
+    assert parsed_run_apply["action"] == "run"
+    assert parsed_run_apply["name"] == "payment-latency-fix"
+    assert parsed_run_apply["apply"] is True
+    assert parsed_run_apply["runbook_file"] == "/tmp/rb.json"
 
 
 def test_parse_chat_runbook_command_add_and_export_import_remove() -> None:
@@ -527,3 +539,30 @@ def test_parse_chat_runbook_command_add_and_export_import_remove() -> None:
     parsed_remove = _parse_chat_runbook_command("remove my-fix --yes")
     assert parsed_remove["action"] == "remove"
     assert parsed_remove["yes"] is True
+
+
+def test_parse_chat_report_command_defaults_and_options() -> None:
+    defaults = _parse_chat_report_command("")
+    assert defaults["fmt"] == "markdown"
+    assert defaults["include_doctor"] is True
+    assert defaults["push_to_git"] is False
+
+    parsed = _parse_chat_report_command(
+        "json --output /tmp/r.json --limit 8 --no-doctor --no-memory --push-to-git "
+        '--git-remote origin --git-message "archive report"'
+    )
+    assert parsed["fmt"] == "json"
+    assert parsed["output"] == "/tmp/r.json"
+    assert parsed["limit"] == 8
+    assert parsed["include_doctor"] is False
+    assert parsed["include_memory"] is False
+    assert parsed["push_to_git"] is True
+    assert parsed["git_remote"] == "origin"
+    assert parsed["git_message"] == "archive report"
+
+
+def test_parse_chat_report_command_errors() -> None:
+    with pytest.raises(ValueError):
+        _parse_chat_report_command("--limit abc")
+    with pytest.raises(ValueError):
+        _parse_chat_report_command("--unknown")

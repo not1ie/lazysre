@@ -324,40 +324,26 @@ def report(
         provider=None,
         max_steps=None,
     )
-    payload = _build_incident_report_payload(
+    result = _export_incident_report(
         session_file=Path(str(options["session_file"])),
         target_profile_file=Path(settings.target_profile_file),
         include_doctor=include_doctor,
         include_memory=include_memory,
-        memory_limit=5,
         turn_limit=limit,
         audit_log=Path(str(options["audit_log"])),
+        fmt=fmt,
+        output=output,
+        push_to_git=push_to_git,
+        git_remote=git_remote,
+        git_message=git_message,
     )
-    chosen = fmt.strip().lower()
-    if chosen not in {"markdown", "json"}:
-        raise typer.BadParameter("format must be markdown or json")
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    if not output.strip():
-        output = _default_report_output_path(fmt=chosen, stamp=stamp, push_to_git=push_to_git)
-    out_path = Path(output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if chosen == "json":
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    else:
-        out_path.write_text(_render_incident_report_markdown(payload), encoding="utf-8")
-    typer.echo(f"Report exported: {out_path}")
-    if push_to_git:
-        archived_path = _archive_report_for_git(out_path, stamp=stamp)
-        commit_message = git_message.strip() or f"chore(report): archive incident report {stamp}"
-        pushed = _push_report_to_git(
-            archived_path=archived_path,
-            remote=git_remote.strip() or "origin",
-            commit_message=commit_message,
-        )
-        if pushed:
-            typer.echo(f"Report archived & pushed: {archived_path}")
+    typer.echo(f"Report exported: {result['out_path']}")
+    archived = str(result.get("archived_path", "")).strip()
+    if archived:
+        if bool(result.get("pushed", False)):
+            typer.echo(f"Report archived & pushed: {archived}")
         else:
-            typer.echo(f"Report archived (no changes to push): {archived_path}")
+            typer.echo(f"Report archived (no changes to push): {archived}")
 
 
 @app.command("approve")
@@ -1663,6 +1649,25 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
             raise ValueError(f"unknown option for list: {token}")
         return {"action": "list", "custom_only": custom_only, "runbook_file": runbook_file}
 
+    def _parse_run_args(args: list[str]) -> tuple[str, bool, list[str], str]:
+        runbook_file = settings.runbook_store_file
+        apply = False
+        cleaned: list[str] = []
+        idx = 0
+        while idx < len(args):
+            token = args[idx]
+            if token == "--runbook-file" or token.startswith("--runbook-file="):
+                runbook_file, idx = _opt_value(args, idx, "--runbook-file")
+                continue
+            if token == "--apply":
+                apply = True
+                idx += 1
+                continue
+            cleaned.append(token)
+            idx += 1
+        var_items, extra = _parse_chat_runbook_var_extra(cleaned)
+        return runbook_file, apply, var_items, extra
+
     if subcmd in {"show", "render"}:
         if len(tokens) < 2:
             raise ValueError(f"usage: /runbook {subcmd} <name> [k=v]")
@@ -1821,14 +1826,134 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
             raise ValueError("missing --input")
         return {"action": "import", "input_file": input_file, "merge": merge, "runbook_file": runbook_file}
 
-    var_items, extra = _parse_chat_runbook_var_extra(tokens[1:])
+    if subcmd == "run":
+        if len(tokens) < 2:
+            raise ValueError("usage: /runbook run <name> [--apply] [k=v]")
+        runbook_file, apply, var_items, extra = _parse_run_args(tokens[2:])
+        return {
+            "action": "run",
+            "name": tokens[1],
+            "var_items": var_items,
+            "extra": extra,
+            "apply": apply,
+            "runbook_file": runbook_file,
+        }
+
+    runbook_file, apply, var_items, extra = _parse_run_args(tokens[1:])
     return {
         "action": "run",
         "name": tokens[0],
         "var_items": var_items,
         "extra": extra,
-        "runbook_file": settings.runbook_store_file,
+        "apply": apply,
+        "runbook_file": runbook_file,
     }
+
+
+def _parse_chat_report_command(tail: str) -> dict[str, object]:
+    text = tail.strip()
+    tokens: list[str] = []
+    if text:
+        try:
+            tokens = shlex.split(text)
+        except ValueError as exc:
+            raise ValueError(f"invalid quoting: {exc}") from exc
+
+    result: dict[str, object] = {
+        "fmt": "markdown",
+        "output": "",
+        "limit": 20,
+        "include_doctor": True,
+        "include_memory": True,
+        "push_to_git": False,
+        "git_remote": "origin",
+        "git_message": "",
+    }
+    if tokens and (not tokens[0].startswith("-")) and tokens[0].lower() in {"markdown", "json"}:
+        result["fmt"] = tokens[0].lower()
+        tokens = tokens[1:]
+
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token == "--format" or token.startswith("--format="):
+            value = token.split("=", 1)[1] if token.startswith("--format=") else ""
+            if not value:
+                idx += 1
+                if idx >= len(tokens):
+                    raise ValueError("missing value for --format")
+                value = tokens[idx]
+            result["fmt"] = value.strip().lower()
+            idx += 1
+            continue
+        if token == "--output" or token.startswith("--output="):
+            value = token.split("=", 1)[1] if token.startswith("--output=") else ""
+            if not value:
+                idx += 1
+                if idx >= len(tokens):
+                    raise ValueError("missing value for --output")
+                value = tokens[idx]
+            result["output"] = value.strip()
+            idx += 1
+            continue
+        if token == "--limit" or token.startswith("--limit="):
+            value = token.split("=", 1)[1] if token.startswith("--limit=") else ""
+            if not value:
+                idx += 1
+                if idx >= len(tokens):
+                    raise ValueError("missing value for --limit")
+                value = tokens[idx]
+            try:
+                limit = int(value)
+            except Exception:
+                raise ValueError("limit must be integer") from None
+            if limit <= 0:
+                raise ValueError("limit must be > 0")
+            result["limit"] = limit
+            idx += 1
+            continue
+        if token in {"--include-doctor", "--doctor"}:
+            result["include_doctor"] = True
+            idx += 1
+            continue
+        if token == "--no-doctor":
+            result["include_doctor"] = False
+            idx += 1
+            continue
+        if token in {"--include-memory", "--memory"}:
+            result["include_memory"] = True
+            idx += 1
+            continue
+        if token == "--no-memory":
+            result["include_memory"] = False
+            idx += 1
+            continue
+        if token == "--push-to-git":
+            result["push_to_git"] = True
+            idx += 1
+            continue
+        if token == "--git-remote" or token.startswith("--git-remote="):
+            value = token.split("=", 1)[1] if token.startswith("--git-remote=") else ""
+            if not value:
+                idx += 1
+                if idx >= len(tokens):
+                    raise ValueError("missing value for --git-remote")
+                value = tokens[idx]
+            result["git_remote"] = value.strip()
+            idx += 1
+            continue
+        if token == "--git-message" or token.startswith("--git-message="):
+            value = token.split("=", 1)[1] if token.startswith("--git-message=") else ""
+            if not value:
+                idx += 1
+                if idx >= len(tokens):
+                    raise ValueError("missing value for --git-message")
+                value = tokens[idx]
+            result["git_message"] = value
+            idx += 1
+            continue
+        raise ValueError(f"unknown option for report: {token}")
+    return result
 
 
 def _build_system_prompt(*, conversation_context: str = "", memory_context: str = "") -> str:
@@ -2228,6 +2353,57 @@ def _render_incident_report_markdown(payload: dict[str, object]) -> str:
             lines.append(f"  root_cause={item.get('root_cause', '-')}")
     lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+
+def _export_incident_report(
+    *,
+    session_file: Path,
+    target_profile_file: Path,
+    include_doctor: bool,
+    include_memory: bool,
+    turn_limit: int,
+    audit_log: Path,
+    fmt: str,
+    output: str,
+    push_to_git: bool,
+    git_remote: str,
+    git_message: str,
+) -> dict[str, object]:
+    payload = _build_incident_report_payload(
+        session_file=session_file,
+        target_profile_file=target_profile_file,
+        include_doctor=include_doctor,
+        include_memory=include_memory,
+        memory_limit=5,
+        turn_limit=turn_limit,
+        audit_log=audit_log,
+    )
+    chosen = fmt.strip().lower()
+    if chosen not in {"markdown", "json"}:
+        raise typer.BadParameter("format must be markdown or json")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    output_value = output.strip()
+    if not output_value:
+        output_value = _default_report_output_path(fmt=chosen, stamp=stamp, push_to_git=push_to_git)
+    out_path = Path(output_value)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if chosen == "json":
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        out_path.write_text(_render_incident_report_markdown(payload), encoding="utf-8")
+
+    result: dict[str, object] = {"out_path": str(out_path), "archived_path": "", "pushed": False}
+    if push_to_git:
+        archived_path = _archive_report_for_git(out_path, stamp=stamp)
+        commit_message = git_message.strip() or f"chore(report): archive incident report {stamp}"
+        pushed = _push_report_to_git(
+            archived_path=archived_path,
+            remote=git_remote.strip() or "origin",
+            commit_message=commit_message,
+        )
+        result["archived_path"] = str(archived_path)
+        result["pushed"] = bool(pushed)
+    return result
 
 
 def _default_report_output_path(*, fmt: str, stamp: str, push_to_git: bool) -> str:
@@ -2983,8 +3159,9 @@ def _render_chat_short_help() -> None:
         "- /runbook remove <name> [--yes]: 删除自定义 runbook",
         "- /runbook export --output <file> [--scope custom|effective]: 导出 runbook",
         "- /runbook import --input <file> [--merge|--replace]: 导入 runbook",
-        "- /runbook <name> [k=v]: 执行 runbook（支持变量覆盖）",
-        "- /report: 导出复盘报告",
+        "- /runbook run <name> [--apply] [k=v]: 执行 runbook（fix 模板可直接 apply）",
+        "- /runbook <name> [--apply] [k=v]: 执行 runbook（简写）",
+        "- /report [--format json] [--no-doctor] [--push-to-git]: 导出复盘报告",
         "- /fix <问题>: 进入修复计划模式",
         "- /apply: 执行最近一次修复计划",
         "- /approve: 查看审批队列",
@@ -3005,7 +3182,8 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
     typer.echo(
         "快捷命令：/help /status [/status probe] /doctor [/doctor fix] "
-        "/runbook [list|show|render|add|remove|export|import|name] [args] /report /fix <问题> /apply /approve [steps] /memory [query]"
+        "/runbook [list|show|render|run|add|remove|export|import|name] [args] "
+        "/report [args] /fix <问题> /apply /approve [steps] /memory [query]"
     )
     while True:
         try:
@@ -3165,25 +3343,41 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             _execute_runbook(
                 template=template,
                 instruction=instruction,
-                apply=False,
+                apply=bool(command.get("apply", False)),
                 options=options,
             )
             continue
         if text.lower().startswith("/report"):
-            payload = _build_incident_report_payload(
-                session_file=Path(str(options["session_file"])),
-                target_profile_file=Path(settings.target_profile_file),
-                include_doctor=True,
-                include_memory=True,
-                memory_limit=5,
-                turn_limit=20,
-                audit_log=Path(str(options["audit_log"])),
-            )
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-            out_path = Path(f".data/lsre-report-{stamp}.md")
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(_render_incident_report_markdown(payload), encoding="utf-8")
-            typer.echo(f"Report exported: {out_path}")
+            tail = text[len("/report") :].strip()
+            try:
+                report_cmd = _parse_chat_report_command(tail)
+            except ValueError as exc:
+                typer.echo(f"report 命令格式错误: {exc}")
+                continue
+            try:
+                result = _export_incident_report(
+                    session_file=Path(str(options["session_file"])),
+                    target_profile_file=Path(settings.target_profile_file),
+                    include_doctor=bool(report_cmd.get("include_doctor", True)),
+                    include_memory=bool(report_cmd.get("include_memory", True)),
+                    turn_limit=int(report_cmd.get("limit", 20)),
+                    audit_log=Path(str(options["audit_log"])),
+                    fmt=str(report_cmd.get("fmt", "markdown")),
+                    output=str(report_cmd.get("output", "")),
+                    push_to_git=bool(report_cmd.get("push_to_git", False)),
+                    git_remote=str(report_cmd.get("git_remote", "origin")),
+                    git_message=str(report_cmd.get("git_message", "")),
+                )
+            except typer.BadParameter as exc:
+                typer.echo(f"report 生成失败: {exc}")
+                continue
+            typer.echo(f"Report exported: {result['out_path']}")
+            archived = str(result.get("archived_path", "")).strip()
+            if archived:
+                if bool(result.get("pushed", False)):
+                    typer.echo(f"Report archived & pushed: {archived}")
+                else:
+                    typer.echo(f"Report archived (no changes to push): {archived}")
             continue
         if text.lower().startswith("/fix "):
             fix_text = text[5:].strip()
