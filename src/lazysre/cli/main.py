@@ -215,6 +215,53 @@ def status(
     _render_status_snapshot(snapshot)
 
 
+@app.command("approve")
+def approve_plan(
+    ctx: typer.Context,
+    steps: Annotated[str, typer.Option("--steps", help="Step indexes to execute, e.g. 1,3-5. Empty means list only.")] = "",
+    execute: Annotated[bool | None, typer.Option("--execute", help="Override execution mode.")] = None,
+    approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
+    audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
+    allow_high_risk: Annotated[bool, typer.Option("--allow-high-risk", help="Allow high/critical risk steps.")] = False,
+    auto_approve_low_risk: Annotated[bool, typer.Option("--auto-approve-low-risk", help="Auto-approve low-risk steps.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", help="Skip per-step confirmation for selected steps.")] = False,
+    with_impact: Annotated[bool, typer.Option("--with-impact", help="Generate impact statement for each step.")] = False,
+    model: Annotated[str | None, typer.Option(help="Override model.")] = None,
+    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=execute,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=model,
+        provider=provider,
+        max_steps=None,
+    )
+    _approve_last_fix_plan(
+        steps=steps,
+        execute=bool(options["execute"]),
+        approval_mode=str(options["approval_mode"]),
+        audit_log=str(options["audit_log"]),
+        allow_high_risk=allow_high_risk,
+        auto_approve_low_risk=auto_approve_low_risk,
+        yes=yes,
+        with_impact=with_impact,
+        model=str(options["model"]),
+        provider=str(options["provider"]),
+    )
+
+
 @app.command("chat")
 def chat(
     ctx: typer.Context,
@@ -1404,6 +1451,8 @@ def _render_chat_short_help() -> None:
         "- /status probe: 追加目标探测摘要（dry-run）",
         "- /fix <问题>: 进入修复计划模式",
         "- /apply: 执行最近一次修复计划",
+        "- /approve: 查看审批队列",
+        "- /approve 1,3-4: 执行指定步骤",
         "- exit / quit: 退出",
     ]
     text = "\n".join(lines)
@@ -1416,7 +1465,7 @@ def _render_chat_short_help() -> None:
 def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("LazySRE 自然语言助手已启动。直接输入问题即可，输入 exit/quit 退出。")
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
-    typer.echo("快捷命令：/help /status [/status probe] /fix <问题> /apply")
+    typer.echo("快捷命令：/help /status [/status probe] /fix <问题> /apply /approve [steps]")
     while True:
         try:
             line = typer.prompt("lsre")
@@ -1452,6 +1501,21 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 typer.echo("用法：/fix <问题描述>")
                 continue
             text = fix_text
+        if text.lower().startswith("/approve"):
+            tail = text[len("/approve") :].strip()
+            _approve_last_fix_plan(
+                steps=tail,
+                execute=bool(options["execute"]),
+                approval_mode=str(options["approval_mode"]),
+                audit_log=str(options["audit_log"]),
+                allow_high_risk=False,
+                auto_approve_low_risk=False,
+                yes=False,
+                with_impact=False,
+                model=str(options["model"]),
+                provider=str(options["provider"]),
+            )
+            continue
         if text.lower() in {"/apply", "/apply-last"}:
             _apply_last_fix_plan(
                 max_apply_steps=6,
@@ -1534,6 +1598,7 @@ def _execute_fix_plan_steps(
     auto_approve_low_risk: bool,
     model: str,
     provider: str,
+    skip_confirm: bool = False,
 ) -> dict[str, int]:
     executor = SafeExecutor(
         dry_run=(not execute),
@@ -1573,7 +1638,9 @@ def _execute_fix_plan_steps(
             skipped_high_risk += 1
             typer.echo(f"[step {idx}/{total}] 已跳过高风险步骤（如需执行请加 --allow-high-risk）")
             continue
-        if need_confirm and (not typer.confirm(f"[step {idx}/{total}] 是否执行该步骤？", default=False)):
+        if (not skip_confirm) and need_confirm and (
+            not typer.confirm(f"[step {idx}/{total}] 是否执行该步骤？", default=False)
+        ):
             continue
         if (not need_confirm) and auto_approve_low_risk:
             typer.echo(f"[step {idx}/{total}] low-risk 自动通过确认")
@@ -1584,7 +1651,9 @@ def _execute_fix_plan_steps(
         else:
             failed += 1
         _render_step_result(idx, total, result_exec)
-        if (not result_exec.ok) and (not typer.confirm("步骤失败，是否继续后续步骤？", default=False)):
+        if (not result_exec.ok) and (not skip_confirm) and (
+            not typer.confirm("步骤失败，是否继续后续步骤？", default=False)
+        ):
             break
     if skipped_high_risk:
         typer.echo(f"共跳过 {skipped_high_risk} 个高风险步骤。")
@@ -1605,32 +1674,8 @@ def _apply_last_fix_plan(
     model: str,
     provider: str,
 ) -> None:
-    path = Path(".data/lsre-fix-last.json")
-    if not path.exists():
-        typer.echo("未找到最近修复计划（.data/lsre-fix-last.json）。先说“修复 xxx”生成计划。")
-        return
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        typer.echo("最近修复计划文件损坏，无法读取。")
-        return
-    if not isinstance(payload, dict):
-        typer.echo("最近修复计划格式无效。")
-        return
-    plan_obj = payload.get("plan", {})
-    if not isinstance(plan_obj, dict):
-        typer.echo("最近修复计划缺少 plan 字段。")
-        return
-    selected = payload.get("selected_apply_commands", [])
-    if not isinstance(selected, list):
-        selected = []
-    apply_commands = [str(x).strip() for x in selected if str(x).strip()]
-    if not apply_commands:
-        apply_commands = [str(x).strip() for x in plan_obj.get("apply_commands", []) if str(x).strip()]
-    rollback_commands = [str(x).strip() for x in plan_obj.get("rollback_commands", []) if str(x).strip()]
-    plan = FixPlan(apply_commands=apply_commands, rollback_commands=rollback_commands)
-    if not plan.apply_commands:
-        typer.echo("最近修复计划没有可执行命令。")
+    plan = _load_last_fix_plan()
+    if not plan:
         return
     _render_fix_summary(plan, max_apply_steps=max_apply_steps)
     _execute_fix_plan_steps(
@@ -1648,6 +1693,199 @@ def _apply_last_fix_plan(
         typer.echo("\n可回滚命令：")
         for cmd in plan.rollback_commands:
             typer.echo(f"- {cmd}")
+
+
+def _approve_last_fix_plan(
+    *,
+    steps: str,
+    execute: bool,
+    approval_mode: str,
+    audit_log: str,
+    allow_high_risk: bool,
+    auto_approve_low_risk: bool,
+    yes: bool,
+    with_impact: bool,
+    model: str,
+    provider: str,
+) -> None:
+    plan = _load_last_fix_plan()
+    if not plan:
+        return
+    queue = _build_approval_queue(
+        plan=plan,
+        approval_mode=approval_mode,
+        with_impact=with_impact,
+        model=model,
+        provider=provider,
+    )
+    _render_approval_queue(queue)
+    if (not steps.strip()) or (steps.strip().lower() in {"list", "show", "ls"}):
+        typer.echo("仅查看审批队列。执行示例：lsre approve --steps 1,3-4 --execute")
+        return
+    selected_indexes = _parse_step_selection(steps, max_step=len(queue))
+    if not selected_indexes:
+        typer.echo("未解析到可执行步骤。示例：--steps 1,3-4")
+        return
+    selected_cmds = [plan.apply_commands[idx - 1] for idx in sorted(selected_indexes)]
+    if not selected_cmds:
+        typer.echo("所选步骤没有可执行命令。")
+        return
+    selected_plan = FixPlan(
+        apply_commands=selected_cmds,
+        rollback_commands=plan.rollback_commands,
+    )
+    typer.echo(f"准备执行步骤: {', '.join(str(x) for x in sorted(selected_indexes))}")
+    _execute_fix_plan_steps(
+        plan=selected_plan,
+        max_apply_steps=len(selected_plan.apply_commands),
+        execute=execute,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        allow_high_risk=allow_high_risk,
+        auto_approve_low_risk=auto_approve_low_risk,
+        model=model,
+        provider=provider,
+        skip_confirm=yes,
+    )
+
+
+def _load_last_fix_plan() -> FixPlan | None:
+    path = Path(".data/lsre-fix-last.json")
+    if not path.exists():
+        typer.echo("未找到最近修复计划（.data/lsre-fix-last.json）。先说“修复 xxx”生成计划。")
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        typer.echo("最近修复计划文件损坏，无法读取。")
+        return None
+    if not isinstance(payload, dict):
+        typer.echo("最近修复计划格式无效。")
+        return None
+    plan_obj = payload.get("plan", {})
+    if not isinstance(plan_obj, dict):
+        typer.echo("最近修复计划缺少 plan 字段。")
+        return None
+    selected = payload.get("selected_apply_commands", [])
+    if not isinstance(selected, list):
+        selected = []
+    apply_commands = [str(x).strip() for x in selected if str(x).strip()]
+    if not apply_commands:
+        apply_commands = [str(x).strip() for x in plan_obj.get("apply_commands", []) if str(x).strip()]
+    rollback_commands = [str(x).strip() for x in plan_obj.get("rollback_commands", []) if str(x).strip()]
+    plan = FixPlan(apply_commands=apply_commands, rollback_commands=rollback_commands)
+    if not plan.apply_commands:
+        typer.echo("最近修复计划没有可执行命令。")
+        return None
+    return plan
+
+
+def _build_approval_queue(
+    *,
+    plan: FixPlan,
+    approval_mode: str,
+    with_impact: bool,
+    model: str,
+    provider: str,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for idx, command_text in enumerate(plan.apply_commands, 1):
+        risk_level = "unknown"
+        score = "-"
+        scope = "-"
+        impact = ""
+        try:
+            command = shlex.split(command_text)
+            decision = assess_command(command, approval_mode=approval_mode)
+            report = build_risk_report(command, decision)
+            risk_level = str(report.get("risk_level", "unknown"))
+            score = str(report.get("risk_score", "-"))
+            scope = str(report.get("impact_scope", "-"))
+            if with_impact:
+                impact = _generate_impact_statement(
+                    command_text=command_text,
+                    report=report,
+                    model=model,
+                    provider=provider,
+                )
+        except Exception:
+            pass
+        rows.append(
+            {
+                "step": str(idx),
+                "command": command_text,
+                "risk_level": risk_level,
+                "risk_score": score,
+                "impact_scope": scope,
+                "impact": impact,
+            }
+        )
+    return rows
+
+
+def _render_approval_queue(rows: list[dict[str, str]]) -> None:
+    if _console and Table:
+        table = Table(title="Approval Queue")
+        table.add_column("Step", style="cyan", no_wrap=True)
+        table.add_column("Risk", style="white", no_wrap=True)
+        table.add_column("Score", style="magenta", no_wrap=True)
+        table.add_column("Scope", style="yellow", no_wrap=True)
+        table.add_column("Command", style="green")
+        for item in rows:
+            table.add_row(
+                item.get("step", "-"),
+                item.get("risk_level", "-"),
+                item.get("risk_score", "-"),
+                item.get("impact_scope", "-"),
+                item.get("command", "")[:180],
+            )
+        _console.print(table)
+        has_impact = any(str(x.get("impact", "")).strip() for x in rows)
+        if has_impact:
+            lines = []
+            for item in rows:
+                impact = str(item.get("impact", "")).strip()
+                if not impact:
+                    continue
+                lines.append(f"[step {item.get('step','-')}] {impact}")
+            if lines and Panel:
+                _console.print(Panel("\n".join(lines), title="Impact Statements", border_style="yellow"))
+        return
+    typer.echo("Approval Queue:")
+    for item in rows:
+        typer.echo(
+            f"- step={item.get('step','-')} risk={item.get('risk_level','-')} "
+            f"score={item.get('risk_score','-')} scope={item.get('impact_scope','-')} "
+            f"cmd={item.get('command','')}"
+        )
+
+
+def _parse_step_selection(raw: str, *, max_step: int) -> set[int]:
+    selected: set[int] = set()
+    text = raw.strip()
+    if not text:
+        return selected
+    for token in [x.strip() for x in text.split(",") if x.strip()]:
+        if "-" in token:
+            left, right = token.split("-", 1)
+            try:
+                start = int(left.strip())
+                end = int(right.strip())
+            except ValueError:
+                continue
+            if start > end:
+                start, end = end, start
+            for idx in range(start, end + 1):
+                if 1 <= idx <= max_step:
+                    selected.add(idx)
+            continue
+        try:
+            idx = int(token)
+        except ValueError:
+            continue
+        if 1 <= idx <= max_step:
+            selected.add(idx)
+    return selected
 
 
 def _looks_like_fix_request(text: str) -> bool:
@@ -1815,7 +2053,7 @@ def main() -> None:
 def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     if len(argv) <= 1:
         return
-    commands = {"run", "chat", "fix", "status", "pack", "target", "history", "--help", "-h"}
+    commands = {"run", "chat", "fix", "approve", "status", "pack", "target", "history", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",
@@ -1848,7 +2086,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
 def _should_launch_assistant(tokens: list[str]) -> bool:
     if not tokens:
         return True
-    commands = {"run", "chat", "fix", "status", "pack", "target", "history", "--help", "-h"}
+    commands = {"run", "chat", "fix", "approve", "status", "pack", "target", "history", "--help", "-h"}
     options_with_value = {
         "--approval-mode",
         "--audit-log",

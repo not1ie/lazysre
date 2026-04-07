@@ -23,7 +23,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /status /status probe /fix <问题> /apply
+# /help /status /status probe /fix <问题> /apply /approve [1,3-4]
 
 # 自动修复模式（先生成修复与回滚计划）
 lsre fix "为什么支付服务响应变慢了？"
@@ -33,6 +33,10 @@ lsre fix "为什么支付服务响应变慢了？" --export-plan-md .data/fix.md
 lsre fix "为什么支付服务响应变慢了？" --apply --execute
 lsre fix "为什么支付服务响应变慢了？" --apply --execute --allow-high-risk
 lsre fix "为什么支付服务响应变慢了？" --apply --execute --auto-approve-low-risk
+# 审批队列与指定步骤执行
+lsre approve
+lsre approve --steps 1,3-4 --execute
+lsre approve --steps 2 --execute --yes --allow-high-risk
 
 # 目标环境配置与连通性探针
 lsre target show

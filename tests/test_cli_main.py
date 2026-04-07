@@ -7,6 +7,7 @@ from lazysre.cli.main import (
     _extract_named_field,
     _looks_like_apply_request,
     _looks_like_fix_request,
+    _parse_step_selection,
     _read_last_fix_plan_summary,
     _rewrite_argv_for_default_run,
     _should_launch_assistant,
@@ -61,6 +62,12 @@ def test_rewrite_argv_preserves_status_subcommand() -> None:
     assert argv == ["lsre", "status", "--json"]
 
 
+def test_rewrite_argv_preserves_approve_subcommand() -> None:
+    argv = ["lsre", "approve", "--steps", "1,3-4", "--execute"]
+    _rewrite_argv_for_default_run(argv)
+    assert argv == ["lsre", "approve", "--steps", "1,3-4", "--execute"]
+
+
 def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_fix_request("请帮我修复支付服务")
     assert _looks_like_fix_request("fix payment service latency")
@@ -75,6 +82,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant([]) is True
     assert _should_launch_assistant(["chat"]) is False
     assert _should_launch_assistant(["status"]) is False
+    assert _should_launch_assistant(["approve"]) is False
     assert _should_launch_assistant(["检查k8s"]) is False
 
 
@@ -153,3 +161,8 @@ def test_collect_runtime_status_without_probe(tmp_path: Path) -> None:
     assert "target" in status
     assert "session" in status
     assert "probe" not in status
+
+
+def test_parse_step_selection_supports_ranges() -> None:
+    selected = _parse_step_selection("1, 3-5, 9, 7-6, x", max_step=8)
+    assert selected == {1, 3, 4, 5, 6, 7}
