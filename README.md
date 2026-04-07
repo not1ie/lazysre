@@ -51,6 +51,8 @@ lsre doctor --json
 lsre doctor --auto-fix
 lsre doctor --auto-fix --write-backup
 lsre doctor --strict
+# CI 可读取 gate 字段：blocking_checks / exit_code_advice
+lsre doctor --strict --json
 
 # 会话历史
 lsre history show --limit 10

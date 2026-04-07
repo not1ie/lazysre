@@ -273,6 +273,7 @@ def doctor(
         summary_obj["strict_healthy"] = strict_healthy
     else:
         strict_healthy = True
+    report["gate"] = _build_doctor_gate(report, strict=strict)
     if as_json or (not _console):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
     else:
@@ -1658,6 +1659,34 @@ def _doctor_is_healthy(summary: dict[str, object], *, strict: bool) -> bool:
     return errors == 0
 
 
+def _build_doctor_gate(report: dict[str, object], *, strict: bool) -> dict[str, object]:
+    checks = report.get("checks", [])
+    blocking_levels = {"error", "warn"} if strict else {"error"}
+    blocking: list[dict[str, str]] = []
+    if isinstance(checks, list):
+        for raw in checks:
+            item = raw if isinstance(raw, dict) else {}
+            severity = str(item.get("severity", "")).strip().lower()
+            if severity not in blocking_levels:
+                continue
+            blocking.append(
+                {
+                    "name": str(item.get("name", "")),
+                    "severity": severity,
+                    "hint": str(item.get("hint", "")),
+                }
+            )
+    healthy = len(blocking) == 0
+    exit_code_advice = 0 if healthy else (2 if strict else 1)
+    return {
+        "strict_mode": strict,
+        "healthy": healthy,
+        "blocking_count": len(blocking),
+        "blocking_checks": blocking,
+        "exit_code_advice": exit_code_advice,
+    }
+
+
 def _render_doctor_report(report: dict[str, object]) -> None:
     if not (_console and Table):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
@@ -1669,6 +1698,12 @@ def _render_doctor_report(report: dict[str, object]) -> None:
     )
     if bool(summary.get("strict_mode")):
         summary_text = f"{summary_text} strict_healthy={summary.get('strict_healthy', False)}"
+    gate = report.get("gate", {})
+    if isinstance(gate, dict):
+        summary_text = (
+            f"{summary_text} gate_blocking={gate.get('blocking_count', 0)} "
+            f"exit_code_advice={gate.get('exit_code_advice', 0)}"
+        )
     autofix = report.get("autofix", {})
     if isinstance(autofix, dict) and ("changed" in autofix):
         summary_text = (
@@ -1983,6 +2018,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             if isinstance(summary_obj, dict):
                 summary_obj["strict_mode"] = strict_mode
                 summary_obj["strict_healthy"] = _doctor_is_healthy(summary_obj, strict=strict_mode)
+            report["gate"] = _build_doctor_gate(report, strict=strict_mode)
             if _console:
                 _render_doctor_report(report)
             else:

@@ -3,6 +3,7 @@ from pathlib import Path
 
 from lazysre.cli.main import (
     _backup_target_profile,
+    _build_doctor_gate,
     _compute_doctor_autofix,
     _collect_runtime_status,
     _doctor_is_healthy,
@@ -238,3 +239,20 @@ def test_backup_target_profile(tmp_path: Path) -> None:
     backup = Path(backup_path)
     assert backup.exists()
     assert backup.read_text(encoding="utf-8") == profile.read_text(encoding="utf-8")
+
+
+def test_build_doctor_gate_strict_and_non_strict() -> None:
+    report = {
+        "checks": [
+            {"name": "a", "severity": "pass", "hint": ""},
+            {"name": "b", "severity": "warn", "hint": "fix warn"},
+            {"name": "c", "severity": "error", "hint": "fix error"},
+        ]
+    }
+    gate_non_strict = _build_doctor_gate(report, strict=False)
+    assert gate_non_strict["blocking_count"] == 1
+    assert gate_non_strict["exit_code_advice"] == 1
+
+    gate_strict = _build_doctor_gate(report, strict=True)
+    assert gate_strict["blocking_count"] == 2
+    assert gate_strict["exit_code_advice"] == 2
