@@ -1598,6 +1598,239 @@ def _prepare_runbook_instruction(
     return instruction
 
 
+def _parse_chat_runbook_var_extra(tokens: list[str]) -> tuple[list[str], str]:
+    var_items: list[str] = []
+    extra_tokens: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token == "--var":
+            if idx + 1 >= len(tokens):
+                raise ValueError("missing value for --var")
+            var_items.append(tokens[idx + 1])
+            idx += 2
+            continue
+        if token.startswith("--var="):
+            value = token.split("=", 1)[1].strip()
+            if not value:
+                raise ValueError("missing value for --var")
+            var_items.append(value)
+            idx += 1
+            continue
+        if "=" in token:
+            var_items.append(token)
+        else:
+            extra_tokens.append(token)
+        idx += 1
+    return var_items, " ".join(extra_tokens).strip()
+
+
+def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
+    text = tail.strip()
+    if not text:
+        return {"action": "list", "custom_only": False, "runbook_file": settings.runbook_store_file}
+    try:
+        tokens = shlex.split(text)
+    except ValueError as exc:
+        raise ValueError(f"invalid quoting: {exc}") from exc
+    if not tokens:
+        return {"action": "list", "custom_only": False, "runbook_file": settings.runbook_store_file}
+
+    def _opt_value(args: list[str], idx: int, key: str) -> tuple[str, int]:
+        token = args[idx]
+        if token == key:
+            if idx + 1 >= len(args):
+                raise ValueError(f"missing value for {key}")
+            return args[idx + 1], idx + 2
+        if token.startswith(f"{key}="):
+            return token.split("=", 1)[1], idx + 1
+        raise ValueError(f"invalid option format: {token}")
+
+    subcmd = tokens[0].lower()
+    if subcmd in {"list", "ls"}:
+        custom_only = False
+        runbook_file = settings.runbook_store_file
+        idx = 1
+        while idx < len(tokens):
+            token = tokens[idx]
+            if token == "--custom-only":
+                custom_only = True
+                idx += 1
+                continue
+            if token == "--runbook-file" or token.startswith("--runbook-file="):
+                runbook_file, idx = _opt_value(tokens, idx, "--runbook-file")
+                continue
+            raise ValueError(f"unknown option for list: {token}")
+        return {"action": "list", "custom_only": custom_only, "runbook_file": runbook_file}
+
+    if subcmd in {"show", "render"}:
+        if len(tokens) < 2:
+            raise ValueError(f"usage: /runbook {subcmd} <name> [k=v]")
+        name = tokens[1]
+        runbook_file = settings.runbook_store_file
+        args = tokens[2:]
+        cleaned: list[str] = []
+        idx = 0
+        while idx < len(args):
+            token = args[idx]
+            if token == "--runbook-file" or token.startswith("--runbook-file="):
+                runbook_file, idx = _opt_value(args, idx, "--runbook-file")
+                continue
+            cleaned.append(token)
+            idx += 1
+        var_items, extra = _parse_chat_runbook_var_extra(cleaned)
+        return {
+            "action": subcmd,
+            "name": name,
+            "var_items": var_items,
+            "extra": extra,
+            "runbook_file": runbook_file,
+        }
+
+    if subcmd == "add":
+        if len(tokens) < 2:
+            raise ValueError("usage: /runbook add <name> --title <title> --instruction <text>")
+        name = tokens[1]
+        title = ""
+        instruction = ""
+        mode = "diagnose"
+        description = ""
+        force = False
+        runbook_file = settings.runbook_store_file
+        var_items: list[str] = []
+        args = tokens[2:]
+        idx = 0
+        while idx < len(args):
+            token = args[idx]
+            if token == "--title" or token.startswith("--title="):
+                title, idx = _opt_value(args, idx, "--title")
+                continue
+            if token == "--instruction" or token.startswith("--instruction="):
+                instruction, idx = _opt_value(args, idx, "--instruction")
+                continue
+            if token == "--mode" or token.startswith("--mode="):
+                mode, idx = _opt_value(args, idx, "--mode")
+                continue
+            if token == "--description" or token.startswith("--description="):
+                description, idx = _opt_value(args, idx, "--description")
+                continue
+            if token == "--runbook-file" or token.startswith("--runbook-file="):
+                runbook_file, idx = _opt_value(args, idx, "--runbook-file")
+                continue
+            if token == "--var" or token.startswith("--var="):
+                value, idx = _opt_value(args, idx, "--var")
+                var_items.append(value)
+                continue
+            if token == "--force":
+                force = True
+                idx += 1
+                continue
+            if "=" in token:
+                var_items.append(token)
+                idx += 1
+                continue
+            raise ValueError(f"unknown option for add: {token}")
+        if not title.strip():
+            raise ValueError("missing --title")
+        if not instruction.strip():
+            raise ValueError("missing --instruction")
+        return {
+            "action": "add",
+            "name": name,
+            "title": title,
+            "instruction": instruction,
+            "mode": mode,
+            "description": description,
+            "var_items": var_items,
+            "force": force,
+            "runbook_file": runbook_file,
+        }
+
+    if subcmd == "remove":
+        if len(tokens) < 2:
+            raise ValueError("usage: /runbook remove <name> [--yes]")
+        name = tokens[1]
+        yes = False
+        runbook_file = settings.runbook_store_file
+        idx = 2
+        while idx < len(tokens):
+            token = tokens[idx]
+            if token == "--yes":
+                yes = True
+                idx += 1
+                continue
+            if token == "--runbook-file" or token.startswith("--runbook-file="):
+                runbook_file, idx = _opt_value(tokens, idx, "--runbook-file")
+                continue
+            raise ValueError(f"unknown option for remove: {token}")
+        return {"action": "remove", "name": name, "yes": yes, "runbook_file": runbook_file}
+
+    if subcmd == "export":
+        output = ""
+        scope = "custom"
+        names: list[str] = []
+        runbook_file = settings.runbook_store_file
+        idx = 1
+        while idx < len(tokens):
+            token = tokens[idx]
+            if token == "--output" or token.startswith("--output="):
+                output, idx = _opt_value(tokens, idx, "--output")
+                continue
+            if token == "--scope" or token.startswith("--scope="):
+                scope, idx = _opt_value(tokens, idx, "--scope")
+                continue
+            if token == "--name" or token.startswith("--name="):
+                value, idx = _opt_value(tokens, idx, "--name")
+                names.append(value)
+                continue
+            if token == "--runbook-file" or token.startswith("--runbook-file="):
+                runbook_file, idx = _opt_value(tokens, idx, "--runbook-file")
+                continue
+            raise ValueError(f"unknown option for export: {token}")
+        return {
+            "action": "export",
+            "output": output,
+            "scope": scope,
+            "names": names,
+            "runbook_file": runbook_file,
+        }
+
+    if subcmd == "import":
+        input_file = ""
+        merge = True
+        runbook_file = settings.runbook_store_file
+        idx = 1
+        while idx < len(tokens):
+            token = tokens[idx]
+            if token == "--input" or token.startswith("--input="):
+                input_file, idx = _opt_value(tokens, idx, "--input")
+                continue
+            if token == "--merge":
+                merge = True
+                idx += 1
+                continue
+            if token == "--replace":
+                merge = False
+                idx += 1
+                continue
+            if token == "--runbook-file" or token.startswith("--runbook-file="):
+                runbook_file, idx = _opt_value(tokens, idx, "--runbook-file")
+                continue
+            raise ValueError(f"unknown option for import: {token}")
+        if not input_file.strip():
+            raise ValueError("missing --input")
+        return {"action": "import", "input_file": input_file, "merge": merge, "runbook_file": runbook_file}
+
+    var_items, extra = _parse_chat_runbook_var_extra(tokens[1:])
+    return {
+        "action": "run",
+        "name": tokens[0],
+        "var_items": var_items,
+        "extra": extra,
+        "runbook_file": settings.runbook_store_file,
+    }
+
+
 def _build_system_prompt(*, conversation_context: str = "", memory_context: str = "") -> str:
     env = TargetEnvStore().load()
     active_profile = ClusterProfileStore.default().get_active() or "(none)"
@@ -2746,6 +2979,10 @@ def _render_chat_short_help() -> None:
         "- /runbook list: 查看 runbook 模板",
         "- /runbook show <name>: 查看 runbook 定义",
         "- /runbook render <name> [k=v]: 预览渲染后的 runbook 指令",
+        "- /runbook add <name> --title ... --instruction ... [--mode fix] [k=v]: 新增 runbook",
+        "- /runbook remove <name> [--yes]: 删除自定义 runbook",
+        "- /runbook export --output <file> [--scope custom|effective]: 导出 runbook",
+        "- /runbook import --input <file> [--merge|--replace]: 导入 runbook",
         "- /runbook <name> [k=v]: 执行 runbook（支持变量覆盖）",
         "- /report: 导出复盘报告",
         "- /fix <问题>: 进入修复计划模式",
@@ -2768,7 +3005,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
     typer.echo(
         "快捷命令：/help /status [/status probe] /doctor [/doctor fix] "
-        "/runbook [list|show|render|name] [k=v] /report /fix <问题> /apply /approve [steps] /memory [query]"
+        "/runbook [list|show|render|add|remove|export|import|name] [args] /report /fix <问题> /apply /approve [steps] /memory [query]"
     )
     while True:
         try:
@@ -2834,38 +3071,83 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower().startswith("/runbook"):
             tail = text[len("/runbook") :].strip()
-            if (not tail) or (tail.lower() in {"list", "ls"}):
-                runbook_list()
+            try:
+                command = _parse_chat_runbook_command(tail)
+            except ValueError as exc:
+                typer.echo(f"runbook 命令格式错误: {exc}")
                 continue
-            parts = [p for p in tail.split(" ") if p.strip()]
-            if not parts:
-                runbook_list()
+            action = str(command.get("action", ""))
+            if action == "list":
+                runbook_list(
+                    runbook_file=str(command.get("runbook_file", settings.runbook_store_file)),
+                    custom_only=bool(command.get("custom_only", False)),
+                )
                 continue
-            if parts[0].lower() in {"show", "render"} and len(parts) >= 2:
-                subcmd = parts[0].lower()
-                runbook_name = parts[1]
-                runbook_var_items = [item for item in parts[2:] if "=" in item]
-                runbook_extra = " ".join(item for item in parts[2:] if "=" not in item).strip()
-            else:
-                subcmd = "run"
-                runbook_name = parts[0]
-                runbook_var_items = [item for item in parts[1:] if "=" in item]
-                runbook_extra = " ".join(item for item in parts[1:] if "=" not in item).strip()
-            template = find_runbook(runbook_name, store=RunbookStore.default())
+            if action == "add":
+                try:
+                    runbook_add(
+                        name=str(command.get("name", "")),
+                        title=str(command.get("title", "")),
+                        instruction=str(command.get("instruction", "")),
+                        mode=str(command.get("mode", "diagnose")),
+                        description=str(command.get("description", "")),
+                        var=list(command.get("var_items", [])),
+                        runbook_file=str(command.get("runbook_file", settings.runbook_store_file)),
+                        force=bool(command.get("force", False)),
+                    )
+                except typer.BadParameter as exc:
+                    typer.echo(f"runbook add failed: {exc}")
+                continue
+            if action == "remove":
+                try:
+                    runbook_remove(
+                        name=str(command.get("name", "")),
+                        runbook_file=str(command.get("runbook_file", settings.runbook_store_file)),
+                        yes=bool(command.get("yes", False)),
+                    )
+                except typer.BadParameter as exc:
+                    typer.echo(f"runbook remove failed: {exc}")
+                continue
+            if action == "export":
+                try:
+                    runbook_export(
+                        output=str(command.get("output", "")),
+                        name=[str(x) for x in list(command.get("names", []))],
+                        scope=str(command.get("scope", "custom")),
+                        runbook_file=str(command.get("runbook_file", settings.runbook_store_file)),
+                    )
+                except typer.BadParameter as exc:
+                    typer.echo(f"runbook export failed: {exc}")
+                continue
+            if action == "import":
+                try:
+                    runbook_import(
+                        input_file=str(command.get("input_file", "")),
+                        merge=bool(command.get("merge", True)),
+                        runbook_file=str(command.get("runbook_file", settings.runbook_store_file)),
+                    )
+                except typer.BadParameter as exc:
+                    typer.echo(f"runbook import failed: {exc}")
+                continue
+
+            runbook_name = str(command.get("name", ""))
+            runbook_file = str(command.get("runbook_file", settings.runbook_store_file))
+            template = find_runbook(runbook_name, store=RunbookStore(Path(runbook_file)))
             if not template:
                 typer.echo(f"runbook not found: {runbook_name}")
                 continue
             try:
                 instruction = _prepare_runbook_instruction(
                     template=template,
-                    var_items=runbook_var_items,
-                    extra=runbook_extra,
+                    var_items=[str(x) for x in list(command.get("var_items", []))],
+                    extra=str(command.get("extra", "")),
                     profile_file=Path(settings.target_profile_file),
                 )
             except ValueError as exc:
                 typer.echo(str(exc))
                 continue
-            if subcmd == "show":
+
+            if action == "show":
                 payload = {
                     "name": template.name,
                     "title": template.title,
@@ -2877,7 +3159,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 }
                 typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
                 continue
-            if subcmd == "render":
+            if action == "render":
                 typer.echo(instruction)
                 continue
             _execute_runbook(

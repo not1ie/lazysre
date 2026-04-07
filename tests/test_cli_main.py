@@ -25,6 +25,8 @@ from lazysre.cli.main import (
     _resolve_runbook_vars,
     _target_runbook_context_vars,
     _prepare_runbook_instruction,
+    _parse_chat_runbook_command,
+    _parse_chat_runbook_var_extra,
     _should_launch_assistant,
 )
 from lazysre.cli.runbook import find_runbook
@@ -480,3 +482,48 @@ def test_prepare_runbook_instruction_includes_vars_and_extra(tmp_path: Path, mon
     assert "payments" in rendered
     assert "service=order" in rendered
     assert "[runbook-extra]" in rendered
+
+
+def test_parse_chat_runbook_var_extra() -> None:
+    vars_payload, extra = _parse_chat_runbook_var_extra(
+        ["service=pay", "--var", "namespace=prod", "只读检查", "--var=p95_ms=350"]
+    )
+    assert "service=pay" in vars_payload
+    assert "namespace=prod" in vars_payload
+    assert "p95_ms=350" in vars_payload
+    assert extra == "只读检查"
+
+
+def test_parse_chat_runbook_command_run_and_render() -> None:
+    parsed_run = _parse_chat_runbook_command("payment-latency-fix service=order namespace=prod")
+    assert parsed_run["action"] == "run"
+    assert parsed_run["name"] == "payment-latency-fix"
+
+    parsed_render = _parse_chat_runbook_command("render payment-latency-fix --var service=order")
+    assert parsed_render["action"] == "render"
+    assert parsed_render["name"] == "payment-latency-fix"
+    assert "service=order" in parsed_render["var_items"]
+
+
+def test_parse_chat_runbook_command_add_and_export_import_remove() -> None:
+    parsed_add = _parse_chat_runbook_command(
+        'add my-fix --title "My Fix" --instruction "check {service}" --mode fix service=pay --force'
+    )
+    assert parsed_add["action"] == "add"
+    assert parsed_add["name"] == "my-fix"
+    assert parsed_add["mode"] == "fix"
+    assert parsed_add["force"] is True
+    assert "service=pay" in parsed_add["var_items"]
+
+    parsed_export = _parse_chat_runbook_command("export --scope effective --name a --name b --output /tmp/x.json")
+    assert parsed_export["action"] == "export"
+    assert parsed_export["scope"] == "effective"
+    assert parsed_export["names"] == ["a", "b"]
+
+    parsed_import = _parse_chat_runbook_command("import --input /tmp/x.json --replace")
+    assert parsed_import["action"] == "import"
+    assert parsed_import["merge"] is False
+
+    parsed_remove = _parse_chat_runbook_command("remove my-fix --yes")
+    assert parsed_remove["action"] == "remove"
+    assert parsed_remove["yes"] is True
