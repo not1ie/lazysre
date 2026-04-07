@@ -58,6 +58,77 @@ def test_runbook_store_remove(tmp_path) -> None:
     assert store.get_custom("my-fix") is None
 
 
+def test_runbook_store_export_payload_custom_and_effective(tmp_path) -> None:
+    store = RunbookStore(tmp_path / "runbooks.json")
+    custom = RunbookTemplate(
+        name="team-latency",
+        title="Team Latency",
+        mode="diagnose",
+        instruction="check {service}",
+        description="team",
+        variables={"service": "api"},
+        source="custom",
+    )
+    store.upsert(custom)
+
+    custom_payload = store.export_payload(scope="custom")
+    assert custom_payload["scope"] == "custom"
+    assert "team-latency" in custom_payload["runbooks"]
+    assert "payment-latency-fix" not in custom_payload["runbooks"]
+
+    effective_payload = store.export_payload(scope="effective")
+    assert effective_payload["scope"] == "effective"
+    assert "team-latency" in effective_payload["runbooks"]
+    assert "payment-latency-fix" in effective_payload["runbooks"]
+
+
+def test_runbook_store_import_payload_merge_and_replace(tmp_path) -> None:
+    store = RunbookStore(tmp_path / "runbooks.json")
+    old = RunbookTemplate(
+        name="old-fix",
+        title="Old Fix",
+        mode="fix",
+        instruction="fix {service}",
+        description="old",
+        variables={"service": "a"},
+        source="custom",
+    )
+    store.upsert(old)
+
+    merge_payload = {
+        "version": 1,
+        "runbooks": {
+            "new-fix": {
+                "title": "New Fix",
+                "mode": "fix",
+                "instruction": "repair {service}",
+                "description": "new",
+                "variables": {"service": "b"},
+            }
+        },
+    }
+    merge_result = store.import_payload(merge_payload, merge=True)
+    assert merge_result["created"] == 1
+    assert store.get_custom("old-fix") is not None
+    assert store.get_custom("new-fix") is not None
+
+    replace_payload = {
+        "runbooks": {
+            "replace-fix": {
+                "title": "Replace Fix",
+                "mode": "diagnose",
+                "instruction": "inspect {service}",
+                "description": "replace",
+                "variables": {"service": "c"},
+            }
+        }
+    }
+    replace_result = store.import_payload(replace_payload, merge=False)
+    assert replace_result["total"] == 1
+    assert store.get_custom("replace-fix") is not None
+    assert store.get_custom("old-fix") is None
+
+
 def test_parse_vars_and_render_instruction() -> None:
     template = find_runbook("payment-latency-fix")
     assert template is not None

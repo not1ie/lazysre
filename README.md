@@ -66,6 +66,9 @@ lsre runbook run payment-latency-fix --apply --execute
 # 新增/覆盖自定义 runbook（可覆盖同名内置模板）
 lsre runbook add payment-latency-fix --title "支付延迟修复(增强版)" --mode fix --instruction "修复 {namespace} 的 {service}" --var namespace=prod --var service=payment --force
 lsre runbook remove payment-latency-fix --yes
+# 导入/导出 runbook（团队共享）
+lsre runbook export --scope custom --output .data/runbooks-share.json
+lsre runbook import --input .data/runbooks-share.json --merge
 
 # 多集群 Target Profiles
 lsre target profile save prod --activate

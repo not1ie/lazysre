@@ -145,6 +145,93 @@ class RunbookStore:
         self.save(payload)
         return True
 
+    def export_payload(
+        self,
+        *,
+        names: list[str] | None = None,
+        scope: str = "custom",  # custom | effective
+    ) -> dict[str, Any]:
+        selected_names = [x.strip().lower() for x in (names or []) if x.strip()]
+        effective_scope = scope.strip().lower() or "custom"
+        if effective_scope not in {"custom", "effective"}:
+            raise ValueError("scope must be custom or effective")
+
+        if effective_scope == "effective":
+            items = all_runbooks(store=self)
+        else:
+            items = self.list_custom()
+
+        selected: dict[str, Any] = {}
+        for item in items:
+            if selected_names and item.name not in selected_names:
+                continue
+            selected[item.name] = {
+                "title": item.title,
+                "mode": item.mode,
+                "instruction": item.instruction,
+                "description": item.description,
+                "variables": dict(item.variables),
+            }
+        return {
+            "version": 1,
+            "scope": effective_scope,
+            "runbooks": selected,
+        }
+
+    def import_payload(self, payload: dict[str, Any], *, merge: bool) -> dict[str, int]:
+        if not isinstance(payload, dict):
+            raise ValueError("invalid payload")
+        raw_runbooks = payload.get("runbooks", payload)
+        if not isinstance(raw_runbooks, dict):
+            raise ValueError("invalid payload: runbooks must be an object")
+
+        imported: dict[str, RunbookTemplate] = {}
+        skipped_invalid = 0
+        for raw_name, row in raw_runbooks.items():
+            name = str(raw_name).strip().lower()
+            if not name or (not isinstance(row, dict)):
+                skipped_invalid += 1
+                continue
+            item = _template_from_dict(name, row, source="custom")
+            if not item:
+                skipped_invalid += 1
+                continue
+            imported[name] = item
+
+        if not imported:
+            raise ValueError("no valid runbooks found in payload")
+
+        base: dict[str, RunbookTemplate] = {}
+        if merge:
+            for item in self.list_custom():
+                base[item.name] = item
+
+        created = 0
+        updated = 0
+        for name, item in imported.items():
+            previous = base.get(name)
+            if previous is None:
+                created += 1
+            elif asdict(previous) != asdict(item):
+                updated += 1
+            base[name] = item
+
+        output: dict[str, Any] = {"runbooks": {}}
+        for name in sorted(base.keys()):
+            row = asdict(base[name])
+            row.pop("name", None)
+            row.pop("source", None)
+            output["runbooks"][name] = row
+        self.save(output)
+
+        return {
+            "imported": len(imported),
+            "created": created,
+            "updated": updated,
+            "skipped_invalid": skipped_invalid,
+            "total": len(base),
+        }
+
 
 def all_runbooks(*, store: RunbookStore | None = None) -> list[RunbookTemplate]:
     merged: dict[str, RunbookTemplate] = {item.name: item for item in builtin_runbooks()}

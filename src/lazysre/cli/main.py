@@ -1399,6 +1399,56 @@ def runbook_remove(
     typer.echo(f"Removed runbook: {name}")
 
 
+@runbook_app.command("export")
+def runbook_export(
+    output: Annotated[str, typer.Option("--output", help="Export file path (.json).")] = "",
+    name: Annotated[list[str], typer.Option("--name", help="Runbook name filter. Can be repeated.")] = [],
+    scope: Annotated[str, typer.Option("--scope", help="Export scope: custom|effective")] = "custom",
+    runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
+) -> None:
+    store = RunbookStore(Path(runbook_file))
+    try:
+        payload = store.export_payload(names=list(name), scope=scope)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out_path = Path(output.strip() or f".data/lsre-runbooks-export-{stamp}.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    count = len(payload.get("runbooks", {})) if isinstance(payload.get("runbooks", {}), dict) else 0
+    typer.echo(f"Exported {count} runbooks -> {out_path}")
+
+
+@runbook_app.command("import")
+def runbook_import(
+    input_file: Annotated[str, typer.Option("--input", help="Import file path (.json).")],
+    merge: Annotated[bool, typer.Option("--merge/--replace", help="Merge into existing custom runbooks or replace all.")] = True,
+    runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
+) -> None:
+    in_path = Path(input_file)
+    if not in_path.exists():
+        raise typer.BadParameter(f"import file not found: {input_file}")
+    try:
+        raw = json.loads(in_path.read_text(encoding="utf-8"))
+    except Exception:
+        raise typer.BadParameter(f"import file is not valid json: {input_file}") from None
+    if not isinstance(raw, dict):
+        raise typer.BadParameter("import payload must be a JSON object")
+    store = RunbookStore(Path(runbook_file))
+    try:
+        result = store.import_payload(raw, merge=merge)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(
+        "Imported runbooks: "
+        f"imported={result.get('imported', 0)} "
+        f"created={result.get('created', 0)} "
+        f"updated={result.get('updated', 0)} "
+        f"skipped_invalid={result.get('skipped_invalid', 0)} "
+        f"total={result.get('total', 0)}"
+    )
+
+
 @runbook_app.command("run")
 def runbook_run(
     ctx: typer.Context,
