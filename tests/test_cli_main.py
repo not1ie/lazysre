@@ -20,10 +20,13 @@ from lazysre.cli.main import (
     _looks_like_apply_request,
     _looks_like_doctor_request,
     _looks_like_fix_request,
+    _looks_like_help_request,
     _looks_like_init_request,
     _looks_like_install_doctor_request,
     _looks_like_quickstart_request,
     _looks_like_report_request,
+    _looks_like_switch_dry_run_request,
+    _looks_like_switch_execute_request,
     _looks_like_status_request,
     _looks_like_template_library_request,
     _parse_step_selection,
@@ -154,6 +157,9 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_report_request("导出复盘报告")
     assert _looks_like_template_library_request("有哪些修复模板")
     assert _looks_like_quickstart_request("帮我修复环境")
+    assert _looks_like_help_request("你会什么")
+    assert _looks_like_switch_execute_request("切换到执行模式")
+    assert _looks_like_switch_dry_run_request("切回dry-run")
 
 
 def test_should_launch_assistant_with_only_options() -> None:

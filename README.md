@@ -79,7 +79,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /quickstart /init /login /setup /status /status probe /doctor [/doctor fix] [/doctor strict]
+# /help /mode /mode execute|dry-run /quickstart /init /login /setup /status /status probe /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
@@ -178,6 +178,7 @@ lsre memory search "payment latency" --limit 5
 - “导出复盘报告”
 - “一键修复 CrashLoopBackOff”
 - “修复环境”（会走 quickstart 自动修复）
+- “切换到执行模式” / “切回dry-run”
 
 执行策略：低风险命令默认自动执行；中高风险命令会弹出确认。
 

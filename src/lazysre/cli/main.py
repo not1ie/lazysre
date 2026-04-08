@@ -4015,6 +4015,8 @@ def _render_chat_short_help() -> None:
     lines = [
         "LazySRE Chat 快捷命令",
         "- /help: 查看帮助",
+        "- /mode: 查看当前执行模式（dry-run/execute）",
+        "- /mode execute|dry-run: 切换执行模式",
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
         "- /quickstart: 一键自动修复环境并完成快速就绪",
         "- /login: 仅保存 OpenAI API Key",
@@ -4059,6 +4061,8 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("不需要记命令，直接用自然语言说你想做什么。")
     _maybe_auto_bootstrap_on_first_chat(options)
     _maybe_offer_one_click_env_fix(options)
+    runtime_execute = bool(options["execute"])
+    _render_mode_hint(runtime_execute)
     while True:
         try:
             line = typer.prompt("lsre")
@@ -4070,10 +4074,36 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower() in {"exit", "quit"}:
             break
-        if (not text.startswith("/")) and _handle_natural_intent(text, options):
+        if _looks_like_help_request(text):
+            _render_chat_short_help()
+            continue
+        if _looks_like_switch_execute_request(text):
+            runtime_execute = True
+            _render_mode_hint(runtime_execute)
+            continue
+        if _looks_like_switch_dry_run_request(text):
+            runtime_execute = False
+            _render_mode_hint(runtime_execute)
+            continue
+        if (not text.startswith("/")) and _handle_natural_intent(text, options, runtime_execute):
             continue
         if text.lower() in {"/help", "/h"}:
             _render_chat_short_help()
+            continue
+        if text.lower() in {"/mode", "/mode show"}:
+            _render_mode_hint(runtime_execute)
+            continue
+        if text.lower().startswith("/mode "):
+            tail = text[len("/mode ") :].strip().lower()
+            if tail in {"execute", "exec", "on", "real"}:
+                runtime_execute = True
+                _render_mode_hint(runtime_execute)
+                continue
+            if tail in {"dry-run", "dryrun", "preview", "off"}:
+                runtime_execute = False
+                _render_mode_hint(runtime_execute)
+                continue
+            typer.echo("用法：/mode execute 或 /mode dry-run")
             continue
         if text.lower().startswith("/login"):
             login(api_key="", secrets_file="")
@@ -4339,7 +4369,11 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 max_apply_steps=int(parsed.get("max_apply_steps", 6)),
                 allow_high_risk=bool(parsed.get("allow_high_risk", False)),
                 auto_approve_low_risk=bool(parsed.get("auto_approve_low_risk", False)),
-                execute=bool(options["execute"]),
+                execute=_resolve_execute_for_apply_request(
+                    runtime_execute,
+                    label="模板修复执行",
+                    apply=bool(parsed.get("apply", False)),
+                ),
                 approval_mode=str(options["approval_mode"]),
                 audit_log=str(options["audit_log"]),
                 model=str(options["model"]),
@@ -4356,7 +4390,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             tail = text[len("/approve") :].strip()
             _approve_last_fix_plan(
                 steps=tail,
-                execute=bool(options["execute"]),
+                execute=runtime_execute,
                 approval_mode=str(options["approval_mode"]),
                 audit_log=str(options["audit_log"]),
                 allow_high_risk=False,
@@ -4383,7 +4417,11 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
         if text.lower() in {"/apply", "/apply-last"}:
             _apply_last_fix_plan(
                 max_apply_steps=6,
-                execute=bool(options["execute"]),
+                execute=_resolve_execute_for_apply_request(
+                    runtime_execute,
+                    label="执行最近修复计划",
+                    apply=True,
+                ),
                 approval_mode=str(options["approval_mode"]),
                 audit_log=str(options["audit_log"]),
                 model=str(options["model"]),
@@ -4396,7 +4434,11 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
         if _looks_like_apply_request(text):
             _apply_last_fix_plan(
                 max_apply_steps=6,
-                execute=bool(options["execute"]),
+                execute=_resolve_execute_for_apply_request(
+                    runtime_execute,
+                    label="执行最近修复计划",
+                    apply=True,
+                ),
                 approval_mode=str(options["approval_mode"]),
                 audit_log=str(options["audit_log"]),
                 model=str(options["model"]),
@@ -4431,7 +4473,11 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                         max_apply_steps=6,
                         allow_high_risk=True,
                         auto_approve_low_risk=True,
-                        execute=bool(options["execute"]),
+                        execute=_resolve_execute_for_apply_request(
+                            runtime_execute,
+                            label=f"一键修复模板 {template_candidate.name}",
+                            apply=True,
+                        ),
                         approval_mode=str(options["approval_mode"]),
                         audit_log=str(options["audit_log"]),
                         model=str(options["model"]),
@@ -4451,7 +4497,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 auto_approve_low_risk=False,
                 export_plan_md="",
                 export_plan_json="",
-                execute=bool(options["execute"]),
+                execute=runtime_execute,
                 approve=bool(options["approve"]),
                 interactive_approval=bool(options["interactive_approval"]),
                 stream_output=bool(options["stream_output"]),
@@ -4472,7 +4518,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
 
         _run_once(
             instruction=text,
-            execute=bool(options["execute"]),
+            execute=runtime_execute,
             approve=bool(options["approve"]),
             interactive_approval=bool(options["interactive_approval"]),
             stream_output=bool(options["stream_output"]),
@@ -4491,7 +4537,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
         )
 
 
-def _handle_natural_intent(text: str, options: dict[str, object]) -> bool:
+def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: bool) -> bool:
     lowered = text.lower().strip()
     if not lowered:
         return False
@@ -4591,7 +4637,11 @@ def _handle_natural_intent(text: str, options: dict[str, object]) -> bool:
             max_apply_steps=6,
             allow_high_risk=True,
             auto_approve_low_risk=True,
-            execute=bool(options["execute"]),
+            execute=_resolve_execute_for_apply_request(
+                execute_mode,
+                label=f"自然语言模板修复 {template_candidate.name}",
+                apply=apply_requested,
+            ),
             approval_mode=str(options["approval_mode"]),
             audit_log=str(options["audit_log"]),
             model=str(options["model"]),
@@ -5101,6 +5151,67 @@ def _parse_step_selection(raw: str, *, max_step: int) -> set[int]:
         if 1 <= idx <= max_step:
             selected.add(idx)
     return selected
+
+
+def _render_mode_hint(execute_mode: bool) -> None:
+    mode = "execute" if execute_mode else "dry-run"
+    detail = "真实执行" if execute_mode else "仅预演，不改线上"
+    typer.echo(f"当前模式: {mode} ({detail})")
+
+
+def _resolve_execute_for_apply_request(execute_mode: bool, *, label: str, apply: bool) -> bool:
+    if not apply:
+        return execute_mode
+    if execute_mode:
+        return True
+    if not _stdin_interactive():
+        return False
+    try:
+        promote = typer.confirm(
+            f"{label}: 当前是 dry-run，是否切换为 execute 真实执行？",
+            default=False,
+        )
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return bool(promote)
+
+
+def _looks_like_help_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if lowered in {"/help", "/h", "help"}:
+        return True
+    keywords = (
+        "你会什么",
+        "怎么用",
+        "帮助",
+        "help me",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_switch_execute_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    keywords = (
+        "切换到执行模式",
+        "进入执行模式",
+        "开始真实执行",
+        "switch to execute",
+        "enable execute",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_switch_dry_run_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    keywords = (
+        "切换到预演模式",
+        "切回dry-run",
+        "只预演",
+        "不要真实执行",
+        "switch to dry-run",
+        "disable execute",
+    )
+    return any(k in lowered for k in keywords)
 
 
 def _looks_like_status_request(text: str) -> bool:
