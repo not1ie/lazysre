@@ -443,6 +443,27 @@ def quickstart(
     _render_setup_report(report)
 
 
+@app.command("reset")
+def reset(
+    reset_onboarding: Annotated[bool, typer.Option("--onboarding/--no-onboarding", help="Reset onboarding marker.")] = True,
+    reset_chat_mode: Annotated[bool, typer.Option("--chat-mode/--no-chat-mode", help="Reset persisted chat execute/dry-run mode.")] = True,
+    reset_session: Annotated[bool, typer.Option("--session/--no-session", help="Clear chat history session turns.")] = False,
+    session_file: Annotated[str, typer.Option("--session-file", help="Session memory file path.")] = ".data/lsre-session.json",
+) -> None:
+    changed: list[str] = []
+    if reset_onboarding and _remove_file_if_exists(Path(settings.data_dir) / "lsre-onboarding.json"):
+        changed.append("onboarding")
+    if reset_chat_mode and _remove_file_if_exists(_chat_state_file()):
+        changed.append("chat-mode")
+    if reset_session:
+        SessionStore(Path(session_file)).clear()
+        changed.append("session")
+    if changed:
+        typer.echo(f"reset done: {', '.join(changed)}")
+        return
+    typer.echo("nothing to reset.")
+
+
 @app.command("setup")
 def setup(
     ctx: typer.Context,
@@ -3351,11 +3372,49 @@ def _show_first_run_setup_hint_once() -> None:
     typer.echo("首次使用建议运行 /quickstart 一键就绪（或 /init 交互引导）。")
 
 
+def _chat_state_file() -> Path:
+    return Path(settings.data_dir) / "lsre-chat-state.json"
+
+
+def _load_chat_runtime_state(default_execute: bool) -> bool:
+    path = _chat_state_file()
+    if not path.exists():
+        return default_execute
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default_execute
+    if not isinstance(payload, dict):
+        return default_execute
+    return bool(payload.get("execute_mode", default_execute))
+
+
+def _save_chat_runtime_state(execute_mode: bool) -> None:
+    path = _chat_state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"execute_mode": bool(execute_mode)}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _remove_file_if_exists(path: Path) -> bool:
+    try:
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+    except Exception:
+        return False
+
+
 def _maybe_auto_bootstrap_on_first_chat(options: dict[str, object]) -> None:
     marker = Path(settings.data_dir) / "lsre-onboarding.json"
     if marker.exists():
         return
     _show_first_run_setup_hint_once()
+    if not _stdin_interactive():
+        return
     try:
         wants = typer.confirm("检测到首次使用，是否现在开始 30 秒初始化？", default=True)
     except (EOFError, KeyboardInterrupt):
@@ -4017,6 +4076,7 @@ def _render_chat_short_help() -> None:
         "- /help: 查看帮助",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
+        "- /reset: 重置引导与聊天模式记忆",
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
         "- /quickstart: 一键自动修复环境并完成快速就绪",
         "- /login: 仅保存 OpenAI API Key",
@@ -4061,7 +4121,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("不需要记命令，直接用自然语言说你想做什么。")
     _maybe_auto_bootstrap_on_first_chat(options)
     _maybe_offer_one_click_env_fix(options)
-    runtime_execute = bool(options["execute"])
+    runtime_execute = _load_chat_runtime_state(bool(options["execute"]))
     _render_mode_hint(runtime_execute)
     while True:
         try:
@@ -4079,10 +4139,12 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if _looks_like_switch_execute_request(text):
             runtime_execute = True
+            _save_chat_runtime_state(runtime_execute)
             _render_mode_hint(runtime_execute)
             continue
         if _looks_like_switch_dry_run_request(text):
             runtime_execute = False
+            _save_chat_runtime_state(runtime_execute)
             _render_mode_hint(runtime_execute)
             continue
         if (not text.startswith("/")) and _handle_natural_intent(text, options, runtime_execute):
@@ -4097,13 +4159,20 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             tail = text[len("/mode ") :].strip().lower()
             if tail in {"execute", "exec", "on", "real"}:
                 runtime_execute = True
+                _save_chat_runtime_state(runtime_execute)
                 _render_mode_hint(runtime_execute)
                 continue
             if tail in {"dry-run", "dryrun", "preview", "off"}:
                 runtime_execute = False
+                _save_chat_runtime_state(runtime_execute)
                 _render_mode_hint(runtime_execute)
                 continue
             typer.echo("用法：/mode execute 或 /mode dry-run")
+            continue
+        if text.lower().startswith("/reset"):
+            reset(reset_onboarding=True, reset_chat_mode=True, reset_session=False, session_file=str(options["session_file"]))
+            runtime_execute = _load_chat_runtime_state(bool(options["execute"]))
+            _render_mode_hint(runtime_execute)
             continue
         if text.lower().startswith("/login"):
             login(api_key="", secrets_file="")
@@ -4541,6 +4610,14 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
     lowered = text.lower().strip()
     if not lowered:
         return False
+    if _looks_like_reset_request(text):
+        reset(
+            reset_onboarding=True,
+            reset_chat_mode=True,
+            reset_session=False,
+            session_file=str(options["session_file"]),
+        )
+        return True
     if _looks_like_quickstart_request(text):
         report = _run_quickstart(
             profile_file=Path(settings.target_profile_file),
@@ -5214,6 +5291,19 @@ def _looks_like_switch_dry_run_request(text: str) -> bool:
     return any(k in lowered for k in keywords)
 
 
+def _looks_like_reset_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "重置",
+        "重置引导",
+        "重新开始",
+        "reset",
+    )
+    return any(k in lowered for k in keywords)
+
+
 def _looks_like_status_request(text: str) -> bool:
     lowered = text.lower().strip()
     if not lowered:
@@ -5525,6 +5615,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "logout",
         "init",
         "quickstart",
+        "reset",
         "fix",
         "approve",
         "status",
@@ -5580,6 +5671,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "logout",
         "init",
         "quickstart",
+        "reset",
         "fix",
         "approve",
         "status",
