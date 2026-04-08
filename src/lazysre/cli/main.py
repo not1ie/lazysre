@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import get_close_matches
 import json
 import re
 import shlex
@@ -10,6 +11,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from string import Formatter
 from typing import Annotated
 
 import typer
@@ -1815,9 +1817,16 @@ def runbook_run(
         max_steps=max_steps,
     )
     try:
+        var_items = _compose_runbook_var_items(
+            template=template,
+            text=" ".join([extra] + [str(x) for x in list(var)]),
+            options=options,
+            base_items=list(var),
+            profile_file=Path(settings.target_profile_file),
+        )
         instruction = _prepare_runbook_instruction(
             template=template,
-            var_items=list(var),
+            var_items=var_items,
             extra=extra,
             profile_file=Path(settings.target_profile_file),
         )
@@ -1843,9 +1852,16 @@ def runbook_render(
     if not template:
         raise typer.BadParameter(f"runbook not found: {name}")
     try:
+        var_items = _compose_runbook_var_items(
+            template=template,
+            text=" ".join([extra] + [str(x) for x in list(var)]),
+            options={"session_file": ".data/lsre-session.json"},
+            base_items=list(var),
+            profile_file=Path(settings.target_profile_file),
+        )
         resolved = _resolve_runbook_vars(
             template=template,
-            var_items=list(var),
+            var_items=var_items,
             profile_file=Path(settings.target_profile_file),
         )
     except ValueError as exc:
@@ -1864,6 +1880,133 @@ def runbook_render(
         typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
         return
     _console.print(Panel(rendered, title=f"Runbook Render: {template.name}", border_style="cyan"))
+
+
+def _runbook_placeholder_keys(template: RunbookTemplate) -> set[str]:
+    return {
+        str(field_name).strip()
+        for _, field_name, _, _ in Formatter().parse(template.instruction)
+        if str(field_name or "").strip()
+    }
+
+
+def _extract_runbook_var_items_from_text(text: str, *, allowed_keys: set[str]) -> list[str]:
+    lowered = str(text or "").lower()
+    found: dict[str, str] = {}
+
+    base_items = _extract_template_var_items_from_text(text)
+    for item in base_items:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        k = key.strip()
+        v = value.strip()
+        if (not k) or (not v) or (k not in allowed_keys):
+            continue
+        found[k] = v
+
+    for key, value in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*([^\s,;，；]+)", str(text or "")):
+        k = str(key).strip()
+        v = str(value).strip()
+        if (not k) or (not v) or (k not in allowed_keys):
+            continue
+        found[k] = v
+
+    if ("service" in allowed_keys) and ("service" not in found):
+        service_before_cn = re.search(r"\b([a-z0-9-]{2,40})\s*服务\b", lowered)
+        if service_before_cn:
+            candidate = str(service_before_cn.group(1)).strip()
+            if not re.fullmatch(r"p\d{2,3}(?:ms)?", candidate):
+                found["service"] = candidate
+
+    if ("p95_ms" in allowed_keys) and ("p95_ms" not in found):
+        match = re.search(r"p95(?:\s*阈值|阈值|目标)?\s*(?:[:=为到是]?\s*)?(\d{2,5})\s*ms?", lowered)
+        if match:
+            found["p95_ms"] = str(match.group(1))
+    if ("p99_ms" in allowed_keys) and ("p99_ms" not in found):
+        match = re.search(r"p99(?:\s*阈值|阈值|目标)?\s*(?:[:=为到是]?\s*)?(\d{2,5})\s*ms?", lowered)
+        if match:
+            found["p99_ms"] = str(match.group(1))
+    if ("replicas" in allowed_keys) and ("replicas" not in found):
+        replicas = _extract_requested_replicas(text)
+        if replicas > 0:
+            found["replicas"] = str(replicas)
+
+    preferred = ["namespace", "service", "workload", "pod", "container", "image", "replicas", "p95_ms", "p99_ms"]
+    out: list[str] = []
+    for key in preferred:
+        if key in found:
+            out.append(f"{key}={found[key]}")
+    for key in sorted(found.keys()):
+        if key in preferred:
+            continue
+        out.append(f"{key}={found[key]}")
+    return out
+
+
+def _compose_runbook_var_items(
+    *,
+    template: RunbookTemplate,
+    text: str,
+    options: dict[str, object],
+    base_items: list[str] | None = None,
+    profile_file: Path,
+) -> list[str]:
+    merged: dict[str, str] = {}
+    if base_items:
+        merged.update(parse_runbook_vars(base_items))
+
+    allowed_keys = _runbook_placeholder_keys(template) | set(template.variables.keys())
+    common_keys = {"namespace", "service", "workload", "pod", "container", "image", "replicas", "p95_ms", "p99_ms"}
+    allowed_keys = {k for k in (allowed_keys | common_keys) if str(k).strip()}
+
+    for item in _extract_runbook_var_items_from_text(text, allowed_keys=allowed_keys):
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        k = key.strip()
+        v = value.strip()
+        if (not k) or (not v) or (k in merged) or (k not in allowed_keys):
+            continue
+        merged[k] = v
+
+    context_vars = _target_runbook_context_vars(profile_file=profile_file)
+    for key, value in context_vars.items():
+        k = str(key).strip()
+        v = str(value).strip()
+        if (not k) or (not v) or (k in merged) or (k not in allowed_keys):
+            continue
+        merged[k] = v
+
+    session_file = Path(str(options.get("session_file", ".data/lsre-session.json")))
+    try:
+        entities = SessionStore(session_file).entities()
+    except Exception:
+        entities = {}
+    fallback_map = {
+        "namespace": str(entities.get("last_namespace", "")).strip(),
+        "service": str(entities.get("last_service", "")).strip(),
+        "pod": str(entities.get("last_pod", "")).strip(),
+    }
+    for key, value in fallback_map.items():
+        if key in merged or key not in allowed_keys or (not value):
+            continue
+        merged[key] = value
+    if ("workload" in allowed_keys) and ("workload" not in merged) and merged.get("service"):
+        merged["workload"] = f"deploy/{merged['service']}"
+
+    preferred = ["namespace", "service", "workload", "pod", "container", "image", "replicas", "p95_ms", "p99_ms"]
+    out: list[str] = []
+    for key in preferred:
+        if key in merged and str(merged[key]).strip():
+            out.append(f"{key}={merged[key]}")
+    for key in sorted(merged.keys()):
+        if key in preferred:
+            continue
+        value = str(merged[key]).strip()
+        if value:
+            out.append(f"{key}={value}")
+    return out
 
 
 def _target_runbook_context_vars(*, profile_file: Path) -> dict[str, str]:
@@ -4116,6 +4259,7 @@ def _render_chat_short_help() -> None:
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
+        "- 输入容错：/quikstart /stauts /templete 会自动纠正",
         "- 自然语言目标配置：把 namespace 设成 prod / 把 prometheus 设成 http://x:9090",
         "- 自然语言多集群：保存当前为 prod 并切换 / 切到 prod 集群 / 看看当前profile",
         "- 自然语言档案管理：导出profile到 .data/p.json / 从 .data/p.json 导入profile / 删除profile prod（需确认）",
@@ -4163,10 +4307,96 @@ def _render_chat_short_help() -> None:
         typer.echo(text)
 
 
+def _normalize_natural_language_text(text: str) -> str:
+    normalized = str(text or "")
+    replacements = [
+        (r"\bquikstart\b", "quickstart"),
+        (r"\bquick[-_\s]?start\b", "quickstart"),
+        (r"\bstauts\b", "status"),
+        (r"\bstaus\b", "status"),
+        (r"\btemplete\b", "template"),
+        (r"\btemplte\b", "template"),
+        (r"\brunbok\b", "runbook"),
+        (r"\baprove\b", "approve"),
+        (r"\bmemroy\b", "memory"),
+    ]
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    normalized = normalized.replace("模版", "模板")
+    return normalized
+
+
+def _normalize_slash_command_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if (not raw) or (not raw.startswith("/")):
+        return raw
+    parts = raw.split(maxsplit=1)
+    head = parts[0]
+    tail = parts[1] if len(parts) > 1 else ""
+    command = head[1:].strip().lower()
+    if not command:
+        return raw
+    aliases = {
+        "qs": "quickstart",
+        "quick-start": "quickstart",
+        "quikstart": "quickstart",
+        "stauts": "status",
+        "staus": "status",
+        "templete": "template",
+        "templte": "template",
+        "runbok": "runbook",
+        "aprove": "approve",
+        "memroy": "memory",
+        "hepl": "help",
+    }
+    known = [
+        "help",
+        "h",
+        "mode",
+        "context",
+        "ctx",
+        "reset",
+        "login",
+        "init",
+        "quickstart",
+        "setup",
+        "status",
+        "doctor",
+        "runbook",
+        "report",
+        "template",
+        "fix",
+        "approve",
+        "undo",
+        "memory",
+        "apply",
+    ]
+    corrected = aliases.get(command, "")
+    if not corrected:
+        match = get_close_matches(command, known, n=1, cutoff=0.78)
+        if match:
+            corrected = match[0]
+    if (not corrected) or (corrected == command):
+        return raw
+    if tail:
+        return f"/{corrected} {tail}"
+    return f"/{corrected}"
+
+
+def _normalize_chat_input_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    if raw.startswith("/"):
+        return _normalize_slash_command_text(raw)
+    return _normalize_natural_language_text(raw)
+
+
 def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("LazySRE 已启动，直接说需求即可（输入 exit/quit 退出）。")
     typer.echo("示例：1) 帮我排查 payment 延迟 2) 一键修复 CrashLoopBackOff")
     typer.echo("不需要记命令，直接用自然语言说你想做什么。")
+    typer.echo("快速上手：检查状态 / 修复环境 / 看审批队列 / 保存当前为 prod 并切换")
     _maybe_auto_bootstrap_on_first_chat(options)
     _maybe_offer_one_click_env_fix(options)
     runtime_execute = _load_chat_runtime_state(bool(options["execute"]))
@@ -4180,6 +4410,10 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
         text = line.strip()
         if not text:
             continue
+        normalized_text = _normalize_chat_input_text(text)
+        if normalized_text != text:
+            typer.echo(f"已自动纠正输入：{normalized_text}")
+            text = normalized_text
         if text.lower() in {"exit", "quit"}:
             break
         if _looks_like_help_request(text):
@@ -4397,9 +4631,17 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 typer.echo(f"runbook not found: {runbook_name}")
                 continue
             try:
+                base_var_items = [str(x) for x in list(command.get("var_items", []))]
+                auto_var_items = _compose_runbook_var_items(
+                    template=template,
+                    text=" ".join([text, str(command.get("extra", ""))] + base_var_items),
+                    options=options,
+                    base_items=base_var_items,
+                    profile_file=Path(settings.target_profile_file),
+                )
                 instruction = _prepare_runbook_instruction(
                     template=template,
-                    var_items=[str(x) for x in list(command.get("var_items", []))],
+                    var_items=auto_var_items,
                     extra=str(command.get("extra", "")),
                     profile_file=Path(settings.target_profile_file),
                 )
@@ -6318,6 +6560,17 @@ def _extract_template_var_items_from_text(text: str) -> list[str]:
             flags=re.IGNORECASE,
         ):
             set_if(key, match.group(1))
+        for match in re.finditer(
+            rf"\b{re.escape(key)}\s+([a-z0-9][a-z0-9._/-]*)\b",
+            lowered,
+            flags=re.IGNORECASE,
+        ):
+            candidate = str(match.group(1)).strip().lower()
+            if candidate in {"is", "to", "for", "the", "and", "or", "in", "of"}:
+                continue
+            if re.fullmatch(r"p\d{2,3}(?:ms)?", candidate):
+                continue
+            set_if(key, candidate)
 
     ns_short = re.search(r"(?:^|\s)-n\s+([a-z0-9-]+)\b", lowered)
     if ns_short:
@@ -6328,6 +6581,9 @@ def _extract_template_var_items_from_text(text: str) -> list[str]:
     ns_cn = re.search(r"命名空间\s*[:：]?\s*([a-z0-9-]+)\b", lowered)
     if ns_cn:
         set_if("namespace", ns_cn.group(1))
+    ns_alias = re.search(r"\bns\s*[:=]?\s*([a-z0-9-]+)\b", lowered)
+    if ns_alias:
+        set_if("namespace", ns_alias.group(1))
 
     workload_slash = re.search(r"\b(deploy/[a-z0-9-]+)\b", lowered)
     if workload_slash:
@@ -6338,7 +6594,12 @@ def _extract_template_var_items_from_text(text: str) -> list[str]:
 
     service_cn = re.search(r"服务\s*[:：]?\s*([a-z0-9-]+)\b", lowered)
     if service_cn and ("service" not in found):
-        set_if("service", service_cn.group(1))
+        candidate = str(service_cn.group(1)).strip().lower()
+        if not re.fullmatch(r"p\d{2,3}(?:ms)?", candidate):
+            set_if("service", candidate)
+    svc_alias = re.search(r"\bsvc\s*[:=]?\s*([a-z0-9-]+)\b", lowered)
+    if svc_alias and ("service" not in found):
+        set_if("service", svc_alias.group(1))
     pod_cn = re.search(r"pod\s*[:：]?\s*([a-z0-9][-a-z0-9.]*)", lowered)
     if pod_cn and ("pod" not in found):
         set_if("pod", pod_cn.group(1))

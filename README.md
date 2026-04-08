@@ -188,6 +188,7 @@ lsre memory search "payment latency" --limit 5
 - “把 namespace 设成 prod / 把 prometheus 设成 http://92.168.69.176:9090 / 查看目标配置”
 - “保存当前为 prod 并切换 / 切到 prod 集群 / 看看当前profile / 列出所有profile”
 - “导出profile到 .data/profiles.json / 从 .data/profiles.json 导入profile / 删除profile prod（会二次确认）”
+- “/quikstart /stauts /templete” 会自动纠错；runbook 会从文本和会话自动补全变量（如 namespace/service/p95）
 
 聊天模式会记住你上次选择的执行模式（execute/dry-run），下次启动自动沿用。
 一键修复时会自动从输入文本和会话记忆补全参数（如 namespace/pod/workload）。

@@ -24,11 +24,16 @@ from lazysre.cli.main import (
     _extract_profile_remove_request,
     _extract_profile_export_request,
     _extract_profile_import_request,
+    _extract_runbook_var_items_from_text,
     _extract_command_candidates,
     _extract_named_field,
     _compose_template_var_items,
+    _compose_runbook_var_items,
     _build_quick_k8s_action_plan,
     _extract_requested_replicas,
+    _normalize_chat_input_text,
+    _normalize_natural_language_text,
+    _normalize_slash_command_text,
     _looks_like_auto_fix_request,
     _looks_like_apply_request,
     _looks_like_approval_queue_request,
@@ -220,6 +225,14 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_target_profile_remove_request("删除profile prod")
     assert _looks_like_target_profile_export_request("导出profile到 .data/p.json")
     assert _looks_like_target_profile_import_request("从 .data/p.json 导入profile")
+
+
+def test_normalize_chat_input_text() -> None:
+    assert _normalize_slash_command_text("/quikstart") == "/quickstart"
+    assert _normalize_slash_command_text("/stauts probe") == "/status probe"
+    assert _normalize_natural_language_text("请看模版库") == "请看模板库"
+    assert _normalize_chat_input_text("/templete list") == "/template list"
+    assert _normalize_chat_input_text("quikstart 一下") == "quickstart 一下"
 
 
 def test_extract_apply_step_selection() -> None:
@@ -757,6 +770,56 @@ def test_prepare_runbook_instruction_includes_vars_and_extra(tmp_path: Path, mon
     assert "payments" in rendered
     assert "service=order" in rendered
     assert "[runbook-extra]" in rendered
+
+
+def test_extract_runbook_var_items_from_text() -> None:
+    items = _extract_runbook_var_items_from_text(
+        "payment 服务 p95 450ms namespace prod",
+        allowed_keys={"service", "p95_ms", "namespace", "target_profile"},
+    )
+    assert "service=payment" in items
+    assert "p95_ms=450" in items
+    assert "namespace=prod" in items
+
+
+def test_compose_runbook_var_items_auto_fill(tmp_path: Path, monkeypatch) -> None:
+    target_file = tmp_path / "target.json"
+    target_file.write_text(
+        json.dumps(
+            {
+                "prometheus_url": "http://127.0.0.1:9090",
+                "k8s_api_url": "https://127.0.0.1:6443",
+                "k8s_context": "dev",
+                "k8s_namespace": "payments",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    session_file = tmp_path / "session.json"
+    session_file.write_text(
+        json.dumps(
+            {
+                "turns": [],
+                "entities": {"last_service": "checkout", "last_namespace": "ops"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("lazysre.cli.main.ClusterProfileStore.default", lambda: type("X", (), {"get_active": lambda self: "prod"})())
+    template = find_runbook("payment-latency-fix")
+    assert template is not None
+    items = _compose_runbook_var_items(
+        template=template,
+        text="请排查服务 payment，目标 p95 420ms",
+        options={"session_file": str(session_file)},
+        base_items=[],
+        profile_file=target_file,
+    )
+    assert "service=payment" in items
+    assert "p95_ms=420" in items
+    assert "namespace=payments" in items
 
 
 def test_parse_chat_runbook_var_extra() -> None:
