@@ -4148,6 +4148,7 @@ def _render_chat_short_help() -> None:
         "- /approve: 查看审批队列",
         "- /approve 1,3-4: 执行指定步骤",
         "- 自然语言审批：看审批队列 / 执行第1步 / 执行步骤:1,3-4",
+        "- 自然语言策略：先只跑只读步骤再执行写操作 / 解释第2步为什么执行",
         "- /memory: 查看最近故障记忆",
         "- /memory <query>: 检索相似历史案例",
         "- exit / quit: 退出",
@@ -4580,10 +4581,36 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             )
             continue
 
+        if _looks_like_explain_step_request(text):
+            _explain_last_fix_plan_steps(
+                text=text,
+                approval_mode=str(options["approval_mode"]),
+                model=str(options["model"]),
+                provider=str(options["provider"]),
+            )
+            continue
+
         if _looks_like_apply_request(text):
             selected_steps = _extract_apply_step_selection(text)
             low_risk_only = _looks_like_low_risk_apply_request(text)
             force_high_risk = _looks_like_force_high_risk_apply_request(text)
+            read_then_write = _looks_like_read_then_write_strategy_request(text)
+            if read_then_write:
+                _apply_last_fix_plan_read_then_write(
+                    steps=selected_steps,
+                    execute=_resolve_execute_for_apply_request(
+                        runtime_execute,
+                        label="执行修复计划写操作阶段",
+                        apply=True,
+                    ),
+                    approval_mode=str(options["approval_mode"]),
+                    audit_log=str(options["audit_log"]),
+                    model=str(options["model"]),
+                    provider=str(options["provider"]),
+                    allow_high_risk=bool((not low_risk_only) or force_high_risk),
+                    auto_approve_low_risk=True,
+                )
+                continue
             if selected_steps:
                 _approve_last_fix_plan(
                     steps=selected_steps,
@@ -5178,6 +5205,194 @@ def _apply_last_fix_plan(
         typer.echo("\n可回滚命令：")
         for cmd in plan.rollback_commands:
             typer.echo(f"- {cmd}")
+
+
+def _select_fix_plan_steps(plan: FixPlan, steps: str) -> FixPlan | None:
+    normalized = str(steps or "").strip()
+    if not normalized:
+        return plan
+    selected_indexes = _parse_step_selection(normalized, max_step=len(plan.apply_commands))
+    if not selected_indexes:
+        typer.echo("未解析到可执行步骤。示例：1,3-4")
+        return None
+    selected_cmds = [plan.apply_commands[idx - 1] for idx in sorted(selected_indexes)]
+    if not selected_cmds:
+        typer.echo("所选步骤没有可执行命令。")
+        return None
+    return FixPlan(apply_commands=selected_cmds, rollback_commands=plan.rollback_commands)
+
+
+def _split_fix_plan_read_write_commands(plan: FixPlan, *, approval_mode: str) -> tuple[list[str], list[str]]:
+    read_only: list[str] = []
+    writes: list[str] = []
+    for command_text in plan.apply_commands:
+        token = str(command_text or "").strip()
+        if not token:
+            continue
+        try:
+            command = shlex.split(token)
+        except ValueError:
+            writes.append(token)
+            continue
+        if not command:
+            continue
+        decision = assess_command(command, approval_mode=approval_mode)
+        if decision.risk_level == "low":
+            read_only.append(token)
+        else:
+            writes.append(token)
+    return read_only, writes
+
+
+def _apply_last_fix_plan_read_then_write(
+    *,
+    steps: str,
+    execute: bool,
+    approval_mode: str,
+    audit_log: str,
+    model: str,
+    provider: str,
+    allow_high_risk: bool,
+    auto_approve_low_risk: bool,
+) -> None:
+    plan = _load_last_fix_plan()
+    if not plan:
+        return
+    selected_plan = _select_fix_plan_steps(plan, steps)
+    if not selected_plan:
+        return
+    read_only_cmds, write_cmds = _split_fix_plan_read_write_commands(selected_plan, approval_mode=approval_mode)
+    if not read_only_cmds and not write_cmds:
+        typer.echo("最近修复计划没有可执行命令。")
+        return
+
+    if read_only_cmds:
+        typer.echo("阶段 1/2：先执行只读步骤（实时取证）")
+        _execute_fix_plan_steps(
+            plan=FixPlan(apply_commands=read_only_cmds, rollback_commands=[]),
+            max_apply_steps=len(read_only_cmds),
+            execute=True,
+            approval_mode=approval_mode,
+            audit_log=audit_log,
+            allow_high_risk=True,
+            auto_approve_low_risk=True,
+            model=model,
+            provider=provider,
+            skip_confirm=True,
+        )
+    else:
+        typer.echo("阶段 1/2：没有只读步骤，跳过。")
+
+    if not write_cmds:
+        typer.echo("阶段 2/2：没有写操作步骤，流程完成。")
+        return
+    typer.echo("阶段 2/2：执行写操作步骤")
+    _execute_fix_plan_steps(
+        plan=FixPlan(apply_commands=write_cmds, rollback_commands=[]),
+        max_apply_steps=len(write_cmds),
+        execute=execute,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        allow_high_risk=allow_high_risk,
+        auto_approve_low_risk=auto_approve_low_risk,
+        model=model,
+        provider=provider,
+    )
+
+
+def _build_step_explanation(
+    *,
+    step: int,
+    command_text: str,
+    approval_mode: str,
+    model: str,
+    provider: str,
+) -> dict[str, str]:
+    output = {
+        "step": str(step),
+        "command": command_text,
+        "risk_level": "unknown",
+        "risk_score": "-",
+        "scope": "-",
+        "reasoning": "命令解析失败，建议手工确认后执行。",
+        "impact": "",
+        "rollback": "-",
+    }
+    try:
+        command = shlex.split(command_text)
+    except ValueError:
+        return output
+    if not command:
+        return output
+    decision = assess_command(command, approval_mode=approval_mode)
+    report = build_risk_report(command, decision)
+    impact = _generate_impact_statement(
+        command_text=command_text,
+        report=report,
+        model=model,
+        provider=provider,
+    )
+    reasons = [str(x).strip() for x in decision.reasons if str(x).strip()]
+    output["risk_level"] = str(report.get("risk_level", "unknown"))
+    output["risk_score"] = str(report.get("risk_score", "-"))
+    output["scope"] = str(report.get("impact_scope", "-"))
+    output["reasoning"] = "；".join(reasons[:2]) if reasons else "建议先观察执行结果。"
+    output["impact"] = impact
+    output["rollback"] = str(report.get("rollback", "-"))
+    return output
+
+
+def _explain_last_fix_plan_steps(
+    *,
+    text: str,
+    approval_mode: str,
+    model: str,
+    provider: str,
+) -> None:
+    plan = _load_last_fix_plan()
+    if not plan:
+        return
+    steps = _extract_step_selection_from_text(text)
+    if steps:
+        selected_indexes = sorted(_parse_step_selection(steps, max_step=len(plan.apply_commands)))
+        if not selected_indexes:
+            typer.echo("未识别到要讲解的步骤。示例：解释第2步 / 解释步骤:1,3-4")
+            return
+    else:
+        selected_indexes = list(range(1, min(len(plan.apply_commands), 3) + 1))
+
+    explanations = [
+        _build_step_explanation(
+            step=idx,
+            command_text=plan.apply_commands[idx - 1],
+            approval_mode=approval_mode,
+            model=model,
+            provider=provider,
+        )
+        for idx in selected_indexes
+    ]
+    if _console and Panel:
+        lines: list[str] = []
+        for item in explanations:
+            lines.extend(
+                [
+                    f"[step {item['step']}] {item['command']}",
+                    f"原因: {item['reasoning']}",
+                    f"风险: {item['risk_level']} (score={item['risk_score']}) / scope={item['scope']}",
+                    f"影响: {item['impact'] or '-'}",
+                    f"回滚: {item['rollback']}",
+                    "",
+                ]
+            )
+        _console.print(Panel("\n".join(lines).strip(), title="Plan Step Explain", border_style="cyan"))
+        return
+    for item in explanations:
+        typer.echo(f"[step {item['step']}] {item['command']}")
+        typer.echo(f"原因: {item['reasoning']}")
+        typer.echo(f"风险: {item['risk_level']} (score={item['risk_score']}) / scope={item['scope']}")
+        typer.echo(f"影响: {item['impact'] or '-'}")
+        typer.echo(f"回滚: {item['rollback']}")
+        typer.echo("")
 
 
 def _undo_last_fix_plan(
@@ -6040,11 +6255,46 @@ def _looks_like_force_high_risk_apply_request(text: str) -> bool:
     )
 
 
-def _extract_apply_step_selection(text: str) -> str:
+def _looks_like_read_then_write_strategy_request(text: str) -> bool:
     lowered = text.lower().strip()
-    if (not lowered) or (not _looks_like_apply_request(text)):
-        return ""
+    if not lowered:
+        return False
+    return any(
+        keyword in lowered
+        for keyword in [
+            "先只跑只读",
+            "先执行只读",
+            "先只读后写",
+            "先看后改",
+            "read-only first",
+            "read only first",
+            "observe then apply",
+        ]
+    )
 
+
+def _looks_like_explain_step_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    return any(
+        keyword in lowered
+        for keyword in [
+            "解释第",
+            "讲解第",
+            "为什么执行第",
+            "解释步骤",
+            "讲解步骤",
+            "explain step",
+            "explain plan",
+        ]
+    )
+
+
+def _extract_step_selection_from_text(text: str) -> str:
+    lowered = text.lower().strip()
+    if not lowered:
+        return ""
     items: list[str] = []
     seen: set[str] = set()
 
@@ -6069,6 +6319,13 @@ def _extract_apply_step_selection(text: str) -> str:
     if not items:
         return ""
     return ",".join(items)
+
+
+def _extract_apply_step_selection(text: str) -> str:
+    lowered = text.lower().strip()
+    if (not lowered) or (not _looks_like_apply_request(text)):
+        return ""
+    return _extract_step_selection_from_text(text)
 
 
 def _looks_like_undo_request(text: str) -> bool:

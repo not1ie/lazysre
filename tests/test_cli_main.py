@@ -17,6 +17,7 @@ from lazysre.cli.main import (
     _doctor_is_healthy,
     _extract_template_var_items_from_text,
     _extract_apply_step_selection,
+    _extract_step_selection_from_text,
     _extract_command_candidates,
     _extract_named_field,
     _compose_template_var_items,
@@ -27,6 +28,7 @@ from lazysre.cli.main import (
     _looks_like_approval_queue_request,
     _looks_like_context_request,
     _looks_like_doctor_request,
+    _looks_like_explain_step_request,
     _looks_like_fix_request,
     _looks_like_force_high_risk_apply_request,
     _looks_like_help_request,
@@ -36,6 +38,7 @@ from lazysre.cli.main import (
     _looks_like_quickstart_request,
     _looks_like_reset_request,
     _looks_like_report_request,
+    _looks_like_read_then_write_strategy_request,
     _looks_like_switch_dry_run_request,
     _looks_like_switch_execute_request,
     _looks_like_undo_request,
@@ -45,6 +48,7 @@ from lazysre.cli.main import (
     _looks_like_status_request,
     _looks_like_template_library_request,
     _looks_like_with_impact_request,
+    _split_fix_plan_read_write_commands,
     _parse_step_selection,
     _read_last_fix_plan_summary,
     _render_incident_report_markdown,
@@ -62,6 +66,7 @@ from lazysre.cli.main import (
     _safe_run_command,
     _should_launch_assistant,
 )
+from lazysre.cli.fix_mode import FixPlan
 from lazysre.cli.runbook import find_runbook
 from lazysre.cli.target import TargetEnvironment
 
@@ -193,12 +198,37 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_with_impact_request("看审批队列并给影响评估")
     assert _looks_like_low_risk_apply_request("只执行低风险步骤")
     assert _looks_like_force_high_risk_apply_request("允许高风险也执行")
+    assert _looks_like_read_then_write_strategy_request("先只跑只读步骤再执行写操作")
+    assert _looks_like_explain_step_request("解释第2步为什么执行")
 
 
 def test_extract_apply_step_selection() -> None:
     assert _extract_apply_step_selection("执行第1步和第3步") == "1,3"
     assert _extract_apply_step_selection("执行步骤: 1, 3-4, 7 到 8") == "1,3-4,7-8"
     assert _extract_apply_step_selection("apply fix") == ""
+
+
+def test_extract_step_selection_from_text() -> None:
+    assert _extract_step_selection_from_text("解释第2步和第4步") == "2,4"
+    assert _extract_step_selection_from_text("讲解步骤: 1, 3-5") == "1,3-5"
+    assert _extract_step_selection_from_text("只想知道原因") == ""
+
+
+def test_split_fix_plan_read_write_commands() -> None:
+    plan = FixPlan(
+        apply_commands=[
+            "kubectl -n default get pods",
+            "kubectl -n default scale deploy/payment --replicas=3",
+            "docker ps",
+            "docker restart payment-api",
+        ],
+        rollback_commands=[],
+    )
+    read_only, writes = _split_fix_plan_read_write_commands(plan, approval_mode="balanced")
+    assert "kubectl -n default get pods" in read_only
+    assert "docker ps" in read_only
+    assert "kubectl -n default scale deploy/payment --replicas=3" in writes
+    assert "docker restart payment-api" in writes
 
 
 def test_extract_template_vars_and_compose_with_session(tmp_path: Path) -> None:
