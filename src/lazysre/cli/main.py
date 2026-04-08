@@ -689,6 +689,45 @@ def approve_plan(
     )
 
 
+@app.command("undo")
+def undo_last_plan(
+    ctx: typer.Context,
+    execute: Annotated[bool | None, typer.Option("--execute", help="Override execution mode for rollback.")] = None,
+    approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
+    audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
+    max_steps: Annotated[int, typer.Option("--max-steps", help="Max rollback steps to run.")] = 6,
+    model: Annotated[str | None, typer.Option(help="Override model.")] = None,
+    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=execute,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=model,
+        provider=provider,
+        max_steps=None,
+    )
+    _undo_last_fix_plan(
+        max_rollback_steps=max(1, min(max_steps, 30)),
+        execute=bool(options["execute"]),
+        approval_mode=str(options["approval_mode"]),
+        audit_log=str(options["audit_log"]),
+        model=str(options["model"]),
+        provider=str(options["provider"]),
+    )
+
+
 @app.command("chat")
 def chat(
     ctx: typer.Context,
@@ -4078,6 +4117,7 @@ def _render_chat_short_help() -> None:
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
         "- /reset: 重置引导与聊天模式记忆",
+        "- /undo: 回滚最近一次修复计划",
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
         "- /quickstart: 一键自动修复环境并完成快速就绪",
         "- /login: 仅保存 OpenAI API Key",
@@ -4103,6 +4143,7 @@ def _render_chat_short_help() -> None:
         "- /report [--format json] [--no-doctor] [--push-to-git]: 导出复盘报告",
         "- /fix <问题>: 进入修复计划模式",
         "- /apply: 执行最近一次修复计划",
+        "- /undo: 执行最近一次修复计划的回滚命令",
         "- /approve: 查看审批队列",
         "- /approve 1,3-4: 执行指定步骤",
         "- /memory: 查看最近故障记忆",
@@ -4478,6 +4519,20 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 provider=str(options["provider"]),
             )
             continue
+        if text.lower() in {"/undo", "/rollback", "/revert"}:
+            _undo_last_fix_plan(
+                max_rollback_steps=6,
+                execute=_resolve_execute_for_apply_request(
+                    runtime_execute,
+                    label="回滚最近修复",
+                    apply=True,
+                ),
+                approval_mode=str(options["approval_mode"]),
+                audit_log=str(options["audit_log"]),
+                model=str(options["model"]),
+                provider=str(options["provider"]),
+            )
+            continue
         if text.lower().startswith("/memory"):
             tail = text[len("/memory") :].strip()
             store = _open_incident_memory_store()
@@ -4525,6 +4580,21 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             )
             continue
 
+        if _looks_like_undo_request(text):
+            _undo_last_fix_plan(
+                max_rollback_steps=6,
+                execute=_resolve_execute_for_apply_request(
+                    runtime_execute,
+                    label="回滚最近修复",
+                    apply=True,
+                ),
+                approval_mode=str(options["approval_mode"]),
+                audit_log=str(options["audit_log"]),
+                model=str(options["model"]),
+                provider=str(options["provider"]),
+            )
+            continue
+
         if _looks_like_init_request(text):
             report = _interactive_init_wizard(
                 profile_file=Path(settings.target_profile_file),
@@ -4540,6 +4610,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
 
         if _looks_like_fix_request(text):
+            auto_fix_requested = _looks_like_auto_fix_request(text)
             template_candidate, apply_requested = maybe_detect_quick_fix_intent(text)
             if template_candidate:
                 auto_vars = _compose_template_var_items(text, options)
@@ -4569,13 +4640,17 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 continue
             _run_fix(
                 instruction=text,
-                apply=False,
+                apply=auto_fix_requested,
                 max_apply_steps=6,
                 allow_high_risk=False,
-                auto_approve_low_risk=False,
+                auto_approve_low_risk=True,
                 export_plan_md="",
                 export_plan_json="",
-                execute=runtime_execute,
+                execute=_resolve_execute_for_apply_request(
+                    runtime_execute,
+                    label="自动修复执行",
+                    apply=auto_fix_requested,
+                ),
                 approve=bool(options["approve"]),
                 interactive_approval=bool(options["interactive_approval"]),
                 stream_output=bool(options["stream_output"]),
@@ -4831,6 +4906,16 @@ def _run_remediation_template(
         return
 
     plan = FixPlan(apply_commands=apply_commands, rollback_commands=rollback_commands)
+    _write_json_file(
+        Path(".data/lsre-fix-last.json"),
+        build_plan_record(
+            instruction=f"[template] {template.name}",
+            plan=plan,
+            final_text=json.dumps(payload, ensure_ascii=False),
+            selected_apply_commands=apply_commands[:max_apply_steps],
+            approval_mode=approval_mode,
+        ),
+    )
     exec_summary = _execute_fix_plan_steps(
         plan=plan,
         max_apply_steps=max_apply_steps,
@@ -4985,6 +5070,8 @@ def _execute_fix_plan_steps(
             allow_high_risk=allow_high_risk,
             auto_approve_low_risk=auto_approve_low_risk,
         )
+        if not execute:
+            need_confirm = False
         if risk_level == "low":
             need_confirm = False
         if not allow_execute:
@@ -4996,7 +5083,10 @@ def _execute_fix_plan_steps(
         ):
             continue
         if not need_confirm:
-            typer.echo(f"[step {idx}/{total}] low-risk 自动执行（无需确认）")
+            if execute:
+                typer.echo(f"[step {idx}/{total}] low-risk 自动执行（无需确认）")
+            else:
+                typer.echo(f"[step {idx}/{total}] dry-run 预演自动执行（无需确认）")
         result_exec = asyncio.run(executor.run(command))
         executed += 1
         if result_exec.ok:
@@ -5048,6 +5138,41 @@ def _apply_last_fix_plan(
         typer.echo("\n可回滚命令：")
         for cmd in plan.rollback_commands:
             typer.echo(f"- {cmd}")
+
+
+def _undo_last_fix_plan(
+    *,
+    max_rollback_steps: int,
+    execute: bool,
+    approval_mode: str,
+    audit_log: str,
+    model: str,
+    provider: str,
+) -> None:
+    plan = _load_last_fix_plan()
+    if not plan:
+        return
+    if not plan.rollback_commands:
+        typer.echo("最近修复计划未提供回滚命令。")
+        return
+    rollback_plan = FixPlan(
+        apply_commands=plan.rollback_commands[:max_rollback_steps],
+        rollback_commands=[],
+    )
+    typer.echo("准备执行回滚命令：")
+    for cmd in rollback_plan.apply_commands:
+        typer.echo(f"- {cmd}")
+    _execute_fix_plan_steps(
+        plan=rollback_plan,
+        max_apply_steps=max_rollback_steps,
+        execute=execute,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        allow_high_risk=True,
+        auto_approve_low_risk=True,
+        model=model,
+        provider=provider,
+    )
 
 
 def _approve_last_fix_plan(
@@ -5642,6 +5767,35 @@ def _looks_like_apply_request(text: str) -> bool:
     )
 
 
+def _looks_like_undo_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(
+        keyword in lowered
+        for keyword in [
+            "回滚",
+            "撤销修复",
+            "撤回修复",
+            "undo",
+            "rollback",
+            "revert fix",
+        ]
+    )
+
+
+def _looks_like_auto_fix_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(
+        keyword in lowered
+        for keyword in [
+            "自动修复",
+            "直接修复",
+            "帮我修好",
+            "auto fix",
+            "fix it now",
+        ]
+    )
+
+
 def _looks_like_init_request(text: str) -> bool:
     lowered = text.lower().strip()
     return any(
@@ -5802,6 +5956,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "init",
         "quickstart",
         "reset",
+        "undo",
         "fix",
         "approve",
         "status",
@@ -5858,6 +6013,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "init",
         "quickstart",
         "reset",
+        "undo",
         "fix",
         "approve",
         "status",

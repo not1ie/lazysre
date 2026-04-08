@@ -79,7 +79,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /mode /mode execute|dry-run /context /reset /quickstart /init /login /setup /status /status probe /doctor [/doctor fix] [/doctor strict]
+# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
@@ -181,9 +181,11 @@ lsre memory search "payment latency" --limit 5
 - “切换到执行模式” / “切回dry-run”
 - “你记住了什么”（查看最近记忆的 pod/service/namespace）
 - “重置一下”（会重置引导和聊天模式记忆）
+- “回滚刚才修复”（执行最近计划的 rollback 命令）
 
 聊天模式会记住你上次选择的执行模式（execute/dry-run），下次启动自动沿用。
 一键修复时会自动从输入文本和会话记忆补全参数（如 namespace/pod/workload）。
+如果你说“自动修复 xxx”，会直接进入“生成并执行”流程（按当前执行模式）。
 
 执行策略：低风险命令默认自动执行；中高风险命令会弹出确认。
 

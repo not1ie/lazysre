@@ -19,6 +19,7 @@ from lazysre.cli.main import (
     _extract_command_candidates,
     _extract_named_field,
     _compose_template_var_items,
+    _looks_like_auto_fix_request,
     _looks_like_apply_request,
     _looks_like_context_request,
     _looks_like_doctor_request,
@@ -31,6 +32,7 @@ from lazysre.cli.main import (
     _looks_like_report_request,
     _looks_like_switch_dry_run_request,
     _looks_like_switch_execute_request,
+    _looks_like_undo_request,
     _looks_like_status_request,
     _looks_like_template_library_request,
     _parse_step_selection,
@@ -148,6 +150,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv9 = ["lsre", "reset"]
     _rewrite_argv_for_default_run(argv9)
     assert argv9 == ["lsre", "reset"]
+    argv10 = ["lsre", "undo"]
+    _rewrite_argv_for_default_run(argv10)
+    assert argv10 == ["lsre", "undo"]
 
 
 def test_detect_fix_and_apply_intent() -> None:
@@ -169,6 +174,8 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_switch_dry_run_request("切回dry-run")
     assert _looks_like_reset_request("我要重置一下")
     assert _looks_like_context_request("你记住了什么")
+    assert _looks_like_auto_fix_request("请自动修复 payment 延迟")
+    assert _looks_like_undo_request("回滚刚才修复")
 
 
 def test_extract_template_vars_and_compose_with_session(tmp_path: Path) -> None:
@@ -213,6 +220,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["init"]) is False
     assert _should_launch_assistant(["quickstart"]) is False
     assert _should_launch_assistant(["reset"]) is False
+    assert _should_launch_assistant(["undo"]) is False
     assert _should_launch_assistant(["login"]) is False
     assert _should_launch_assistant(["logout"]) is False
     assert _should_launch_assistant(["status"]) is False
