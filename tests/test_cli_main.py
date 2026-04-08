@@ -19,6 +19,8 @@ from lazysre.cli.main import (
     _extract_command_candidates,
     _extract_named_field,
     _compose_template_var_items,
+    _build_quick_k8s_action_plan,
+    _extract_requested_replicas,
     _looks_like_auto_fix_request,
     _looks_like_apply_request,
     _looks_like_context_request,
@@ -33,6 +35,9 @@ from lazysre.cli.main import (
     _looks_like_switch_dry_run_request,
     _looks_like_switch_execute_request,
     _looks_like_undo_request,
+    _looks_like_logs_action_request,
+    _looks_like_restart_action_request,
+    _looks_like_scale_action_request,
     _looks_like_status_request,
     _looks_like_template_library_request,
     _parse_step_selection,
@@ -176,6 +181,9 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_context_request("你记住了什么")
     assert _looks_like_auto_fix_request("请自动修复 payment 延迟")
     assert _looks_like_undo_request("回滚刚才修复")
+    assert _looks_like_logs_action_request("看它日志")
+    assert _looks_like_restart_action_request("重启它")
+    assert _looks_like_scale_action_request("扩容到3")
 
 
 def test_extract_template_vars_and_compose_with_session(tmp_path: Path) -> None:
@@ -210,6 +218,48 @@ def test_extract_template_vars_and_compose_with_session(tmp_path: Path) -> None:
     assert "service=payment" in merged
     assert "pod=payment-abc-1" in merged
     assert "workload=deploy/payment" in merged
+
+
+def test_extract_requested_replicas() -> None:
+    assert _extract_requested_replicas("扩容到3") == 3
+    assert _extract_requested_replicas("replicas=5") == 5
+    assert _extract_requested_replicas("scale to 7") == 7
+
+
+def test_build_quick_k8s_action_plan_from_memory(tmp_path: Path) -> None:
+    session_file = tmp_path / "session.json"
+    session_file.write_text(
+        json.dumps(
+            {
+                "turns": [],
+                "entities": {
+                    "last_namespace": "ops",
+                    "last_service": "payment",
+                    "last_pod": "payment-abc-1",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    options = {
+        "session_file": str(session_file),
+        "approval_mode": "balanced",
+        "audit_log": str(tmp_path / "audit.jsonl"),
+        "model": "gpt-5.4-mini",
+        "provider": "mock",
+    }
+    logs_plan = _build_quick_k8s_action_plan("看它日志", options)
+    assert logs_plan is not None
+    assert "kubectl -n ops logs payment-abc-1 --tail=200" in logs_plan["commands"]
+
+    restart_plan = _build_quick_k8s_action_plan("重启它", options)
+    assert restart_plan is not None
+    assert "kubectl -n ops rollout restart deploy/payment" in restart_plan["commands"]
+
+    scale_plan = _build_quick_k8s_action_plan("扩容到4", options)
+    assert scale_plan is not None
+    assert "kubectl -n ops scale deploy/payment --replicas=4" in scale_plan["commands"]
 
 
 def test_should_launch_assistant_with_only_options() -> None:

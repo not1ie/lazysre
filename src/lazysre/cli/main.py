@@ -4144,6 +4144,7 @@ def _render_chat_short_help() -> None:
         "- /fix <问题>: 进入修复计划模式",
         "- /apply: 执行最近一次修复计划",
         "- /undo: 执行最近一次修复计划的回滚命令",
+        "- 自然语言快捷动作：看它日志 / 重启它 / 扩容到3（自动补全对象）",
         "- /approve: 查看审批队列",
         "- /approve 1,3-4: 执行指定步骤",
         "- /memory: 查看最近故障记忆",
@@ -4791,6 +4792,8 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
         return True
     if _looks_like_template_library_request(text):
         template_list()
+        return True
+    if _maybe_execute_quick_k8s_action(text, options, execute_mode=execute_mode):
         return True
     template_candidate, apply_requested = maybe_detect_quick_fix_intent(text)
     if template_candidate and (apply_requested or _looks_like_template_advice_request(text)):
@@ -5474,6 +5477,126 @@ def _compose_template_var_items(
     return out
 
 
+def _build_quick_k8s_action_plan(text: str, options: dict[str, object]) -> dict[str, object] | None:
+    lowered = str(text or "").lower().strip()
+    if not lowered:
+        return None
+    var_items = _compose_template_var_items(text, options)
+    vars_map = parse_remediation_var_items(var_items)
+    namespace = str(vars_map.get("namespace", "default")).strip() or "default"
+    service = str(vars_map.get("service", "")).strip()
+    workload = str(vars_map.get("workload", "")).strip()
+    pod = str(vars_map.get("pod", "")).strip()
+    replicas = _extract_requested_replicas(text)
+
+    if _looks_like_logs_action_request(text):
+        commands: list[str] = []
+        if pod:
+            commands.append(f"kubectl -n {namespace} logs {pod} --tail=200")
+        elif service:
+            commands.append(f"kubectl -n {namespace} logs -l app={service} --tail=200")
+        elif workload.startswith("deploy/"):
+            commands.append(f"kubectl -n {namespace} logs -l app={workload.split('/', 1)[1]} --tail=200")
+        else:
+            return None
+        return {
+            "label": "快速日志查询",
+            "commands": commands,
+            "read_only": True,
+        }
+
+    if _looks_like_restart_action_request(text):
+        commands = []
+        resolved_workload = workload
+        if (not resolved_workload) and service:
+            resolved_workload = f"deploy/{service}"
+        if resolved_workload:
+            commands.append(f"kubectl -n {namespace} rollout restart {resolved_workload}")
+            if resolved_workload.startswith("deploy/"):
+                commands.append(f"kubectl -n {namespace} rollout status {resolved_workload} --timeout=180s")
+        elif pod:
+            commands.append(f"kubectl -n {namespace} delete pod {pod}")
+        else:
+            return None
+        return {
+            "label": "快速重启",
+            "commands": commands,
+            "read_only": False,
+        }
+
+    if _looks_like_scale_action_request(text):
+        if replicas <= 0:
+            return {"label": "快速扩缩容", "commands": [], "read_only": False, "error": "未识别到目标副本数"}
+        resolved_workload = workload or (f"deploy/{service}" if service else "")
+        if not resolved_workload:
+            return None
+        commands = [f"kubectl -n {namespace} scale {resolved_workload} --replicas={replicas}"]
+        if resolved_workload.startswith("deploy/"):
+            commands.append(f"kubectl -n {namespace} rollout status {resolved_workload} --timeout=180s")
+        return {
+            "label": "快速扩缩容",
+            "commands": commands,
+            "read_only": False,
+        }
+    return None
+
+
+def _maybe_execute_quick_k8s_action(text: str, options: dict[str, object], *, execute_mode: bool) -> bool:
+    plan = _build_quick_k8s_action_plan(text, options)
+    if not plan:
+        return False
+    label = str(plan.get("label", "快速动作"))
+    error = str(plan.get("error", "")).strip()
+    commands = [str(x).strip() for x in list(plan.get("commands", [])) if str(x).strip()]
+    if error:
+        typer.echo(f"{label}: {error}")
+        return True
+    if not commands:
+        return False
+    read_only = bool(plan.get("read_only"))
+    execute = bool(execute_mode or read_only)
+    if read_only and (not execute_mode):
+        typer.echo(f"{label}: 检测到只读动作，dry-run 下已临时执行真实查询。")
+    else:
+        execute = _resolve_execute_for_apply_request(
+            execute_mode,
+            label=label,
+            apply=True,
+        )
+    step_plan = FixPlan(apply_commands=commands, rollback_commands=[])
+    _execute_fix_plan_steps(
+        plan=step_plan,
+        max_apply_steps=len(commands),
+        execute=execute,
+        approval_mode=str(options["approval_mode"]),
+        audit_log=str(options["audit_log"]),
+        allow_high_risk=True,
+        auto_approve_low_risk=True,
+        model=str(options["model"]),
+        provider=str(options["provider"]),
+    )
+    return True
+
+
+def _extract_requested_replicas(text: str) -> int:
+    lowered = str(text or "").lower()
+    patterns = [
+        r"(?:扩容到|缩容到|副本数?|replicas?\s*(?:to|=|:))\s*(\d+)",
+        r"(?:scale\s+to)\s*(\d+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        try:
+            value = int(match.group(1))
+        except Exception:
+            continue
+        if value > 0:
+            return value
+    return 0
+
+
 def _extract_template_var_items_from_text(text: str) -> list[str]:
     raw = str(text or "")
     lowered = raw.lower()
@@ -5611,6 +5734,47 @@ def _looks_like_context_request(text: str) -> bool:
         "当前上下文",
         "context",
         "最近对象",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_logs_action_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    if re.search(r"(看|查|查看).{0,4}日志", lowered):
+        return True
+    keywords = (
+        "看日志",
+        "查日志",
+        "查看日志",
+        "logs",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_restart_action_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "重启",
+        "restart",
+        "rollout restart",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_scale_action_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "扩容",
+        "缩容",
+        "scale",
+        "副本",
+        "replicas",
     )
     return any(k in lowered for k in keywords)
 
