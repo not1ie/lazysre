@@ -18,6 +18,7 @@ from lazysre.cli.main import (
     _extract_template_var_items_from_text,
     _extract_apply_step_selection,
     _extract_step_selection_from_text,
+    _extract_target_updates_from_text,
     _extract_command_candidates,
     _extract_named_field,
     _compose_template_var_items,
@@ -38,6 +39,8 @@ from lazysre.cli.main import (
     _looks_like_quickstart_request,
     _looks_like_reset_request,
     _looks_like_report_request,
+    _looks_like_target_show_request,
+    _looks_like_target_update_request,
     _looks_like_read_then_write_strategy_request,
     _looks_like_switch_dry_run_request,
     _looks_like_switch_execute_request,
@@ -200,6 +203,8 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_force_high_risk_apply_request("允许高风险也执行")
     assert _looks_like_read_then_write_strategy_request("先只跑只读步骤再执行写操作")
     assert _looks_like_explain_step_request("解释第2步为什么执行")
+    assert _looks_like_target_update_request("把 namespace 设成 prod")
+    assert _looks_like_target_show_request("查看目标配置")
 
 
 def test_extract_apply_step_selection() -> None:
@@ -212,6 +217,16 @@ def test_extract_step_selection_from_text() -> None:
     assert _extract_step_selection_from_text("解释第2步和第4步") == "2,4"
     assert _extract_step_selection_from_text("讲解步骤: 1, 3-5") == "1,3-5"
     assert _extract_step_selection_from_text("只想知道原因") == ""
+
+
+def test_extract_target_updates_from_text() -> None:
+    payload = _extract_target_updates_from_text(
+        "把 prometheus 设成 http://92.168.69.176:9090 ，k8s api 改成 https://192.168.10.1:6443 ，namespace 改成 prod，开启tls校验"
+    )
+    assert payload["prometheus_url"] == "http://92.168.69.176:9090"
+    assert payload["k8s_api_url"] == "https://192.168.10.1:6443"
+    assert payload["k8s_namespace"] == "prod"
+    assert payload["k8s_verify_tls"] is True
 
 
 def test_split_fix_plan_read_write_commands() -> None:

@@ -4116,6 +4116,7 @@ def _render_chat_short_help() -> None:
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
+        "- 自然语言目标配置：把 namespace 设成 prod / 把 prometheus 设成 http://x:9090",
         "- /reset: 重置引导与聊天模式记忆",
         "- /undo: 回滚最近一次修复计划",
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
@@ -4759,6 +4760,13 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
     lowered = text.lower().strip()
     if not lowered:
         return False
+    if _looks_like_target_show_request(text):
+        payload = TargetEnvStore(Path(settings.target_profile_file)).load().to_safe_dict()
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return True
+    if _looks_like_target_update_request(text):
+        if _apply_target_updates_from_text(text):
+            return True
     if _looks_like_context_request(text):
         _render_context_snapshot(options, execute_mode=execute_mode)
         return True
@@ -5729,6 +5737,97 @@ def _compose_template_var_items(
     return out
 
 
+def _extract_target_updates_from_text(text: str) -> dict[str, object]:
+    raw = str(text or "")
+    lowered = raw.lower()
+    updates: dict[str, object] = {}
+
+    def _first(patterns: list[str]) -> str:
+        for pattern in patterns:
+            match = re.search(pattern, raw, flags=re.IGNORECASE)
+            if match:
+                return str(match.group(1)).strip()
+        return ""
+
+    prom_url = _first(
+        [
+            r"(?:prometheus(?:\s*url)?)[\s:=：]*(?:是|为|改成|设成|设置为|用)?\s*(https?://[^\s,，;；]+)",
+        ]
+    )
+    if prom_url:
+        updates["prometheus_url"] = prom_url.rstrip("/")
+
+    k8s_api_url = _first(
+        [
+            r"(?:k8s|kubernetes)(?:\s*api)?[\s:=：]*(?:是|为|改成|设成|设置为|用)?\s*(https?://[^\s,，;；]+)",
+            r"(?:api[\s_-]*server)[\s:=：]*(?:是|为|改成|设成|设置为|用)?\s*(https?://[^\s,，;；]+)",
+        ]
+    )
+    if k8s_api_url:
+        updates["k8s_api_url"] = k8s_api_url.rstrip("/")
+
+    namespace = _first(
+        [
+            r"(?:namespace|命名空间)[\s:=：]*(?:是|为|改成|设成|设置为|用)?\s*([a-z0-9-]{1,63})",
+        ]
+    )
+    if namespace:
+        updates["k8s_namespace"] = namespace
+
+    context = _first(
+        [
+            r"(?:k8s\s*context|context|集群上下文)[\s:=：]*(?:是|为|改成|设成|设置为|用)?\s*([^\s,，;；]+)",
+        ]
+    )
+    if context:
+        updates["k8s_context"] = context
+
+    token = _first(
+        [
+            r"(?:k8s\s*token|bearer\s*token|token)[\s:=：]*(?:是|为|改成|设成|设置为|用)?\s*([A-Za-z0-9._\-]{12,})",
+        ]
+    )
+    if token:
+        updates["k8s_bearer_token"] = token
+
+    disable_tls_keywords = (
+        "skip tls",
+        "skip-tls",
+        "insecure",
+        "不校验tls",
+        "跳过tls",
+        "关闭tls校验",
+        "不验证证书",
+        "skip verify",
+    )
+    enable_tls_keywords = (
+        "verify tls",
+        "开启tls校验",
+        "启用tls校验",
+        "校验证书",
+        "开启证书校验",
+    )
+    if any(k in lowered for k in disable_tls_keywords):
+        updates["k8s_verify_tls"] = False
+    elif any(k in lowered for k in enable_tls_keywords):
+        updates["k8s_verify_tls"] = True
+    return updates
+
+
+def _apply_target_updates_from_text(text: str) -> bool:
+    updates = _extract_target_updates_from_text(text)
+    if not updates:
+        typer.echo("未识别到可更新的目标配置字段。示例：把 namespace 设成 prod")
+        return False
+    store = TargetEnvStore(Path(settings.target_profile_file))
+    updated = store.update(**updates)
+    safe = updated.to_safe_dict()
+    changed = ", ".join(sorted(updates.keys()))
+    typer.echo(f"目标环境已更新: {changed}")
+    typer.echo(json.dumps(safe, ensure_ascii=False, indent=2))
+    return True
+
+
 def _build_quick_k8s_action_plan(text: str, options: dict[str, object]) -> dict[str, object] | None:
     lowered = str(text or "").lower().strip()
     if not lowered:
@@ -5988,6 +6087,55 @@ def _looks_like_context_request(text: str) -> bool:
         "最近对象",
     )
     return any(k in lowered for k in keywords)
+
+
+def _looks_like_target_show_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    if _looks_like_target_update_request(text):
+        return False
+    keywords = (
+        "目标配置",
+        "目标环境",
+        "target show",
+        "查看target",
+        "查看目标",
+        "当前target",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_target_update_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    updates = _extract_target_updates_from_text(text)
+    if updates:
+        return True
+    field_keywords = (
+        "prometheus",
+        "k8s api",
+        "kubernetes api",
+        "namespace",
+        "命名空间",
+        "context",
+        "token",
+        "tls",
+        "证书",
+    )
+    action_keywords = (
+        "设置",
+        "设成",
+        "改成",
+        "改为",
+        "配置",
+        "更新",
+        "set",
+        "update",
+        "use",
+    )
+    return any(k in lowered for k in field_keywords) and any(k in lowered for k in action_keywords)
 
 
 def _looks_like_logs_action_request(text: str) -> bool:
