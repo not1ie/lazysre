@@ -246,6 +246,7 @@ def doctor(
     timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 6,
     dry_run_probe: Annotated[bool, typer.Option("--dry-run-probe", help="Run probe checks in dry-run mode.")] = False,
     auto_fix: Annotated[bool, typer.Option("--auto-fix", help="Apply safe auto-fixes for doctor findings.")] = False,
+    autofix: Annotated[bool, typer.Option("--autofix", help="一键自动修复常见问题（推荐）。")] = False,
     write_backup: Annotated[bool, typer.Option("--write-backup", help="Backup target profile before auto-fix updates.")] = False,
     strict: Annotated[bool, typer.Option("--strict", help="Treat warnings as failure (CI-friendly).")] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print doctor report as JSON.")] = False,
@@ -277,8 +278,17 @@ def doctor(
         dry_run_probe=dry_run_probe,
         audit_log=Path(str(options["audit_log"])),
     )
-    if auto_fix:
-        autofix = _apply_doctor_autofix(target_store, target, write_backup=write_backup)
+    enable_autofix = bool(auto_fix or autofix)
+    if enable_autofix:
+        auto_payload = _run_doctor_autofix_flow(
+            profile_file=Path(profile_file),
+            timeout_sec=timeout_sec,
+            execute_probe=(not dry_run_probe),
+            write_backup=write_backup,
+            audit_log=Path(str(options["audit_log"])),
+            prompt_for_api_key=True,
+            secrets_file=None,
+        )
         target = target_store.load()
         report = _collect_doctor_report(
             target=target,
@@ -286,7 +296,7 @@ def doctor(
             dry_run_probe=dry_run_probe,
             audit_log=Path(str(options["audit_log"])),
         )
-        report["autofix"] = autofix
+        report["autofix"] = auto_payload
     summary_obj = report.get("summary", {})
     if isinstance(summary_obj, dict):
         strict_healthy = _doctor_is_healthy(summary_obj, strict=strict)
@@ -382,6 +392,55 @@ def init(
         _render_setup_report(report)
     else:
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+@app.command("quickstart")
+def quickstart(
+    ctx: typer.Context,
+    api_key: Annotated[str, typer.Option("--api-key", help="OpenAI API Key. Empty means prompt when needed.")] = "",
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 6,
+    execute_probe: Annotated[bool, typer.Option("--execute-probe/--dry-run-probe", help="Execute real probe checks.")] = True,
+    autofix: Annotated[bool, typer.Option("--autofix/--no-autofix", help="Apply safe target auto-fix before final probe.")] = True,
+    write_backup: Annotated[bool, typer.Option("--write-backup", help="Backup target profile when autofix updates it.")] = False,
+    prompt_for_api_key: Annotated[bool, typer.Option("--prompt-api-key/--no-prompt-api-key", help="Prompt to set API key when missing.")] = True,
+    secrets_file: Annotated[str, typer.Option("--secrets-file", help="Secrets JSON file path.")] = "",
+    as_json: Annotated[bool, typer.Option("--json", help="Print quickstart report as JSON.")] = False,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
+    report = _run_quickstart(
+        profile_file=Path(profile_file),
+        timeout_sec=timeout_sec,
+        execute_probe=execute_probe,
+        autofix=autofix,
+        write_backup=write_backup,
+        audit_log=Path(str(options["audit_log"])),
+        api_key=api_key,
+        prompt_for_api_key=prompt_for_api_key,
+        secrets_file=Path(secrets_file).expanduser() if secrets_file.strip() else None,
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_setup_report(report)
 
 
 @app.command("setup")
@@ -3047,6 +3106,106 @@ def _run_first_run_setup(
     return report
 
 
+def _run_quickstart(
+    *,
+    profile_file: Path,
+    timeout_sec: int,
+    execute_probe: bool,
+    autofix: bool,
+    write_backup: bool,
+    audit_log: Path,
+    api_key: str,
+    prompt_for_api_key: bool,
+    secrets_file: Path | None,
+) -> dict[str, object]:
+    quick_actions: list[str] = []
+    secret_store = SecretStore(secrets_file)
+    key = str(api_key or "").strip()
+    if key:
+        secret_store.set_openai_api_key(key)
+        quick_actions.append("openai_api_key saved from --api-key")
+    elif (not _resolve_openai_api_key(secrets_file=secrets_file)) and prompt_for_api_key and _stdin_interactive():
+        if typer.confirm("检测到未配置 OpenAI API Key，是否现在配置？", default=True):
+            typed = typer.prompt("OpenAI API Key", hide_input=True).strip()
+            if typed:
+                secret_store.set_openai_api_key(typed)
+                quick_actions.append("openai_api_key saved from prompt")
+
+    report = _run_first_run_setup(
+        profile_file=profile_file,
+        timeout_sec=timeout_sec,
+        execute_probe=execute_probe,
+        apply_defaults=True,
+        audit_log=audit_log,
+        write_marker=True,
+        secrets_file=secrets_file,
+    )
+    if autofix:
+        auto_payload = _run_doctor_autofix_flow(
+            profile_file=profile_file,
+            timeout_sec=timeout_sec,
+            execute_probe=execute_probe,
+            write_backup=write_backup,
+            audit_log=audit_log,
+            prompt_for_api_key=prompt_for_api_key,
+            secrets_file=secrets_file,
+        )
+        report = _run_first_run_setup(
+            profile_file=profile_file,
+            timeout_sec=timeout_sec,
+            execute_probe=execute_probe,
+            apply_defaults=True,
+            audit_log=audit_log,
+            write_marker=True,
+            secrets_file=secrets_file,
+        )
+        report["autofix"] = auto_payload
+    report["quickstart"] = {
+        "actions": quick_actions,
+        "autofix_enabled": bool(autofix),
+    }
+    return report
+
+
+def _run_doctor_autofix_flow(
+    *,
+    profile_file: Path,
+    timeout_sec: int,
+    execute_probe: bool,
+    write_backup: bool,
+    audit_log: Path,
+    prompt_for_api_key: bool,
+    secrets_file: Path | None,
+) -> dict[str, object]:
+    target_store = TargetEnvStore(profile_file)
+    target = target_store.load()
+    target_autofix = _apply_doctor_autofix(target_store, target, write_backup=write_backup)
+    api_key_saved = False
+    if (not _resolve_openai_api_key(secrets_file=secrets_file)) and prompt_for_api_key and _stdin_interactive():
+        if typer.confirm("检测到未配置 OpenAI API Key，是否现在配置？", default=True):
+            typed = typer.prompt("OpenAI API Key", hide_input=True).strip()
+            if typed:
+                SecretStore(secrets_file).set_openai_api_key(typed)
+                api_key_saved = True
+    setup_report = _run_first_run_setup(
+        profile_file=profile_file,
+        timeout_sec=timeout_sec,
+        execute_probe=execute_probe,
+        apply_defaults=True,
+        audit_log=audit_log,
+        write_marker=True,
+        secrets_file=secrets_file,
+    )
+    return {
+        "target_autofix": target_autofix,
+        "openai_api_key_saved": api_key_saved,
+        "post_setup_ready": bool(setup_report.get("ready")),
+        "post_setup_next_actions": list(setup_report.get("next_actions", []))[:8]
+        if isinstance(setup_report.get("next_actions"), list)
+        else [],
+    }
+
+
 def _interactive_init_wizard(
     *,
     profile_file: Path,
@@ -3146,7 +3305,7 @@ def _build_setup_next_actions(
 ) -> list[str]:
     actions: list[str] = []
     if not openai_ok:
-        actions.append("export OPENAI_API_KEY=<your_key>")
+        actions.append("lsre login")
     checks = install_report.get("checks", [])
     if isinstance(checks, list):
         for item in checks:
@@ -3189,7 +3348,7 @@ def _show_first_run_setup_hint_once() -> None:
     marker = Path(settings.data_dir) / "lsre-onboarding.json"
     if marker.exists():
         return
-    typer.echo("首次使用建议运行 /init（交互引导）或 /setup（自动检查）。")
+    typer.echo("首次使用建议运行 /quickstart 一键就绪（或 /init 交互引导）。")
 
 
 def _maybe_auto_bootstrap_on_first_chat(options: dict[str, object]) -> None:
@@ -3223,11 +3382,41 @@ def _maybe_auto_bootstrap_on_first_chat(options: dict[str, object]) -> None:
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+def _maybe_offer_one_click_env_fix(options: dict[str, object]) -> None:
+    marker = Path(settings.data_dir) / "lsre-onboarding.json"
+    if marker.exists():
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict) and bool(payload.get("ready")):
+            return
+    quick = _run_first_run_setup(
+        profile_file=Path(settings.target_profile_file),
+        timeout_sec=4,
+        execute_probe=False,
+        apply_defaults=False,
+        audit_log=Path(str(options["audit_log"])),
+        write_marker=False,
+        secrets_file=None,
+    )
+    if bool(quick.get("ready")):
+        return
+    typer.echo("检测到环境未完全就绪。可直接输入“修复环境”或 /quickstart 一键自动修复。")
+
+
 def _resolve_openai_api_key(*, secrets_file: Path | None = None) -> str:
     env_key = str(settings.openai_api_key or "").strip()
     if env_key:
         return env_key
     return SecretStore(secrets_file).get_openai_api_key()
+
+
+def _stdin_interactive() -> bool:
+    try:
+        return bool(sys.stdin.isatty())
+    except Exception:
+        return False
 
 
 def _render_setup_report(report: dict[str, object]) -> None:
@@ -3827,6 +4016,7 @@ def _render_chat_short_help() -> None:
         "LazySRE Chat 快捷命令",
         "- /help: 查看帮助",
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
+        "- /quickstart: 一键自动修复环境并完成快速就绪",
         "- /login: 仅保存 OpenAI API Key",
         "- /setup [--dry-run-probe]: 首次启动向导（安装检查+目标探测+OpenAI Key）",
         "- /status: 查看当前会话、目标配置、最近修复计划",
@@ -3868,6 +4058,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("示例：1) 帮我排查 payment 延迟 2) 一键修复 CrashLoopBackOff")
     typer.echo("不需要记命令，直接用自然语言说你想做什么。")
     _maybe_auto_bootstrap_on_first_chat(options)
+    _maybe_offer_one_click_env_fix(options)
     while True:
         try:
             line = typer.prompt("lsre")
@@ -3893,6 +4084,23 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 timeout_sec=6,
                 execute_probe=True,
                 audit_log=Path(str(options["audit_log"])),
+                secrets_file=None,
+            )
+            if _console:
+                _render_setup_report(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/quickstart"):
+            report = _run_quickstart(
+                profile_file=Path(settings.target_profile_file),
+                timeout_sec=6,
+                execute_probe=True,
+                autofix=True,
+                write_backup=False,
+                audit_log=Path(str(options["audit_log"])),
+                api_key="",
+                prompt_for_api_key=True,
                 secrets_file=None,
             )
             if _console:
@@ -4287,6 +4495,23 @@ def _handle_natural_intent(text: str, options: dict[str, object]) -> bool:
     lowered = text.lower().strip()
     if not lowered:
         return False
+    if _looks_like_quickstart_request(text):
+        report = _run_quickstart(
+            profile_file=Path(settings.target_profile_file),
+            timeout_sec=6,
+            execute_probe=True,
+            autofix=True,
+            write_backup=False,
+            audit_log=Path(str(options["audit_log"])),
+            api_key="",
+            prompt_for_api_key=True,
+            secrets_file=None,
+        )
+        if _console:
+            _render_setup_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return True
     if _looks_like_init_request(text):
         report = _interactive_init_wizard(
             profile_file=Path(settings.target_profile_file),
@@ -4895,6 +5120,21 @@ def _looks_like_status_request(text: str) -> bool:
     return any(k in lowered for k in keywords)
 
 
+def _looks_like_quickstart_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "修复环境",
+        "一键修复环境",
+        "一键初始化",
+        "quickstart",
+        "快速就绪",
+        "一键就绪",
+    )
+    return any(k in lowered for k in keywords)
+
+
 def _looks_like_install_doctor_request(text: str) -> bool:
     lowered = text.lower().strip()
     if not lowered:
@@ -5173,6 +5413,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "login",
         "logout",
         "init",
+        "quickstart",
         "fix",
         "approve",
         "status",
@@ -5227,6 +5468,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "login",
         "logout",
         "init",
+        "quickstart",
         "fix",
         "approve",
         "status",

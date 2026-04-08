@@ -22,6 +22,7 @@ from lazysre.cli.main import (
     _looks_like_fix_request,
     _looks_like_init_request,
     _looks_like_install_doctor_request,
+    _looks_like_quickstart_request,
     _looks_like_report_request,
     _looks_like_status_request,
     _looks_like_template_library_request,
@@ -134,6 +135,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv7 = ["lsre", "login", "--api-key", "sk-xxx"]
     _rewrite_argv_for_default_run(argv7)
     assert argv7 == ["lsre", "login", "--api-key", "sk-xxx"]
+    argv8 = ["lsre", "quickstart", "--json"]
+    _rewrite_argv_for_default_run(argv8)
+    assert argv8 == ["lsre", "quickstart", "--json"]
 
 
 def test_detect_fix_and_apply_intent() -> None:
@@ -149,6 +153,7 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_install_doctor_request("做一下安装检查")
     assert _looks_like_report_request("导出复盘报告")
     assert _looks_like_template_library_request("有哪些修复模板")
+    assert _looks_like_quickstart_request("帮我修复环境")
 
 
 def test_should_launch_assistant_with_only_options() -> None:
@@ -157,6 +162,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant([]) is True
     assert _should_launch_assistant(["chat"]) is False
     assert _should_launch_assistant(["init"]) is False
+    assert _should_launch_assistant(["quickstart"]) is False
     assert _should_launch_assistant(["login"]) is False
     assert _should_launch_assistant(["logout"]) is False
     assert _should_launch_assistant(["status"]) is False

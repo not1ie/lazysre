@@ -27,6 +27,8 @@ lazysre install-doctor
 lazysre setup
 # 交互式初始化（更像 Gemini/Claude：一步步填完即可）
 lazysre init
+# 一键快速就绪（推荐，自动修复常见问题）
+lazysre quickstart
 # 本地保存 OpenAI Key（后续无需每次 export）
 lazysre login
 ```
@@ -77,7 +79,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /init /login /setup /status /status probe /doctor [/doctor fix] [/doctor strict]
+# /help /quickstart /init /login /setup /status /status probe /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
@@ -117,9 +119,13 @@ lsre login
 lsre logout
 # 交互式初始化（推荐第一次使用）
 lsre init
+# 一键快速就绪（自动补齐配置 + 自动修复 + 连通性检查）
+lsre quickstart
 # 首次启动向导（建议首次使用执行）
 lsre setup
 lsre setup --dry-run-probe
+# 一键自动修复环境（doctor）
+lsre doctor --autofix
 # CI 可读取 gate 字段：blocking_checks / exit_code_advice
 lsre doctor --strict --json
 
@@ -171,6 +177,7 @@ lsre memory search "payment latency" --limit 5
 - “做一次环境体检”
 - “导出复盘报告”
 - “一键修复 CrashLoopBackOff”
+- “修复环境”（会走 quickstart 自动修复）
 
 执行策略：低风险命令默认自动执行；中高风险命令会弹出确认。
 
