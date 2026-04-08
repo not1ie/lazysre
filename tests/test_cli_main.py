@@ -18,8 +18,13 @@ from lazysre.cli.main import (
     _extract_command_candidates,
     _extract_named_field,
     _looks_like_apply_request,
+    _looks_like_doctor_request,
     _looks_like_fix_request,
     _looks_like_init_request,
+    _looks_like_install_doctor_request,
+    _looks_like_report_request,
+    _looks_like_status_request,
+    _looks_like_template_library_request,
     _parse_step_selection,
     _read_last_fix_plan_summary,
     _render_incident_report_markdown,
@@ -139,6 +144,11 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_fix_request("执行修复计划") is False
     assert _looks_like_init_request("请帮我初始化 lazysre")
     assert _looks_like_init_request("我要配置 OpenAI Key")
+    assert _looks_like_status_request("帮我看下当前状态")
+    assert _looks_like_doctor_request("做一次环境体检")
+    assert _looks_like_install_doctor_request("做一下安装检查")
+    assert _looks_like_report_request("导出复盘报告")
+    assert _looks_like_template_library_request("有哪些修复模板")
 
 
 def test_should_launch_assistant_with_only_options() -> None:

@@ -3866,7 +3866,7 @@ def _render_chat_short_help() -> None:
 def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("LazySRE 已启动，直接说需求即可（输入 exit/quit 退出）。")
     typer.echo("示例：1) 帮我排查 payment 延迟 2) 一键修复 CrashLoopBackOff")
-    typer.echo("不记命令也能用，详细命令随时输入 /help")
+    typer.echo("不需要记命令，直接用自然语言说你想做什么。")
     _maybe_auto_bootstrap_on_first_chat(options)
     while True:
         try:
@@ -3879,6 +3879,8 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower() in {"exit", "quit"}:
             break
+        if (not text.startswith("/")) and _handle_natural_intent(text, options):
+            continue
         if text.lower() in {"/help", "/h"}:
             _render_chat_short_help()
             continue
@@ -4178,6 +4180,8 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 audit_log=str(options["audit_log"]),
                 model=str(options["model"]),
                 provider=str(options["provider"]),
+                allow_high_risk=True,
+                auto_approve_low_risk=True,
             )
             continue
 
@@ -4189,6 +4193,8 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 audit_log=str(options["audit_log"]),
                 model=str(options["model"]),
                 provider=str(options["provider"]),
+                allow_high_risk=True,
+                auto_approve_low_risk=True,
             )
             continue
 
@@ -4215,8 +4221,8 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                         var_items=[],
                         apply=True,
                         max_apply_steps=6,
-                        allow_high_risk=False,
-                        auto_approve_low_risk=False,
+                        allow_high_risk=True,
+                        auto_approve_low_risk=True,
                         execute=bool(options["execute"]),
                         approval_mode=str(options["approval_mode"]),
                         audit_log=str(options["audit_log"]),
@@ -4275,6 +4281,134 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             provider=str(options["provider"]),
             max_steps=int(options["max_steps"]),
         )
+
+
+def _handle_natural_intent(text: str, options: dict[str, object]) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    if _looks_like_init_request(text):
+        report = _interactive_init_wizard(
+            profile_file=Path(settings.target_profile_file),
+            timeout_sec=6,
+            execute_probe=True,
+            audit_log=Path(str(options["audit_log"])),
+            secrets_file=None,
+        )
+        if _console:
+            _render_setup_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return True
+    if _looks_like_status_request(text):
+        include_probe = any(k in lowered for k in ("probe", "探测", "连通性", "健康检查"))
+        snapshot = _collect_runtime_status(
+            session_file=Path(str(options["session_file"])),
+            profile_file=Path(settings.target_profile_file),
+            include_probe=include_probe,
+            execute_probe=False,
+            timeout_sec=6,
+            audit_log=Path(str(options["audit_log"])),
+        )
+        if _console:
+            _render_status_snapshot(snapshot)
+        else:
+            typer.echo(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        return True
+    if _looks_like_install_doctor_request(text):
+        report = _collect_install_doctor_report()
+        report["gate"] = _build_doctor_gate(report, strict=False)
+        if _console:
+            _render_doctor_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return True
+    if _looks_like_doctor_request(text):
+        strict_mode = ("strict" in lowered) or ("严格" in lowered)
+        auto_fix = any(k in lowered for k in ("自动修复", "自动修正", "自动修复一下"))
+        target_store = TargetEnvStore()
+        target = target_store.load()
+        autofix_payload: dict[str, object] | None = None
+        if auto_fix:
+            autofix_payload = _apply_doctor_autofix(
+                target_store,
+                target,
+                write_backup=False,
+            )
+            target = target_store.load()
+        report = _collect_doctor_report(
+            target=target,
+            timeout_sec=6,
+            dry_run_probe=False,
+            audit_log=Path(str(options["audit_log"])),
+        )
+        if autofix_payload is not None:
+            report["autofix"] = autofix_payload
+        summary_obj = report.get("summary", {})
+        if isinstance(summary_obj, dict):
+            summary_obj["strict_mode"] = strict_mode
+            summary_obj["strict_healthy"] = _doctor_is_healthy(summary_obj, strict=strict_mode)
+        report["gate"] = _build_doctor_gate(report, strict=strict_mode)
+        if _console:
+            _render_doctor_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return True
+    if _looks_like_template_library_request(text):
+        template_list()
+        return True
+    template_candidate, apply_requested = maybe_detect_quick_fix_intent(text)
+    if template_candidate and (apply_requested or _looks_like_template_advice_request(text)):
+        _run_remediation_template(
+            template_name=template_candidate.name,
+            var_items=[],
+            apply=apply_requested,
+            max_apply_steps=6,
+            allow_high_risk=True,
+            auto_approve_low_risk=True,
+            execute=bool(options["execute"]),
+            approval_mode=str(options["approval_mode"]),
+            audit_log=str(options["audit_log"]),
+            model=str(options["model"]),
+            provider=str(options["provider"]),
+        )
+        return True
+    if _looks_like_report_request(text):
+        fmt = "json" if "json" in lowered else "markdown"
+        push_to_git = any(k in lowered for k in ("push", "git", "提交", "归档到仓库"))
+        result = _export_incident_report(
+            session_file=Path(str(options["session_file"])),
+            target_profile_file=Path(settings.target_profile_file),
+            include_doctor=True,
+            include_memory=True,
+            turn_limit=20,
+            audit_log=Path(str(options["audit_log"])),
+            fmt=fmt,
+            output="",
+            push_to_git=push_to_git,
+            git_remote="origin",
+            git_message="",
+        )
+        typer.echo(f"Report exported: {result['out_path']}")
+        archived = str(result.get("archived_path", "")).strip()
+        if archived:
+            if bool(result.get("pushed", False)):
+                typer.echo(f"Report archived & pushed: {archived}")
+            else:
+                typer.echo(f"Report archived (no changes to push): {archived}")
+        return True
+    if _looks_like_memory_request(text):
+        store = _open_incident_memory_store()
+        if not store:
+            typer.echo("memory store is unavailable.")
+            return True
+        rows = store.search_similar(text, limit=5)
+        if rows:
+            _render_memory_cases(rows, title=f"Incident Memory Search: {text[:40]}")
+        else:
+            _render_memory_cases(store.list_recent(limit=8), title="Incident Memory (Recent)")
+        return True
+    return False
 
 
 def _run_remediation_template(
@@ -4480,11 +4614,14 @@ def _execute_fix_plan_steps(
             provider=provider,
         )
         _render_step_risk(idx, total, command_text, report, impact_statement=impact_statement)
+        risk_level = str(report.get("risk_level", "low")).strip().lower()
         allow_execute, need_confirm = evaluate_apply_guardrail(
-            risk_level=str(report.get("risk_level", "low")),
+            risk_level=risk_level,
             allow_high_risk=allow_high_risk,
             auto_approve_low_risk=auto_approve_low_risk,
         )
+        if risk_level == "low":
+            need_confirm = False
         if not allow_execute:
             skipped_high_risk += 1
             typer.echo(f"[step {idx}/{total}] 已跳过高风险步骤（如需执行请加 --allow-high-risk）")
@@ -4493,8 +4630,8 @@ def _execute_fix_plan_steps(
             not typer.confirm(f"[step {idx}/{total}] 是否执行该步骤？", default=False)
         ):
             continue
-        if (not need_confirm) and auto_approve_low_risk:
-            typer.echo(f"[step {idx}/{total}] low-risk 自动通过确认")
+        if not need_confirm:
+            typer.echo(f"[step {idx}/{total}] low-risk 自动执行（无需确认）")
         result_exec = asyncio.run(executor.run(command))
         executed += 1
         if result_exec.ok:
@@ -4524,6 +4661,8 @@ def _apply_last_fix_plan(
     audit_log: str,
     model: str,
     provider: str,
+    allow_high_risk: bool = False,
+    auto_approve_low_risk: bool = False,
 ) -> None:
     plan = _load_last_fix_plan()
     if not plan:
@@ -4535,8 +4674,8 @@ def _apply_last_fix_plan(
         execute=execute,
         approval_mode=approval_mode,
         audit_log=audit_log,
-        allow_high_risk=False,
-        auto_approve_low_risk=False,
+        allow_high_risk=allow_high_risk,
+        auto_approve_low_risk=auto_approve_low_risk,
         model=model,
         provider=provider,
     )
@@ -4737,6 +4876,109 @@ def _parse_step_selection(raw: str, *, max_step: int) -> set[int]:
         if 1 <= idx <= max_step:
             selected.add(idx)
     return selected
+
+
+def _looks_like_status_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "查看状态",
+        "看看状态",
+        "当前状态",
+        "系统状态",
+        "运行状态",
+        "状态总览",
+        "show status",
+        "runtime status",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_install_doctor_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "安装检查",
+        "安装体检",
+        "node环境检查",
+        "npm环境检查",
+        "install doctor",
+        "check install",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_doctor_request(text: str) -> bool:
+    if _looks_like_install_doctor_request(text):
+        return False
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "环境体检",
+        "环境检查",
+        "健康检查",
+        "运行体检",
+        "自检",
+        "doctor",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_report_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "复盘报告",
+        "导出报告",
+        "生成报告",
+        "incident report",
+        "export report",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_memory_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "历史案例",
+        "相似案例",
+        "故障记忆",
+        "memory case",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_template_library_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "模板库",
+        "修复模板",
+        "有哪些模板",
+        "template list",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_template_advice_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "怎么办",
+        "怎么处理",
+        "如何处理",
+        "怎么修",
+        "how to fix",
+    )
+    return any(k in lowered for k in keywords)
 
 
 def _looks_like_fix_request(text: str) -> bool:
