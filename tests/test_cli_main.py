@@ -19,6 +19,7 @@ from lazysre.cli.main import (
     _extract_named_field,
     _looks_like_apply_request,
     _looks_like_fix_request,
+    _looks_like_init_request,
     _parse_step_selection,
     _read_last_fix_plan_summary,
     _render_incident_report_markdown,
@@ -122,6 +123,12 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv5 = ["lsre", "template", "list"]
     _rewrite_argv_for_default_run(argv5)
     assert argv5 == ["lsre", "template", "list"]
+    argv6 = ["lsre", "init"]
+    _rewrite_argv_for_default_run(argv6)
+    assert argv6 == ["lsre", "init"]
+    argv7 = ["lsre", "login", "--api-key", "sk-xxx"]
+    _rewrite_argv_for_default_run(argv7)
+    assert argv7 == ["lsre", "login", "--api-key", "sk-xxx"]
 
 
 def test_detect_fix_and_apply_intent() -> None:
@@ -130,6 +137,8 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_apply_request("执行修复计划")
     assert _looks_like_apply_request("apply fix")
     assert _looks_like_fix_request("执行修复计划") is False
+    assert _looks_like_init_request("请帮我初始化 lazysre")
+    assert _looks_like_init_request("我要配置 OpenAI Key")
 
 
 def test_should_launch_assistant_with_only_options() -> None:
@@ -137,6 +146,9 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["--verbose-reasoning"]) is True
     assert _should_launch_assistant([]) is True
     assert _should_launch_assistant(["chat"]) is False
+    assert _should_launch_assistant(["init"]) is False
+    assert _should_launch_assistant(["login"]) is False
+    assert _should_launch_assistant(["logout"]) is False
     assert _should_launch_assistant(["status"]) is False
     assert _should_launch_assistant(["doctor"]) is False
     assert _should_launch_assistant(["install-doctor"]) is False

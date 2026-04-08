@@ -31,6 +31,7 @@ from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.session import SessionStore
 from lazysre.cli.memory import IncidentMemoryStore, MemoryCase, format_memory_context
+from lazysre.cli.secrets import SecretStore
 from lazysre.cli.runbook import (
     RunbookStore,
     RunbookTemplate,
@@ -312,6 +313,75 @@ def install_doctor(
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return
     _render_doctor_report(report)
+
+
+@app.command("login")
+def login(
+    api_key: Annotated[str, typer.Option("--api-key", help="OpenAI API Key. If empty, prompt securely.")] = "",
+    secrets_file: Annotated[str, typer.Option("--secrets-file", help="Secrets JSON file path.")] = "",
+) -> None:
+    store = SecretStore(Path(secrets_file).expanduser() if secrets_file.strip() else None)
+    key = api_key.strip()
+    if not key:
+        key = typer.prompt("请输入 OpenAI API Key", hide_input=True).strip()
+    if not key:
+        raise typer.BadParameter("API Key 不能为空")
+    store.set_openai_api_key(key)
+    masked = store.masked_openai_api_key() or "***"
+    typer.echo(f"OpenAI API Key 已保存: {masked} ({store.path})")
+    typer.echo("现在可直接运行：lazysre")
+
+
+@app.command("logout")
+def logout(
+    secrets_file: Annotated[str, typer.Option("--secrets-file", help="Secrets JSON file path.")] = "",
+) -> None:
+    store = SecretStore(Path(secrets_file).expanduser() if secrets_file.strip() else None)
+    removed = store.clear_openai_api_key()
+    if removed:
+        typer.echo("已清除本地 OpenAI API Key。")
+        return
+    typer.echo("本地未找到可清除的 OpenAI API Key。")
+
+
+@app.command("init")
+def init(
+    ctx: typer.Context,
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 6,
+    execute_probe: Annotated[bool, typer.Option("--execute-probe/--dry-run-probe", help="Execute probe commands during init.")] = True,
+    secrets_file: Annotated[str, typer.Option("--secrets-file", help="Secrets JSON file path.")] = "",
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
+    report = _interactive_init_wizard(
+        profile_file=Path(profile_file),
+        timeout_sec=timeout_sec,
+        execute_probe=execute_probe,
+        audit_log=Path(str(options["audit_log"])),
+        secrets_file=Path(secrets_file).expanduser() if secrets_file.strip() else None,
+    )
+    if _console:
+        _render_setup_report(report)
+    else:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 
 
 @app.command("setup")
@@ -1042,12 +1112,13 @@ async def _dispatch(
     ap_mode = (approval_mode or "balanced").strip().lower()
     if ap_mode not in {"strict", "balanced", "permissive"}:
         raise typer.BadParameter("approval_mode must be one of strict/balanced/permissive")
-    if mode == "openai" or (mode == "auto" and settings.openai_api_key):
-        if not settings.openai_api_key:
+    openai_key = _resolve_openai_api_key()
+    if mode == "openai" or (mode == "auto" and openai_key):
+        if not openai_key:
             raise typer.BadParameter(
-                "OPENAI_API_KEY is required when provider=openai",
+                "缺少 OpenAI API Key。请执行：lsre login（或设置 OPENAI_API_KEY）",
             )
-        llm = OpenAIResponsesLLM(settings.openai_api_key)
+        llm = OpenAIResponsesLLM(openai_key)
     else:
         llm = MockFunctionCallingLLM()
 
@@ -2918,6 +2989,7 @@ def _run_first_run_setup(
     apply_defaults: bool,
     audit_log: Path,
     write_marker: bool,
+    secrets_file: Path | None = None,
 ) -> dict[str, object]:
     store = TargetEnvStore(profile_file)
     target = store.load()
@@ -2932,7 +3004,7 @@ def _run_first_run_setup(
             )
 
     install_report = _collect_install_doctor_report()
-    openai_check = _build_openai_setup_check()
+    openai_check = _build_openai_setup_check(secrets_file=secrets_file)
     probe_report = asyncio.run(
         probe_target_environment(
             target,
@@ -2975,6 +3047,62 @@ def _run_first_run_setup(
     return report
 
 
+def _interactive_init_wizard(
+    *,
+    profile_file: Path,
+    timeout_sec: int,
+    execute_probe: bool,
+    audit_log: Path,
+    secrets_file: Path | None,
+) -> dict[str, object]:
+    typer.echo("LazySRE 初始化向导（约 30 秒）")
+    store = TargetEnvStore(profile_file)
+    target = store.load()
+    secret_store = SecretStore(secrets_file)
+
+    existing_key = _resolve_openai_api_key(secrets_file=secrets_file)
+    if existing_key:
+        masked = secret_store.masked_openai_api_key() or "***"
+        typer.echo(f"已检测到 OpenAI Key: {masked}")
+    else:
+        if typer.confirm("是否现在配置 OpenAI API Key？", default=True):
+            api_key = typer.prompt("OpenAI API Key", hide_input=True).strip()
+            if api_key:
+                secret_store.set_openai_api_key(api_key)
+                typer.echo("API Key 已保存。")
+
+    prom_default = str(target.prometheus_url or settings.target_prometheus_url or "").strip()
+    api_default = str(target.k8s_api_url or settings.target_k8s_api_url or "").strip()
+    ctx_default = str(target.k8s_context or settings.target_k8s_context or "").strip()
+    ns_default = str(target.k8s_namespace or settings.target_k8s_namespace or "default").strip() or "default"
+    verify_tls_default = bool(target.k8s_verify_tls)
+
+    prometheus_url = typer.prompt("Prometheus URL", default=prom_default).strip()
+    k8s_api_url = typer.prompt("K8s API URL", default=api_default).strip()
+    k8s_context = typer.prompt("kubectl context", default=ctx_default).strip()
+    k8s_namespace = typer.prompt("默认 namespace", default=ns_default).strip() or "default"
+    k8s_verify_tls = typer.confirm("是否校验 K8s TLS 证书？", default=verify_tls_default)
+
+    store.update(
+        prometheus_url=prometheus_url,
+        k8s_api_url=k8s_api_url,
+        k8s_context=k8s_context,
+        k8s_namespace=k8s_namespace,
+        k8s_verify_tls=k8s_verify_tls,
+    )
+
+    report = _run_first_run_setup(
+        profile_file=profile_file,
+        timeout_sec=timeout_sec,
+        execute_probe=execute_probe,
+        apply_defaults=False,
+        audit_log=audit_log,
+        write_marker=True,
+        secrets_file=secrets_file,
+    )
+    return report
+
+
 def _compute_setup_default_updates(target) -> dict[str, object]:
     updates: dict[str, object] = {}
     if not str(getattr(target, "prometheus_url", "") or "").strip():
@@ -2995,17 +3123,18 @@ def _compute_setup_default_updates(target) -> dict[str, object]:
     return updates
 
 
-def _build_openai_setup_check() -> dict[str, object]:
-    raw = str(settings.openai_api_key or "").strip()
+def _build_openai_setup_check(*, secrets_file: Path | None = None) -> dict[str, object]:
+    raw = _resolve_openai_api_key(secrets_file=secrets_file)
     masked = ""
     if raw:
         masked = f"{raw[:4]}...{raw[-4:]}" if len(raw) > 12 else "***"
+    source = "env" if str(settings.openai_api_key or "").strip() else ("secrets" if raw else "unset")
     return {
         "name": "runtime.openai_api_key",
         "ok": bool(raw),
         "severity": "pass" if raw else "error",
-        "detail": masked or "(unset)",
-        "hint": "" if raw else "设置 OPENAI_API_KEY 后可启用真实 LLM（否则仅 mock 模式）",
+        "detail": f"{masked or '(unset)'} ({source})",
+        "hint": "" if raw else "执行 lsre login 保存 API Key（或设置 OPENAI_API_KEY）后可启用真实 LLM",
     }
 
 
@@ -3060,7 +3189,45 @@ def _show_first_run_setup_hint_once() -> None:
     marker = Path(settings.data_dir) / "lsre-onboarding.json"
     if marker.exists():
         return
-    typer.echo("首次使用建议先运行 /setup 完成环境向导（仅需约 10 秒）。")
+    typer.echo("首次使用建议运行 /init（交互引导）或 /setup（自动检查）。")
+
+
+def _maybe_auto_bootstrap_on_first_chat(options: dict[str, object]) -> None:
+    marker = Path(settings.data_dir) / "lsre-onboarding.json"
+    if marker.exists():
+        return
+    _show_first_run_setup_hint_once()
+    try:
+        wants = typer.confirm("检测到首次使用，是否现在开始 30 秒初始化？", default=True)
+    except (EOFError, KeyboardInterrupt):
+        return
+    if not wants:
+        skip_report = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "ready": False,
+            "skipped": True,
+            "next_actions": ["用户跳过初始化，可随时执行：lsre init 或 /init"],
+        }
+        _write_setup_marker(skip_report)
+        return
+    report = _interactive_init_wizard(
+        profile_file=Path(settings.target_profile_file),
+        timeout_sec=6,
+        execute_probe=True,
+        audit_log=Path(str(options["audit_log"])),
+        secrets_file=None,
+    )
+    if _console:
+        _render_setup_report(report)
+    else:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def _resolve_openai_api_key(*, secrets_file: Path | None = None) -> str:
+    env_key = str(settings.openai_api_key or "").strip()
+    if env_key:
+        return env_key
+    return SecretStore(secrets_file).get_openai_api_key()
 
 
 def _render_setup_report(report: dict[str, object]) -> None:
@@ -3659,6 +3826,8 @@ def _render_chat_short_help() -> None:
     lines = [
         "LazySRE Chat 快捷命令",
         "- /help: 查看帮助",
+        "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
+        "- /login: 仅保存 OpenAI API Key",
         "- /setup [--dry-run-probe]: 首次启动向导（安装检查+目标探测+OpenAI Key）",
         "- /status: 查看当前会话、目标配置、最近修复计划",
         "- /status probe: 追加目标探测摘要（dry-run）",
@@ -3695,16 +3864,10 @@ def _render_chat_short_help() -> None:
 
 
 def _assistant_chat_loop(options: dict[str, object]) -> None:
-    typer.echo("LazySRE 自然语言助手已启动。直接输入问题即可，输入 exit/quit 退出。")
-    typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
-    typer.echo(
-        "快捷命令：/help /setup /status [/status probe] /doctor [/doctor fix] "
-        "[/doctor install] "
-        "/template [list|show|run|name] [args] "
-        "/runbook [list|show|render|run|add|remove|export|import|name] [args] "
-        "/report [args] /fix <问题> /apply /approve [steps] /memory [query]"
-    )
-    _show_first_run_setup_hint_once()
+    typer.echo("LazySRE 已启动，直接说需求即可（输入 exit/quit 退出）。")
+    typer.echo("示例：1) 帮我排查 payment 延迟 2) 一键修复 CrashLoopBackOff")
+    typer.echo("不记命令也能用，详细命令随时输入 /help")
+    _maybe_auto_bootstrap_on_first_chat(options)
     while True:
         try:
             line = typer.prompt("lsre")
@@ -3718,6 +3881,22 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             break
         if text.lower() in {"/help", "/h"}:
             _render_chat_short_help()
+            continue
+        if text.lower().startswith("/login"):
+            login(api_key="", secrets_file="")
+            continue
+        if text.lower().startswith("/init"):
+            report = _interactive_init_wizard(
+                profile_file=Path(settings.target_profile_file),
+                timeout_sec=6,
+                execute_probe=True,
+                audit_log=Path(str(options["audit_log"])),
+                secrets_file=None,
+            )
+            if _console:
+                _render_setup_report(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
             continue
         if text.lower().startswith("/setup"):
             setup_execute_probe = "--dry-run-probe" not in text.lower()
@@ -4011,6 +4190,20 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 model=str(options["model"]),
                 provider=str(options["provider"]),
             )
+            continue
+
+        if _looks_like_init_request(text):
+            report = _interactive_init_wizard(
+                profile_file=Path(settings.target_profile_file),
+                timeout_sec=6,
+                execute_probe=True,
+                audit_log=Path(str(options["audit_log"])),
+                secrets_file=None,
+            )
+            if _console:
+                _render_setup_report(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
             continue
 
         if _looks_like_fix_request(text):
@@ -4580,6 +4773,21 @@ def _looks_like_apply_request(text: str) -> bool:
     )
 
 
+def _looks_like_init_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(
+        keyword in lowered
+        for keyword in [
+            "初始化",
+            "init lazysre",
+            "配置api key",
+            "配置 openai key",
+            "登录openai",
+            "setup lazysre",
+        ]
+    )
+
+
 def _build_memory_context(instruction: str) -> str:
     try:
         store = _open_incident_memory_store()
@@ -4720,6 +4928,9 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     commands = {
         "run",
         "chat",
+        "login",
+        "logout",
+        "init",
         "fix",
         "approve",
         "status",
@@ -4771,6 +4982,9 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
     commands = {
         "run",
         "chat",
+        "login",
+        "logout",
+        "init",
         "fix",
         "approve",
         "status",

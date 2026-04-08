@@ -25,6 +25,10 @@ python -m lazysre
 lazysre install-doctor
 # 首次启动向导（安装检查+OpenAI Key+目标连通性）
 lazysre setup
+# 交互式初始化（更像 Gemini/Claude：一步步填完即可）
+lazysre init
+# 本地保存 OpenAI Key（后续无需每次 export）
+lazysre login
 ```
 
 说明：`npm install -g lazysre` 安装的是跨平台启动器；首次运行会自动检查并安装 Python 版 LazySRE 内核。
@@ -73,7 +77,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /setup /status /status probe /doctor [/doctor fix] [/doctor strict]
+# /help /init /login /setup /status /status probe /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
@@ -108,6 +112,11 @@ lsre doctor --auto-fix --write-backup
 lsre doctor --strict
 # 安装/发布环境自检（python/node/npm/gh）
 lsre install-doctor
+# 本地登录（保存 OpenAI Key 到 ~/.lazysre/secrets.json）
+lsre login
+lsre logout
+# 交互式初始化（推荐第一次使用）
+lsre init
 # 首次启动向导（建议首次使用执行）
 lsre setup
 lsre setup --dry-run-probe
