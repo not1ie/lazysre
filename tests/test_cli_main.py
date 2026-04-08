@@ -21,6 +21,9 @@ from lazysre.cli.main import (
     _extract_target_updates_from_text,
     _extract_profile_save_request,
     _extract_profile_switch_name,
+    _extract_profile_remove_request,
+    _extract_profile_export_request,
+    _extract_profile_import_request,
     _extract_command_candidates,
     _extract_named_field,
     _compose_template_var_items,
@@ -45,6 +48,9 @@ from lazysre.cli.main import (
     _looks_like_target_update_request,
     _looks_like_target_profile_current_request,
     _looks_like_target_profile_list_request,
+    _looks_like_target_profile_remove_request,
+    _looks_like_target_profile_export_request,
+    _looks_like_target_profile_import_request,
     _looks_like_read_then_write_strategy_request,
     _looks_like_switch_dry_run_request,
     _looks_like_switch_execute_request,
@@ -211,6 +217,9 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_target_show_request("查看目标配置")
     assert _looks_like_target_profile_current_request("看看当前profile")
     assert _looks_like_target_profile_list_request("列出所有profile")
+    assert _looks_like_target_profile_remove_request("删除profile prod")
+    assert _looks_like_target_profile_export_request("导出profile到 .data/p.json")
+    assert _looks_like_target_profile_import_request("从 .data/p.json 导入profile")
 
 
 def test_extract_apply_step_selection() -> None:
@@ -251,6 +260,33 @@ def test_extract_profile_save_request() -> None:
     name3, activate3 = _extract_profile_save_request("save current profile as qa and activate")
     assert name3 == "qa"
     assert activate3 is True
+
+
+def test_extract_profile_remove_request() -> None:
+    name1, confirmed1 = _extract_profile_remove_request("删除profile prod")
+    assert name1 == "prod"
+    assert confirmed1 is False
+    name2, confirmed2 = _extract_profile_remove_request("确认删除 staging")
+    assert name2 == "staging"
+    assert confirmed2 is True
+
+
+def test_extract_profile_export_request() -> None:
+    req = _extract_profile_export_request("导出prod profile到 .data/profiles.json")
+    assert req["output"] == ".data/profiles.json"
+    assert req["names"] == ["prod"]
+    req_all = _extract_profile_export_request("导出全部profile")
+    assert req_all["names"] == []
+
+
+def test_extract_profile_import_request() -> None:
+    req = _extract_profile_import_request("从 .data/profiles.json 导入profile 并激活@active")
+    assert req["input_file"] == ".data/profiles.json"
+    assert req["merge"] is True
+    assert req["activate"] == "@active"
+    req_replace = _extract_profile_import_request("import profiles from /tmp/a.json replace")
+    assert req_replace["input_file"] == "/tmp/a.json"
+    assert req_replace["merge"] is False
 
 
 def test_split_fix_plan_read_write_commands() -> None:

@@ -4118,6 +4118,7 @@ def _render_chat_short_help() -> None:
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
         "- 自然语言目标配置：把 namespace 设成 prod / 把 prometheus 设成 http://x:9090",
         "- 自然语言多集群：保存当前为 prod 并切换 / 切到 prod 集群 / 看看当前profile",
+        "- 自然语言档案管理：导出profile到 .data/p.json / 从 .data/p.json 导入profile / 删除profile prod（需确认）",
         "- /reset: 重置引导与聊天模式记忆",
         "- /undo: 回滚最近一次修复计划",
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
@@ -5883,6 +5884,125 @@ def _extract_profile_save_request(text: str) -> tuple[str, bool]:
     return name, activate
 
 
+def _tokenize_natural_text(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    try:
+        return [x for x in shlex.split(raw) if str(x).strip()]
+    except ValueError:
+        return [x for x in raw.split() if str(x).strip()]
+
+
+def _extract_json_path_from_text(text: str) -> str:
+    tokens = _tokenize_natural_text(text)
+    for token in tokens:
+        cleaned = str(token).strip().strip(",，;；。\"'")
+        if cleaned.lower().endswith(".json"):
+            return cleaned
+    fallback = re.search(r"([~./A-Za-z0-9_-]+\.json)", str(text or ""))
+    if fallback:
+        return str(fallback.group(1)).strip()
+    return ""
+
+
+def _looks_like_target_profile_remove_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    remove_words = ("删除", "移除", "remove", "delete")
+    target_words = ("profile", "集群", "环境档案", "当前profile")
+    return any(k in lowered for k in remove_words) and any(k in lowered for k in target_words)
+
+
+def _extract_profile_remove_request(text: str) -> tuple[str, bool]:
+    raw = str(text or "")
+    lowered = raw.lower()
+    patterns = [
+        r"(?:删除|移除)\s*(?:profile|集群)\s*([A-Za-z0-9._-]{1,40})",
+        r"(?:删除|移除)\s*([A-Za-z0-9._-]{1,40})\s*(?:profile|集群)?",
+        r"(?:remove|delete)\s*(?:profile)?\s*([A-Za-z0-9._-]{1,40})",
+    ]
+    name = ""
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = _normalize_profile_name(match.group(1))
+        if candidate and candidate not in {"profile", "cluster"}:
+            name = candidate
+            break
+    confirmed = any(
+        keyword in lowered
+        for keyword in [
+            "确认删除",
+            "确定删除",
+            "强制删除",
+            "--yes",
+            "confirm delete",
+        ]
+    )
+    return name, confirmed
+
+
+def _looks_like_target_profile_export_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    return ("导出" in lowered and ("profile" in lowered or "集群" in lowered or "json" in lowered)) or (
+        "export" in lowered and ("profile" in lowered or "json" in lowered)
+    )
+
+
+def _extract_profile_export_request(text: str) -> dict[str, object]:
+    raw = str(text or "")
+    lowered = raw.lower()
+    output = _extract_json_path_from_text(raw)
+    names: list[str] = []
+
+    for match in re.finditer(r"(?:导出|export)\s*([A-Za-z0-9._-]{1,40})\s*(?:profile|集群)", raw, flags=re.IGNORECASE):
+        candidate = _normalize_profile_name(match.group(1))
+        if candidate and candidate not in names:
+            names.append(candidate)
+
+    name_field = re.search(r"(?:profiles?|集群)\s*[:：]\s*([A-Za-z0-9._,\-\s]+)", raw, flags=re.IGNORECASE)
+    if name_field:
+        for token in re.split(r"[,，\s]+", str(name_field.group(1)).strip()):
+            candidate = _normalize_profile_name(token)
+            if candidate and candidate not in names:
+                names.append(candidate)
+
+    if any(k in lowered for k in ["全部", "all"]):
+        names = []
+    return {"output": output, "names": names}
+
+
+def _looks_like_target_profile_import_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    return ("导入" in lowered and ("profile" in lowered or "集群" in lowered or "json" in lowered)) or (
+        "import" in lowered and ("profile" in lowered or "json" in lowered)
+    )
+
+
+def _extract_profile_import_request(text: str) -> dict[str, object]:
+    lowered = str(text or "").lower()
+    input_file = _extract_json_path_from_text(text)
+    merge = not any(k in lowered for k in ["replace", "覆盖", "替换全部", "全量替换"])
+    activate = ""
+    match = re.search(
+        r"(?:激活|activate)\s*([@A-Za-z0-9._-]{1,40})",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    if match:
+        activate = str(match.group(1)).strip()
+    elif any(k in lowered for k in ["并激活导入的active", "激活导入active", "activate imported active"]):
+        activate = "@active"
+    return {"input_file": input_file, "merge": merge, "activate": activate}
+
+
 def _looks_like_target_profile_list_request(text: str) -> bool:
     lowered = text.lower().strip()
     if not lowered:
@@ -5922,6 +6042,87 @@ def _looks_like_target_profile_current_request(text: str) -> bool:
 
 
 def _maybe_handle_target_profile_natural_intent(text: str) -> bool:
+    if _looks_like_target_profile_export_request(text):
+        req = _extract_profile_export_request(text)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        out_path = Path(str(req.get("output", "")).strip() or f".data/lsre-target-profiles-export-{stamp}.json")
+        names = [str(x).strip() for x in list(req.get("names", [])) if str(x).strip()]
+        store = ClusterProfileStore(Path(settings.target_profiles_file))
+        payload = store.export_payload(names=names)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        count = len(payload.get("profiles", {})) if isinstance(payload.get("profiles", {}), dict) else 0
+        typer.echo(f"已导出 {count} 个 profile -> {out_path}")
+        return True
+
+    if _looks_like_target_profile_import_request(text):
+        req = _extract_profile_import_request(text)
+        input_file = str(req.get("input_file", "")).strip()
+        if not input_file:
+            typer.echo("请提供导入 JSON 文件路径。示例：从 .data/profiles.json 导入 profile")
+            return True
+        in_path = Path(input_file).expanduser()
+        if not in_path.exists():
+            typer.echo(f"import file not found: {in_path}")
+            return True
+        try:
+            raw = json.loads(in_path.read_text(encoding="utf-8"))
+        except Exception:
+            typer.echo(f"import file is not valid json: {in_path}")
+            return True
+        if not isinstance(raw, dict):
+            typer.echo("import payload must be a JSON object")
+            return True
+        store = ClusterProfileStore(Path(settings.target_profiles_file))
+        try:
+            result = store.import_payload(raw, merge=bool(req.get("merge", True)))
+        except ValueError as exc:
+            typer.echo(str(exc))
+            return True
+        activate_value = str(req.get("activate", "")).strip()
+        activated = ""
+        if activate_value:
+            activated = str(result.get("active", "")).strip() if activate_value == "@active" else activate_value
+            if not activated:
+                typer.echo("import payload has no active profile to activate")
+                return True
+            ok = store.activate(activated, target_profile_file=Path(settings.target_profile_file))
+            if not ok:
+                typer.echo(f"profile not found after import: {activated}")
+                return True
+        typer.echo(
+            "Imported profiles: "
+            f"imported={result.get('imported', 0)} "
+            f"created={result.get('created', 0)} "
+            f"updated={result.get('updated', 0)} "
+            f"total={result.get('total', 0)}"
+        )
+        if activated:
+            typer.echo(f"Activated profile: {activated}")
+        return True
+
+    if _looks_like_target_profile_remove_request(text):
+        name, confirmed = _extract_profile_remove_request(text)
+        store = ClusterProfileStore(Path(settings.target_profiles_file))
+        if (not name) and ("当前profile" in str(text or "").lower() or "当前集群" in str(text or "")):
+            name = store.get_active()
+        if not name:
+            typer.echo("请指定要删除的 profile 名称。示例：删除 profile prod")
+            return True
+        if not confirmed:
+            if not _stdin_interactive():
+                typer.echo(f"删除 profile {name} 需要确认。请使用“确认删除 {name}”重试。")
+                return True
+            if not typer.confirm(f"确认删除 profile {name} 吗？", default=False):
+                typer.echo("Canceled.")
+                return True
+        removed = store.remove_profile(name)
+        if not removed:
+            typer.echo(f"profile not found: {name}")
+            return True
+        typer.echo(f"Removed profile: {name}")
+        return True
+
     save_name, activate = _extract_profile_save_request(text)
     if save_name:
         env = TargetEnvStore(Path(settings.target_profile_file)).load()
