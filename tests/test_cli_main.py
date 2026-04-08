@@ -15,9 +15,12 @@ from lazysre.cli.main import (
     _collect_runtime_status,
     _default_report_output_path,
     _doctor_is_healthy,
+    _extract_template_var_items_from_text,
     _extract_command_candidates,
     _extract_named_field,
+    _compose_template_var_items,
     _looks_like_apply_request,
+    _looks_like_context_request,
     _looks_like_doctor_request,
     _looks_like_fix_request,
     _looks_like_help_request,
@@ -165,6 +168,41 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_switch_execute_request("切换到执行模式")
     assert _looks_like_switch_dry_run_request("切回dry-run")
     assert _looks_like_reset_request("我要重置一下")
+    assert _looks_like_context_request("你记住了什么")
+
+
+def test_extract_template_vars_and_compose_with_session(tmp_path: Path) -> None:
+    extracted = _extract_template_var_items_from_text(
+        "请一键修复 CrashLoopBackOff namespace=prod pod=pay-7 deploy/payment 副本 4"
+    )
+    assert "namespace=prod" in extracted
+    assert "pod=pay-7" in extracted
+    assert "workload=deploy/payment" in extracted
+    assert "replicas=4" in extracted
+
+    session_file = tmp_path / "session.json"
+    session_file.write_text(
+        json.dumps(
+            {
+                "turns": [],
+                "entities": {
+                    "last_namespace": "ops",
+                    "last_service": "payment",
+                    "last_pod": "payment-abc-1",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    merged = _compose_template_var_items(
+        "帮我修复 CrashLoopBackOff",
+        {"session_file": str(session_file)},
+    )
+    assert "namespace=ops" in merged
+    assert "service=payment" in merged
+    assert "pod=payment-abc-1" in merged
+    assert "workload=deploy/payment" in merged
 
 
 def test_should_launch_assistant_with_only_options() -> None:

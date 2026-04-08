@@ -89,6 +89,18 @@ class SessionStore:
             )
         return rows
 
+    def entities(self) -> dict[str, str]:
+        payload = self.load()
+        raw = payload.get("entities", {})
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, str] = {}
+        for key in ("last_pod", "last_service", "last_namespace"):
+            value = str(raw.get(key, "")).strip()
+            if value:
+                out[key] = value
+        return out
+
     def build_dialogue_context(self, *, max_chars: int = 2400) -> str:
         payload = self.load()
         turns = payload.get("turns", [])

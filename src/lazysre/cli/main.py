@@ -4076,6 +4076,7 @@ def _render_chat_short_help() -> None:
         "- /help: 查看帮助",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
+        "- /context: 查看会话记忆（最近 pod/service/namespace）",
         "- /reset: 重置引导与聊天模式记忆",
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
         "- /quickstart: 一键自动修复环境并完成快速就绪",
@@ -4154,6 +4155,9 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower() in {"/mode", "/mode show"}:
             _render_mode_hint(runtime_execute)
+            continue
+        if text.lower() in {"/context", "/ctx"}:
+            _render_context_snapshot(options, execute_mode=runtime_execute)
             continue
         if text.lower().startswith("/mode "):
             tail = text[len("/mode ") :].strip().lower()
@@ -4433,7 +4437,11 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 continue
             _run_remediation_template(
                 template_name=str(parsed.get("name", "")),
-                var_items=[str(x) for x in list(parsed.get("var_items", []))],
+                var_items=_compose_template_var_items(
+                    " ".join([text] + [str(x) for x in list(parsed.get("var_items", []))]),
+                    options,
+                    base_items=[str(x) for x in list(parsed.get("var_items", []))],
+                ),
                 apply=bool(parsed.get("apply", False)),
                 max_apply_steps=int(parsed.get("max_apply_steps", 6)),
                 allow_high_risk=bool(parsed.get("allow_high_risk", False)),
@@ -4534,10 +4542,11 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
         if _looks_like_fix_request(text):
             template_candidate, apply_requested = maybe_detect_quick_fix_intent(text)
             if template_candidate:
+                auto_vars = _compose_template_var_items(text, options)
                 if apply_requested:
                     _run_remediation_template(
                         template_name=template_candidate.name,
-                        var_items=[],
+                        var_items=auto_vars,
                         apply=True,
                         max_apply_steps=6,
                         allow_high_risk=True,
@@ -4610,6 +4619,9 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
     lowered = text.lower().strip()
     if not lowered:
         return False
+    if _looks_like_context_request(text):
+        _render_context_snapshot(options, execute_mode=execute_mode)
+        return True
     if _looks_like_reset_request(text):
         reset(
             reset_onboarding=True,
@@ -4707,9 +4719,10 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
         return True
     template_candidate, apply_requested = maybe_detect_quick_fix_intent(text)
     if template_candidate and (apply_requested or _looks_like_template_advice_request(text)):
+        auto_vars = _compose_template_var_items(text, options)
         _run_remediation_template(
             template_name=template_candidate.name,
-            var_items=[],
+            var_items=auto_vars,
             apply=apply_requested,
             max_apply_steps=6,
             allow_high_risk=True,
@@ -5236,6 +5249,29 @@ def _render_mode_hint(execute_mode: bool) -> None:
     typer.echo(f"当前模式: {mode} ({detail})")
 
 
+def _render_context_snapshot(options: dict[str, object], *, execute_mode: bool) -> None:
+    session = SessionStore(Path(str(options["session_file"])))
+    entities = session.entities()
+    turns = session.recent_turns(limit=10)
+    payload = {
+        "mode": "execute" if execute_mode else "dry-run",
+        "session_turns": len(turns),
+        "entities": entities,
+    }
+    if not (_console and Table):
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    table = Table(title="LazySRE Context")
+    table.add_column("Item", style="cyan", no_wrap=True)
+    table.add_column("Value", style="white")
+    table.add_row("Mode", payload["mode"])
+    table.add_row("Session Turns", str(payload["session_turns"]))
+    table.add_row("last_namespace", entities.get("last_namespace", "(none)"))
+    table.add_row("last_service", entities.get("last_service", "(none)"))
+    table.add_row("last_pod", entities.get("last_pod", "(none)"))
+    _console.print(table)
+
+
 def _resolve_execute_for_apply_request(execute_mode: bool, *, label: str, apply: bool) -> bool:
     if not apply:
         return execute_mode
@@ -5251,6 +5287,142 @@ def _resolve_execute_for_apply_request(execute_mode: bool, *, label: str, apply:
     except (EOFError, KeyboardInterrupt):
         return False
     return bool(promote)
+
+
+def _compose_template_var_items(
+    text: str,
+    options: dict[str, object],
+    *,
+    base_items: list[str] | None = None,
+) -> list[str]:
+    merged: dict[str, str] = {}
+    if base_items:
+        for raw in base_items:
+            token = str(raw).strip()
+            if (not token) or ("=" not in token):
+                continue
+            key, value = token.split("=", 1)
+            k = key.strip()
+            if not k:
+                continue
+            merged[k] = value.strip()
+    extracted = _extract_template_var_items_from_text(text)
+    for raw in extracted:
+        if "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        k = key.strip()
+        if not k:
+            continue
+        if k not in merged:
+            merged[k] = value.strip()
+
+    entities = SessionStore(Path(str(options["session_file"]))).entities()
+    if ("namespace" not in merged) and entities.get("last_namespace"):
+        merged["namespace"] = entities["last_namespace"]
+    if ("pod" not in merged) and entities.get("last_pod"):
+        merged["pod"] = entities["last_pod"]
+    if ("service" not in merged) and entities.get("last_service"):
+        merged["service"] = entities["last_service"]
+    if ("workload" not in merged) and merged.get("service"):
+        merged["workload"] = f"deploy/{merged['service']}"
+
+    preferred_order = [
+        "namespace",
+        "service",
+        "workload",
+        "pod",
+        "container",
+        "image",
+        "replicas",
+        "rollback_replicas",
+    ]
+    out: list[str] = []
+    for key in preferred_order:
+        if key in merged and str(merged[key]).strip():
+            out.append(f"{key}={merged[key]}")
+    for key, value in merged.items():
+        if key in preferred_order:
+            continue
+        if str(value).strip():
+            out.append(f"{key}={value}")
+    return out
+
+
+def _extract_template_var_items_from_text(text: str) -> list[str]:
+    raw = str(text or "")
+    lowered = raw.lower()
+    found: dict[str, str] = {}
+
+    def set_if(key: str, value: str) -> None:
+        v = str(value or "").strip()
+        if v:
+            found[key] = v
+
+    key_patterns = [
+        "namespace",
+        "pod",
+        "workload",
+        "service",
+        "container",
+        "image",
+        "replicas",
+        "rollback_replicas",
+    ]
+    for key in key_patterns:
+        for match in re.finditer(
+            rf"\b{re.escape(key)}\s*[:=]\s*([^\s,;，。]+)",
+            lowered,
+            flags=re.IGNORECASE,
+        ):
+            set_if(key, match.group(1))
+
+    ns_short = re.search(r"(?:^|\s)-n\s+([a-z0-9-]+)\b", lowered)
+    if ns_short:
+        set_if("namespace", ns_short.group(1))
+    ns_long = re.search(r"--namespace\s+([a-z0-9-]+)\b", lowered)
+    if ns_long:
+        set_if("namespace", ns_long.group(1))
+    ns_cn = re.search(r"命名空间\s*[:：]?\s*([a-z0-9-]+)\b", lowered)
+    if ns_cn:
+        set_if("namespace", ns_cn.group(1))
+
+    workload_slash = re.search(r"\b(deploy/[a-z0-9-]+)\b", lowered)
+    if workload_slash:
+        set_if("workload", workload_slash.group(1))
+    deployment_name = re.search(r"\bdeployment\s+([a-z0-9-]+)\b", lowered)
+    if deployment_name and ("workload" not in found):
+        set_if("workload", f"deploy/{deployment_name.group(1)}")
+
+    service_cn = re.search(r"服务\s*[:：]?\s*([a-z0-9-]+)\b", lowered)
+    if service_cn and ("service" not in found):
+        set_if("service", service_cn.group(1))
+    pod_cn = re.search(r"pod\s*[:：]?\s*([a-z0-9][-a-z0-9.]*)", lowered)
+    if pod_cn and ("pod" not in found):
+        set_if("pod", pod_cn.group(1))
+
+    replicas_cn = re.search(r"副本\s*[:：]?\s*(\d+)\b", lowered)
+    if replicas_cn and ("replicas" not in found):
+        set_if("replicas", replicas_cn.group(1))
+    rollback_cn = re.search(r"回滚副本\s*[:：]?\s*(\d+)\b", lowered)
+    if rollback_cn and ("rollback_replicas" not in found):
+        set_if("rollback_replicas", rollback_cn.group(1))
+
+    preferred_order = [
+        "namespace",
+        "service",
+        "workload",
+        "pod",
+        "container",
+        "image",
+        "replicas",
+        "rollback_replicas",
+    ]
+    out: list[str] = []
+    for key in preferred_order:
+        if key in found:
+            out.append(f"{key}={found[key]}")
+    return out
 
 
 def _looks_like_help_request(text: str) -> bool:
@@ -5300,6 +5472,20 @@ def _looks_like_reset_request(text: str) -> bool:
         "重置引导",
         "重新开始",
         "reset",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _looks_like_context_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "你记住了什么",
+        "上下文",
+        "当前上下文",
+        "context",
+        "最近对象",
     )
     return any(k in lowered for k in keywords)
 

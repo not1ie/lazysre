@@ -52,6 +52,9 @@ def test_session_store_builds_pronoun_hint(tmp_path: Path) -> None:
     hint = store.build_context_hint("重启它")
     assert "last_pod=payment-abc-123" in hint
     assert "last_namespace=prod" in hint
+    entities = store.entities()
+    assert entities["last_pod"] == "payment-abc-123"
+    assert entities["last_namespace"] == "prod"
 
 
 def test_session_store_recent_clear_and_export(tmp_path: Path) -> None:
