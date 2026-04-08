@@ -31,6 +31,7 @@ from lazysre.cli.main import (
     _parse_chat_runbook_command,
     _parse_chat_runbook_var_extra,
     _parse_chat_report_command,
+    _parse_chat_template_command,
     _collect_install_doctor_report,
     _safe_run_command,
     _should_launch_assistant,
@@ -115,6 +116,12 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv3 = ["lsre", "install-doctor", "--json"]
     _rewrite_argv_for_default_run(argv3)
     assert argv3 == ["lsre", "install-doctor", "--json"]
+    argv4 = ["lsre", "setup", "--json"]
+    _rewrite_argv_for_default_run(argv4)
+    assert argv4 == ["lsre", "setup", "--json"]
+    argv5 = ["lsre", "template", "list"]
+    _rewrite_argv_for_default_run(argv5)
+    assert argv5 == ["lsre", "template", "list"]
 
 
 def test_detect_fix_and_apply_intent() -> None:
@@ -133,6 +140,8 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["status"]) is False
     assert _should_launch_assistant(["doctor"]) is False
     assert _should_launch_assistant(["install-doctor"]) is False
+    assert _should_launch_assistant(["setup"]) is False
+    assert _should_launch_assistant(["template"]) is False
     assert _should_launch_assistant(["report"]) is False
     assert _should_launch_assistant(["runbook"]) is False
     assert _should_launch_assistant(["approve"]) is False
@@ -573,6 +582,25 @@ def test_parse_chat_report_command_errors() -> None:
         _parse_chat_report_command("--limit abc")
     with pytest.raises(ValueError):
         _parse_chat_report_command("--unknown")
+
+
+def test_parse_chat_template_command_variants() -> None:
+    parsed_list = _parse_chat_template_command("")
+    assert parsed_list["action"] == "list"
+
+    parsed_show = _parse_chat_template_command("show k8s-high-cpu")
+    assert parsed_show["action"] == "show"
+    assert parsed_show["name"] == "k8s-high-cpu"
+
+    parsed_run = _parse_chat_template_command(
+        "run k8s-crashloopbackoff --apply --var namespace=prod pod=pay-123 --max-apply-steps 3"
+    )
+    assert parsed_run["action"] == "run"
+    assert parsed_run["name"] == "k8s-crashloopbackoff"
+    assert parsed_run["apply"] is True
+    assert parsed_run["max_apply_steps"] == 3
+    assert "namespace=prod" in parsed_run["var_items"]
+    assert "pod=pay-123" in parsed_run["var_items"]
 
 
 def test_safe_run_command_success_and_failure() -> None:

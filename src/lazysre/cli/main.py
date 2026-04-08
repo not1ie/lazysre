@@ -39,6 +39,14 @@ from lazysre.cli.runbook import (
     parse_runbook_vars,
     render_runbook_instruction,
 )
+from lazysre.cli.remediation_templates import (
+    get_template as get_remediation_template,
+    list_templates as list_remediation_templates,
+    match_template_for_text,
+    maybe_detect_quick_fix_intent,
+    parse_var_items as parse_remediation_var_items,
+    render_template as render_remediation_template,
+)
 from lazysre.cli.target import TargetEnvStore, probe_target_environment
 from lazysre.cli.target_profiles import ClusterProfileStore
 from lazysre.cli.tools import build_default_registry
@@ -77,6 +85,7 @@ target_profile_app = typer.Typer(help="Multi-cluster target profile management."
 history_app = typer.Typer(help="Session history management.")
 memory_app = typer.Typer(help="Long-term incident memory management.")
 runbook_app = typer.Typer(help="Workflow runbook templates.")
+template_app = typer.Typer(help="One-click remediation templates.")
 
 
 @app.callback(invoke_without_command=True)
@@ -305,6 +314,49 @@ def install_doctor(
     _render_doctor_report(report)
 
 
+@app.command("setup")
+def setup(
+    ctx: typer.Context,
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 6,
+    execute_probe: Annotated[bool, typer.Option("--execute-probe/--dry-run-probe", help="Execute probe commands for real checks.")] = True,
+    apply_defaults: Annotated[bool, typer.Option("--apply-defaults/--no-apply-defaults", help="Fill empty target config with built-in defaults.")] = True,
+    write_marker: Annotated[bool, typer.Option("--write-marker/--no-write-marker", help="Write first-run marker file under .data/.")] = True,
+    as_json: Annotated[bool, typer.Option("--json", help="Print setup report as JSON.")] = False,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
+    report = _run_first_run_setup(
+        profile_file=Path(profile_file),
+        timeout_sec=timeout_sec,
+        execute_probe=execute_probe,
+        apply_defaults=apply_defaults,
+        audit_log=Path(str(options["audit_log"])),
+        write_marker=write_marker,
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_setup_report(report)
+
+
 @app.command("report")
 def report(
     ctx: typer.Context,
@@ -356,6 +408,88 @@ def report(
             typer.echo(f"Report archived & pushed: {archived}")
         else:
             typer.echo(f"Report archived (no changes to push): {archived}")
+
+
+@template_app.command("list")
+def template_list() -> None:
+    templates = list_remediation_templates()
+    if not (_console and Table):
+        payload = [item.to_dict() for item in templates]
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    table = Table(title="LazySRE Remediation Templates")
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Risk", style="yellow", no_wrap=True)
+    table.add_column("Aliases", style="green")
+    table.add_column("Description", style="white")
+    for item in templates:
+        table.add_row(
+            item.name,
+            item.risk_level,
+            ", ".join(item.aliases[:4]),
+            item.description,
+        )
+    _console.print(table)
+
+
+@template_app.command("show")
+def template_show(
+    name: Annotated[str, typer.Argument(help="Template name or alias.")],
+) -> None:
+    template = get_remediation_template(name)
+    if not template:
+        raise typer.BadParameter(f"template not found: {name}")
+    payload = render_remediation_template(template=template, overrides={})
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@template_app.command("run")
+def template_run(
+    ctx: typer.Context,
+    name: Annotated[str, typer.Argument(help="Template name or alias.")],
+    var: Annotated[list[str], typer.Option("--var", help="Template variables, format key=value, repeatable.")] = [],
+    apply: Annotated[bool, typer.Option("--apply", help="Execute generated apply commands with confirmation gate.")] = False,
+    max_apply_steps: Annotated[int, typer.Option("--max-apply-steps", help="Max number of apply commands to execute.")] = 6,
+    allow_high_risk: Annotated[bool, typer.Option("--allow-high-risk", help="Allow high/critical risk steps in apply mode.")] = False,
+    auto_approve_low_risk: Annotated[bool, typer.Option("--auto-approve-low-risk", help="Auto-approve low-risk steps in apply mode.")] = False,
+    execute: Annotated[bool | None, typer.Option("--execute", help="Override execution mode for apply steps.")] = None,
+    approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
+    audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
+    model: Annotated[str | None, typer.Option(help="Override model.")] = None,
+    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=execute,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=model,
+        provider=provider,
+        max_steps=None,
+    )
+    _run_remediation_template(
+        template_name=name,
+        var_items=list(var),
+        apply=apply,
+        max_apply_steps=max(1, min(max_apply_steps, 30)),
+        allow_high_risk=allow_high_risk,
+        auto_approve_low_risk=auto_approve_low_risk,
+        execute=bool(options["execute"]),
+        approval_mode=str(options["approval_mode"]),
+        audit_log=str(options["audit_log"]),
+        model=str(options["model"]),
+        provider=str(options["provider"]),
+    )
 
 
 @app.command("approve")
@@ -2078,6 +2212,7 @@ app.add_typer(target_app, name="target")
 app.add_typer(history_app, name="history")
 app.add_typer(memory_app, name="memory")
 app.add_typer(runbook_app, name="runbook")
+app.add_typer(template_app, name="template")
 
 
 def _render_timeline(events) -> None:
@@ -2775,6 +2910,238 @@ def _safe_run_command(command: list[str], *, timeout_sec: int) -> dict[str, obje
     }
 
 
+def _run_first_run_setup(
+    *,
+    profile_file: Path,
+    timeout_sec: int,
+    execute_probe: bool,
+    apply_defaults: bool,
+    audit_log: Path,
+    write_marker: bool,
+) -> dict[str, object]:
+    store = TargetEnvStore(profile_file)
+    target = store.load()
+    setup_actions: list[str] = []
+    if apply_defaults:
+        updates = _compute_setup_default_updates(target)
+        if updates:
+            target = store.update(**updates)
+            setup_actions.extend(
+                f"set {key}={value}" if key != "k8s_bearer_token" else "set k8s_bearer_token=(hidden)"
+                for key, value in updates.items()
+            )
+
+    install_report = _collect_install_doctor_report()
+    openai_check = _build_openai_setup_check()
+    probe_report = asyncio.run(
+        probe_target_environment(
+            target,
+            executor=SafeExecutor(
+                dry_run=(not execute_probe),
+                approval_mode="permissive",
+                approval_granted=True,
+                audit_logger=AuditLogger(audit_log),
+            ),
+            timeout_sec=timeout_sec,
+        )
+    )
+    probe_summary = dict(probe_report.get("summary", {})) if isinstance(probe_report, dict) else {}
+    openai_ok = bool(openai_check.get("ok"))
+    install_summary = dict(install_report.get("summary", {})) if isinstance(install_report, dict) else {}
+    install_errors = int(install_summary.get("error", 0))
+    probe_ok = bool(probe_summary.get("all_ok"))
+    ready = bool(openai_ok and install_errors == 0 and probe_ok)
+
+    next_actions = _build_setup_next_actions(
+        openai_ok=openai_ok,
+        install_report=install_report,
+        probe_report=probe_report,
+    )
+    report = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "profile_file": str(profile_file),
+        "execute_probe": execute_probe,
+        "apply_defaults": apply_defaults,
+        "actions": setup_actions,
+        "ready": ready,
+        "openai": openai_check,
+        "install": install_report,
+        "probe": probe_report,
+        "next_actions": next_actions,
+    }
+    if write_marker:
+        marker = _write_setup_marker(report)
+        report["marker_file"] = str(marker)
+    return report
+
+
+def _compute_setup_default_updates(target) -> dict[str, object]:
+    updates: dict[str, object] = {}
+    if not str(getattr(target, "prometheus_url", "") or "").strip():
+        candidate = str(settings.target_prometheus_url or "").strip()
+        if candidate:
+            updates["prometheus_url"] = candidate
+    if not str(getattr(target, "k8s_api_url", "") or "").strip():
+        candidate = str(settings.target_k8s_api_url or "").strip()
+        if candidate:
+            updates["k8s_api_url"] = candidate
+    if not str(getattr(target, "k8s_context", "") or "").strip():
+        candidate = str(settings.target_k8s_context or "").strip()
+        if candidate:
+            updates["k8s_context"] = candidate
+    if not str(getattr(target, "k8s_namespace", "") or "").strip():
+        candidate = str(settings.target_k8s_namespace or "").strip() or "default"
+        updates["k8s_namespace"] = candidate
+    return updates
+
+
+def _build_openai_setup_check() -> dict[str, object]:
+    raw = str(settings.openai_api_key or "").strip()
+    masked = ""
+    if raw:
+        masked = f"{raw[:4]}...{raw[-4:]}" if len(raw) > 12 else "***"
+    return {
+        "name": "runtime.openai_api_key",
+        "ok": bool(raw),
+        "severity": "pass" if raw else "error",
+        "detail": masked or "(unset)",
+        "hint": "" if raw else "设置 OPENAI_API_KEY 后可启用真实 LLM（否则仅 mock 模式）",
+    }
+
+
+def _build_setup_next_actions(
+    *,
+    openai_ok: bool,
+    install_report: dict[str, object],
+    probe_report: dict[str, object],
+) -> list[str]:
+    actions: list[str] = []
+    if not openai_ok:
+        actions.append("export OPENAI_API_KEY=<your_key>")
+    checks = install_report.get("checks", [])
+    if isinstance(checks, list):
+        for item in checks:
+            if not isinstance(item, dict):
+                continue
+            if bool(item.get("ok")):
+                continue
+            hint = str(item.get("hint", "")).strip()
+            if hint:
+                actions.append(hint)
+    probe_checks = probe_report.get("checks", {})
+    if isinstance(probe_checks, dict):
+        for name, row in probe_checks.items():
+            if not isinstance(row, dict):
+                continue
+            if bool(row.get("ok")):
+                continue
+            stderr_preview = str(row.get("stderr_preview", "")).strip()
+            if stderr_preview:
+                actions.append(f"{name}: {stderr_preview}")
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in actions:
+        text = item.strip()
+        if (not text) or (text in seen):
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped[:12]
+
+
+def _write_setup_marker(report: dict[str, object]) -> Path:
+    marker = Path(settings.data_dir) / "lsre-onboarding.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return marker
+
+
+def _show_first_run_setup_hint_once() -> None:
+    marker = Path(settings.data_dir) / "lsre-onboarding.json"
+    if marker.exists():
+        return
+    typer.echo("首次使用建议先运行 /setup 完成环境向导（仅需约 10 秒）。")
+
+
+def _render_setup_report(report: dict[str, object]) -> None:
+    if not (_console and Table and Panel):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+
+    summary = Table(title="LazySRE Setup Wizard")
+    summary.add_column("Item", style="cyan", no_wrap=True)
+    summary.add_column("Value", style="white")
+    summary.add_row("Ready", "yes" if bool(report.get("ready")) else "no")
+    summary.add_row("Execute Probe", "yes" if bool(report.get("execute_probe")) else "no (dry-run)")
+    summary.add_row("Profile File", str(report.get("profile_file", "-")))
+    summary.add_row("Generated", str(report.get("generated_at_utc", "-")))
+    _console.print(summary)
+
+    openai = report.get("openai", {})
+    if isinstance(openai, dict):
+        openai_table = Table(title="OpenAI")
+        openai_table.add_column("Check", style="cyan")
+        openai_table.add_column("Status", style="white")
+        openai_table.add_column("Detail", style="white")
+        openai_table.add_row(
+            str(openai.get("name", "runtime.openai_api_key")),
+            "PASS" if bool(openai.get("ok")) else "FAIL",
+            str(openai.get("detail", "")),
+        )
+        _console.print(openai_table)
+
+    install = report.get("install", {})
+    if isinstance(install, dict):
+        install_checks = install.get("checks", [])
+        install_table = Table(title="Install Diagnostics")
+        install_table.add_column("Check", style="cyan")
+        install_table.add_column("Status", style="white")
+        install_table.add_column("Detail", style="white")
+        if isinstance(install_checks, list):
+            for row in install_checks:
+                if not isinstance(row, dict):
+                    continue
+                install_table.add_row(
+                    str(row.get("name", "-")),
+                    "PASS" if bool(row.get("ok")) else str(row.get("severity", "warn")).upper(),
+                    str(row.get("detail", ""))[:160],
+                )
+        _console.print(install_table)
+
+    probe = report.get("probe", {})
+    if isinstance(probe, dict):
+        checks = probe.get("checks", {})
+        probe_table = Table(title="Target Probe")
+        probe_table.add_column("Check", style="cyan")
+        probe_table.add_column("Status", style="white")
+        probe_table.add_column("Exit", style="green", no_wrap=True)
+        probe_table.add_column("Detail", style="white")
+        if isinstance(checks, dict):
+            for name, row in checks.items():
+                if not isinstance(row, dict):
+                    continue
+                detail = str(row.get("stdout_preview", "") or row.get("stderr_preview", ""))
+                probe_table.add_row(
+                    str(name),
+                    "OK" if bool(row.get("ok")) else "FAIL",
+                    str(row.get("exit_code", "-")),
+                    detail[:160],
+                )
+        _console.print(probe_table)
+
+    actions = report.get("next_actions", [])
+    if isinstance(actions, list) and actions:
+        lines = ["建议下一步："] + [f"- {str(item)}" for item in actions]
+        _console.print(Panel("\n".join(lines), border_style="yellow"))
+    elif bool(report.get("ready")):
+        _console.print(
+            Panel(
+                "环境已满足可用条件。建议开始：lsre chat",
+                border_style="green",
+            )
+        )
+
+
 def _collect_doctor_report(
     *,
     target,
@@ -3292,12 +3659,16 @@ def _render_chat_short_help() -> None:
     lines = [
         "LazySRE Chat 快捷命令",
         "- /help: 查看帮助",
+        "- /setup [--dry-run-probe]: 首次启动向导（安装检查+目标探测+OpenAI Key）",
         "- /status: 查看当前会话、目标配置、最近修复计划",
         "- /status probe: 追加目标探测摘要（dry-run）",
         "- /doctor: 运行环境预检（依赖/配置/连通性）",
         "- /doctor install: 安装环境自检（python/node/npm/gh）",
         "- /doctor fix: 执行安全自动修复后再预检",
         "- /doctor strict: 严格模式（warn 也视为不健康）",
+        "- /template list: 查看一键修复模板库",
+        "- /template show <name>: 查看模板详情",
+        "- /template run <name> [--apply] [--var k=v]: 运行模板（支持审批门禁）",
         "- /runbook list: 查看 runbook 模板",
         "- /runbook show <name>: 查看 runbook 定义",
         "- /runbook render <name> [k=v]: 预览渲染后的 runbook 指令",
@@ -3327,11 +3698,13 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("LazySRE 自然语言助手已启动。直接输入问题即可，输入 exit/quit 退出。")
     typer.echo("提示：说“修复 xxx”会自动生成修复计划；说“执行修复计划”会执行最近计划。")
     typer.echo(
-        "快捷命令：/help /status [/status probe] /doctor [/doctor fix] "
+        "快捷命令：/help /setup /status [/status probe] /doctor [/doctor fix] "
         "[/doctor install] "
+        "/template [list|show|run|name] [args] "
         "/runbook [list|show|render|run|add|remove|export|import|name] [args] "
         "/report [args] /fix <问题> /apply /approve [steps] /memory [query]"
     )
+    _show_first_run_setup_hint_once()
     while True:
         try:
             line = typer.prompt("lsre")
@@ -3345,6 +3718,21 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             break
         if text.lower() in {"/help", "/h"}:
             _render_chat_short_help()
+            continue
+        if text.lower().startswith("/setup"):
+            setup_execute_probe = "--dry-run-probe" not in text.lower()
+            report = _run_first_run_setup(
+                profile_file=Path(settings.target_profile_file),
+                timeout_sec=6,
+                execute_probe=setup_execute_probe,
+                apply_defaults=True,
+                audit_log=Path(str(options["audit_log"])),
+                write_marker=True,
+            )
+            if _console:
+                _render_setup_report(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
             continue
         if text.lower().startswith("/status"):
             include_probe = "probe" in text.lower()
@@ -3534,6 +3922,41 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 else:
                     typer.echo(f"Report archived (no changes to push): {archived}")
             continue
+        if text.lower().startswith("/template"):
+            tail = text[len("/template") :].strip()
+            try:
+                parsed = _parse_chat_template_command(tail)
+            except ValueError as exc:
+                typer.echo(f"template 命令格式错误: {exc}")
+                continue
+            action = str(parsed.get("action", "list"))
+            if action == "list":
+                template_list()
+                continue
+            if action == "show":
+                name = str(parsed.get("name", "")).strip()
+                if not name:
+                    typer.echo("用法：/template show <name>")
+                    continue
+                try:
+                    template_show(name=name)
+                except typer.BadParameter as exc:
+                    typer.echo(str(exc))
+                continue
+            _run_remediation_template(
+                template_name=str(parsed.get("name", "")),
+                var_items=[str(x) for x in list(parsed.get("var_items", []))],
+                apply=bool(parsed.get("apply", False)),
+                max_apply_steps=int(parsed.get("max_apply_steps", 6)),
+                allow_high_risk=bool(parsed.get("allow_high_risk", False)),
+                auto_approve_low_risk=bool(parsed.get("auto_approve_low_risk", False)),
+                execute=bool(options["execute"]),
+                approval_mode=str(options["approval_mode"]),
+                audit_log=str(options["audit_log"]),
+                model=str(options["model"]),
+                provider=str(options["provider"]),
+            )
+            continue
         if text.lower().startswith("/fix "):
             fix_text = text[5:].strip()
             if not fix_text:
@@ -3591,6 +4014,28 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
 
         if _looks_like_fix_request(text):
+            template_candidate, apply_requested = maybe_detect_quick_fix_intent(text)
+            if template_candidate:
+                if apply_requested:
+                    _run_remediation_template(
+                        template_name=template_candidate.name,
+                        var_items=[],
+                        apply=True,
+                        max_apply_steps=6,
+                        allow_high_risk=False,
+                        auto_approve_low_risk=False,
+                        execute=bool(options["execute"]),
+                        approval_mode=str(options["approval_mode"]),
+                        audit_log=str(options["audit_log"]),
+                        model=str(options["model"]),
+                        provider=str(options["provider"]),
+                    )
+                    continue
+                typer.echo(
+                    f"检测到可用一键修复模板：{template_candidate.name}。"
+                    f"可执行：/template run {template_candidate.name} --apply"
+                )
+                continue
             _run_fix(
                 instruction=text,
                 apply=False,
@@ -3637,6 +4082,167 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             provider=str(options["provider"]),
             max_steps=int(options["max_steps"]),
         )
+
+
+def _run_remediation_template(
+    *,
+    template_name: str,
+    var_items: list[str],
+    apply: bool,
+    max_apply_steps: int,
+    allow_high_risk: bool,
+    auto_approve_low_risk: bool,
+    execute: bool,
+    approval_mode: str,
+    audit_log: str,
+    model: str,
+    provider: str,
+) -> None:
+    template = get_remediation_template(template_name)
+    if not template:
+        candidate = match_template_for_text(template_name)
+        if candidate:
+            template = candidate
+    if not template:
+        typer.echo(f"template not found: {template_name}")
+        return
+    target = TargetEnvStore().load()
+    defaults = {
+        "namespace": str(target.k8s_namespace or "default"),
+    }
+    overrides = parse_remediation_var_items(var_items)
+    overrides = {**defaults, **overrides}
+    rendered = render_remediation_template(template=template, overrides=overrides)
+    diagnose_commands = [str(x) for x in list(rendered.get("diagnose_commands", []))]
+    apply_commands = [str(x) for x in list(rendered.get("apply_commands", []))]
+    rollback_commands = [str(x) for x in list(rendered.get("rollback_commands", []))]
+    payload = {
+        "template": rendered.get("template", {}),
+        "variables": rendered.get("variables", {}),
+        "diagnose_commands": diagnose_commands,
+        "apply_commands": apply_commands,
+        "rollback_commands": rollback_commands,
+    }
+    if _console and Panel:
+        _console.print(
+            Panel(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                title=f"Template: {template.name}",
+                border_style="magenta",
+            )
+        )
+    else:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    if not apply:
+        typer.echo("仅预览模板。加 --apply 执行修复命令。")
+        return
+
+    plan = FixPlan(apply_commands=apply_commands, rollback_commands=rollback_commands)
+    exec_summary = _execute_fix_plan_steps(
+        plan=plan,
+        max_apply_steps=max_apply_steps,
+        execute=execute,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        allow_high_risk=allow_high_risk,
+        auto_approve_low_risk=auto_approve_low_risk,
+        model=model,
+        provider=provider,
+    )
+    _persist_successful_fix_case(
+        instruction=f"[template] {template.name}",
+        final_text=json.dumps(payload, ensure_ascii=False),
+        plan=plan,
+        plan_md_path=Path(".data/lsre-template-last.md"),
+        exec_summary=exec_summary,
+        apply=apply,
+        execute=execute,
+    )
+    if plan.rollback_commands:
+        typer.echo("\n可回滚命令：")
+        for cmd in plan.rollback_commands:
+            typer.echo(f"- {cmd}")
+
+
+def _parse_chat_template_command(tail: str) -> dict[str, object]:
+    tokens = shlex.split(tail or "")
+    if not tokens:
+        return {"action": "list"}
+
+    action = tokens[0].lower()
+    if action in {"list", "ls"}:
+        return {"action": "list"}
+    if action == "show":
+        if len(tokens) < 2:
+            raise ValueError("missing template name for show")
+        return {"action": "show", "name": tokens[1]}
+    if action == "run":
+        if len(tokens) < 2:
+            raise ValueError("missing template name for run")
+        return _parse_chat_template_run(name=tokens[1], tail_tokens=tokens[2:])
+    if action.startswith("-"):
+        raise ValueError(f"unknown template action: {action}")
+    return _parse_chat_template_run(name=tokens[0], tail_tokens=tokens[1:])
+
+
+def _parse_chat_template_run(*, name: str, tail_tokens: list[str]) -> dict[str, object]:
+    result: dict[str, object] = {
+        "action": "run",
+        "name": name,
+        "apply": False,
+        "max_apply_steps": 6,
+        "allow_high_risk": False,
+        "auto_approve_low_risk": False,
+        "var_items": [],
+    }
+    vars_out: list[str] = []
+    idx = 0
+    while idx < len(tail_tokens):
+        token = tail_tokens[idx]
+        if token == "--apply":
+            result["apply"] = True
+            idx += 1
+            continue
+        if token == "--allow-high-risk":
+            result["allow_high_risk"] = True
+            idx += 1
+            continue
+        if token == "--auto-approve-low-risk":
+            result["auto_approve_low_risk"] = True
+            idx += 1
+            continue
+        if token in {"--max-apply-steps"} or token.startswith("--max-apply-steps="):
+            value = token.split("=", 1)[1] if token.startswith("--max-apply-steps=") else ""
+            if not value:
+                idx += 1
+                if idx >= len(tail_tokens):
+                    raise ValueError("missing value for --max-apply-steps")
+                value = tail_tokens[idx]
+            try:
+                result["max_apply_steps"] = max(1, min(int(value), 30))
+            except Exception:
+                raise ValueError("max-apply-steps must be integer") from None
+            idx += 1
+            continue
+        if token == "--var":
+            idx += 1
+            if idx >= len(tail_tokens):
+                raise ValueError("missing value for --var")
+            vars_out.append(tail_tokens[idx])
+            idx += 1
+            continue
+        if token.startswith("--var="):
+            vars_out.append(token.split("=", 1)[1])
+            idx += 1
+            continue
+        if "=" in token and (not token.startswith("--")):
+            vars_out.append(token)
+            idx += 1
+            continue
+        raise ValueError(f"unknown option for template run: {token}")
+    result["var_items"] = vars_out
+    return result
 
 
 def _execute_fix_plan_steps(
@@ -4119,7 +4725,9 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "status",
         "doctor",
         "install-doctor",
+        "setup",
         "report",
+        "template",
         "runbook",
         "pack",
         "target",
@@ -4168,7 +4776,9 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "status",
         "doctor",
         "install-doctor",
+        "setup",
         "report",
+        "template",
         "runbook",
         "pack",
         "target",

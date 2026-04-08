@@ -23,6 +23,8 @@ lsre
 python -m lazysre
 # 安装环境自检
 lazysre install-doctor
+# 首次启动向导（安装检查+OpenAI Key+目标连通性）
+lazysre setup
 ```
 
 说明：`npm install -g lazysre` 安装的是跨平台启动器；首次运行会自动检查并安装 Python 版 LazySRE 内核。
@@ -71,8 +73,10 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /status /status probe /doctor [/doctor fix] [/doctor strict]
+# /help /setup /status /status probe /doctor [/doctor fix] [/doctor strict]
+# /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
+# 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
 # 示例: /runbook run payment-latency-fix --apply service=payment
 # 示例: /report --format json --no-memory --push-to-git
 
@@ -104,8 +108,16 @@ lsre doctor --auto-fix --write-backup
 lsre doctor --strict
 # 安装/发布环境自检（python/node/npm/gh）
 lsre install-doctor
+# 首次启动向导（建议首次使用执行）
+lsre setup
+lsre setup --dry-run-probe
 # CI 可读取 gate 字段：blocking_checks / exit_code_advice
 lsre doctor --strict --json
+
+# 一键修复模板库（内置 CrashLoopBackOff / ImagePullBackOff / High CPU / OOM 等）
+lsre template list
+lsre template show k8s-crashloopbackoff
+lsre template run k8s-crashloopbackoff --var namespace=prod --var pod=payment-6c8b7 --apply --execute
 
 # Runbook 工作流
 lsre runbook list
