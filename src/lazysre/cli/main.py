@@ -4147,6 +4147,7 @@ def _render_chat_short_help() -> None:
         "- 自然语言快捷动作：看它日志 / 重启它 / 扩容到3（自动补全对象）",
         "- /approve: 查看审批队列",
         "- /approve 1,3-4: 执行指定步骤",
+        "- 自然语言审批：看审批队列 / 执行第1步 / 执行步骤:1,3-4",
         "- /memory: 查看最近故障记忆",
         "- /memory <query>: 检索相似历史案例",
         "- exit / quit: 退出",
@@ -4564,7 +4565,43 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             )
             continue
 
+        if _looks_like_approval_queue_request(text):
+            _approve_last_fix_plan(
+                steps="list",
+                execute=runtime_execute,
+                approval_mode=str(options["approval_mode"]),
+                audit_log=str(options["audit_log"]),
+                allow_high_risk=False,
+                auto_approve_low_risk=False,
+                yes=False,
+                with_impact=_looks_like_with_impact_request(text),
+                model=str(options["model"]),
+                provider=str(options["provider"]),
+            )
+            continue
+
         if _looks_like_apply_request(text):
+            selected_steps = _extract_apply_step_selection(text)
+            low_risk_only = _looks_like_low_risk_apply_request(text)
+            force_high_risk = _looks_like_force_high_risk_apply_request(text)
+            if selected_steps:
+                _approve_last_fix_plan(
+                    steps=selected_steps,
+                    execute=_resolve_execute_for_apply_request(
+                        runtime_execute,
+                        label=f"执行修复计划步骤 {selected_steps}",
+                        apply=True,
+                    ),
+                    approval_mode=str(options["approval_mode"]),
+                    audit_log=str(options["audit_log"]),
+                    allow_high_risk=bool(force_high_risk and (not low_risk_only)),
+                    auto_approve_low_risk=True,
+                    yes=False,
+                    with_impact=_looks_like_with_impact_request(text),
+                    model=str(options["model"]),
+                    provider=str(options["provider"]),
+                )
+                continue
             _apply_last_fix_plan(
                 max_apply_steps=6,
                 execute=_resolve_execute_for_apply_request(
@@ -4576,7 +4613,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 audit_log=str(options["audit_log"]),
                 model=str(options["model"]),
                 provider=str(options["provider"]),
-                allow_high_risk=True,
+                allow_high_risk=bool((not low_risk_only) or force_high_risk),
                 auto_approve_low_risk=True,
             )
             continue
@@ -5918,7 +5955,7 @@ def _looks_like_fix_request(text: str) -> bool:
 
 def _looks_like_apply_request(text: str) -> bool:
     lowered = text.lower().strip()
-    return any(
+    if any(
         keyword in lowered
         for keyword in [
             "执行修复计划",
@@ -5928,7 +5965,110 @@ def _looks_like_apply_request(text: str) -> bool:
             "apply plan",
             "apply fix",
         ]
+    ):
+        return True
+    return bool(re.search(r"(执行|应用|运行).{0,8}(第\s*\d+\s*步|步骤)", lowered))
+
+
+def _looks_like_approval_queue_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    if _looks_like_apply_request(text):
+        return False
+    return any(
+        keyword in lowered
+        for keyword in [
+            "审批队列",
+            "审批列表",
+            "查看审批",
+            "看审批",
+            "看看审批",
+            "查看计划步骤",
+            "计划步骤",
+            "approve list",
+            "approval queue",
+        ]
     )
+
+
+def _looks_like_with_impact_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    return any(
+        keyword in lowered
+        for keyword in [
+            "影响评估",
+            "影响说明",
+            "风险说明",
+            "impact",
+        ]
+    )
+
+
+def _looks_like_low_risk_apply_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    return any(
+        keyword in lowered
+        for keyword in [
+            "低风险",
+            "仅低风险",
+            "只执行低风险",
+            "不要高风险",
+            "skip high risk",
+            "low risk only",
+        ]
+    )
+
+
+def _looks_like_force_high_risk_apply_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    return any(
+        keyword in lowered
+        for keyword in [
+            "允许高风险",
+            "高风险也执行",
+            "包含高风险",
+            "all risk",
+            "include high risk",
+        ]
+    )
+
+
+def _extract_apply_step_selection(text: str) -> str:
+    lowered = text.lower().strip()
+    if (not lowered) or (not _looks_like_apply_request(text)):
+        return ""
+
+    items: list[str] = []
+    seen: set[str] = set()
+
+    def _push(token: str) -> None:
+        normalized = re.sub(r"\s+", "", token)
+        normalized = normalized.replace("到", "-").replace("至", "-").replace("~", "-")
+        if (not normalized) or (normalized in seen):
+            return
+        seen.add(normalized)
+        items.append(normalized)
+
+    for value in re.findall(r"(?:步骤|steps?)\s*[:：]\s*([0-9,\-\s到至~]+)", lowered):
+        for token in re.findall(r"\d+\s*(?:[-~到至]\s*\d+)?", value):
+            _push(token)
+
+    for start, end in re.findall(r"(\d+)\s*[-~到至]\s*(\d+)", lowered):
+        _push(f"{start}-{end}")
+
+    for value in re.findall(r"第\s*(\d+)\s*步", lowered):
+        _push(value)
+
+    if not items:
+        return ""
+    return ",".join(items)
 
 
 def _looks_like_undo_request(text: str) -> bool:

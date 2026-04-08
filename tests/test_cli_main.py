@@ -16,6 +16,7 @@ from lazysre.cli.main import (
     _default_report_output_path,
     _doctor_is_healthy,
     _extract_template_var_items_from_text,
+    _extract_apply_step_selection,
     _extract_command_candidates,
     _extract_named_field,
     _compose_template_var_items,
@@ -23,12 +24,15 @@ from lazysre.cli.main import (
     _extract_requested_replicas,
     _looks_like_auto_fix_request,
     _looks_like_apply_request,
+    _looks_like_approval_queue_request,
     _looks_like_context_request,
     _looks_like_doctor_request,
     _looks_like_fix_request,
+    _looks_like_force_high_risk_apply_request,
     _looks_like_help_request,
     _looks_like_init_request,
     _looks_like_install_doctor_request,
+    _looks_like_low_risk_apply_request,
     _looks_like_quickstart_request,
     _looks_like_reset_request,
     _looks_like_report_request,
@@ -40,6 +44,7 @@ from lazysre.cli.main import (
     _looks_like_scale_action_request,
     _looks_like_status_request,
     _looks_like_template_library_request,
+    _looks_like_with_impact_request,
     _parse_step_selection,
     _read_last_fix_plan_summary,
     _render_incident_report_markdown,
@@ -184,6 +189,16 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_logs_action_request("看它日志")
     assert _looks_like_restart_action_request("重启它")
     assert _looks_like_scale_action_request("扩容到3")
+    assert _looks_like_approval_queue_request("看审批队列")
+    assert _looks_like_with_impact_request("看审批队列并给影响评估")
+    assert _looks_like_low_risk_apply_request("只执行低风险步骤")
+    assert _looks_like_force_high_risk_apply_request("允许高风险也执行")
+
+
+def test_extract_apply_step_selection() -> None:
+    assert _extract_apply_step_selection("执行第1步和第3步") == "1,3"
+    assert _extract_apply_step_selection("执行步骤: 1, 3-4, 7 到 8") == "1,3-4,7-8"
+    assert _extract_apply_step_selection("apply fix") == ""
 
 
 def test_extract_template_vars_and_compose_with_session(tmp_path: Path) -> None:

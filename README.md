@@ -183,6 +183,7 @@ lsre memory search "payment latency" --limit 5
 - “重置一下”（会重置引导和聊天模式记忆）
 - “回滚刚才修复”（执行最近计划的 rollback 命令）
 - “看它日志 / 重启它 / 扩容到3”（会自动从会话记忆补全对象）
+- “看审批队列 / 执行第1步 / 执行步骤:1,3-4”（不记 `/approve` 也能执行计划步骤）
 
 聊天模式会记住你上次选择的执行模式（execute/dry-run），下次启动自动沿用。
 一键修复时会自动从输入文本和会话记忆补全参数（如 namespace/pod/workload）。
