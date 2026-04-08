@@ -19,6 +19,8 @@ from lazysre.cli.main import (
     _extract_apply_step_selection,
     _extract_step_selection_from_text,
     _extract_target_updates_from_text,
+    _extract_profile_save_request,
+    _extract_profile_switch_name,
     _extract_command_candidates,
     _extract_named_field,
     _compose_template_var_items,
@@ -41,6 +43,8 @@ from lazysre.cli.main import (
     _looks_like_report_request,
     _looks_like_target_show_request,
     _looks_like_target_update_request,
+    _looks_like_target_profile_current_request,
+    _looks_like_target_profile_list_request,
     _looks_like_read_then_write_strategy_request,
     _looks_like_switch_dry_run_request,
     _looks_like_switch_execute_request,
@@ -205,6 +209,8 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_explain_step_request("解释第2步为什么执行")
     assert _looks_like_target_update_request("把 namespace 设成 prod")
     assert _looks_like_target_show_request("查看目标配置")
+    assert _looks_like_target_profile_current_request("看看当前profile")
+    assert _looks_like_target_profile_list_request("列出所有profile")
 
 
 def test_extract_apply_step_selection() -> None:
@@ -227,6 +233,24 @@ def test_extract_target_updates_from_text() -> None:
     assert payload["k8s_api_url"] == "https://192.168.10.1:6443"
     assert payload["k8s_namespace"] == "prod"
     assert payload["k8s_verify_tls"] is True
+
+
+def test_extract_profile_switch_name() -> None:
+    assert _extract_profile_switch_name("切到 prod 集群") == "prod"
+    assert _extract_profile_switch_name("switch to staging profile") == "staging"
+    assert _extract_profile_switch_name("随便聊聊") == ""
+
+
+def test_extract_profile_save_request() -> None:
+    name1, activate1 = _extract_profile_save_request("保存当前为 prod")
+    assert name1 == "prod"
+    assert activate1 is False
+    name2, activate2 = _extract_profile_save_request("保存当前profile为 staging 并切换")
+    assert name2 == "staging"
+    assert activate2 is True
+    name3, activate3 = _extract_profile_save_request("save current profile as qa and activate")
+    assert name3 == "qa"
+    assert activate3 is True
 
 
 def test_split_fix_plan_read_write_commands() -> None:

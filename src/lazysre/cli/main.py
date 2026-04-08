@@ -4117,6 +4117,7 @@ def _render_chat_short_help() -> None:
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
         "- 自然语言目标配置：把 namespace 设成 prod / 把 prometheus 设成 http://x:9090",
+        "- 自然语言多集群：保存当前为 prod 并切换 / 切到 prod 集群 / 看看当前profile",
         "- /reset: 重置引导与聊天模式记忆",
         "- /undo: 回滚最近一次修复计划",
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
@@ -4760,6 +4761,8 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
     lowered = text.lower().strip()
     if not lowered:
         return False
+    if _maybe_handle_target_profile_natural_intent(text):
+        return True
     if _looks_like_target_show_request(text):
         payload = TargetEnvStore(Path(settings.target_profile_file)).load().to_safe_dict()
         typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -5826,6 +5829,145 @@ def _apply_target_updates_from_text(text: str) -> bool:
     typer.echo(f"目标环境已更新: {changed}")
     typer.echo(json.dumps(safe, ensure_ascii=False, indent=2))
     return True
+
+
+def _normalize_profile_name(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]", "", str(value or "").strip())
+    return token[:40]
+
+
+def _extract_profile_switch_name(text: str) -> str:
+    raw = str(text or "")
+    patterns = [
+        r"(?:切到|切换到|切换至|激活|使用)\s*([A-Za-z0-9._-]{1,40})(?:\s*(?:集群|profile))?",
+        r"(?:use|switch\s+to|activate)\s+([A-Za-z0-9._-]{1,40})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if not match:
+            continue
+        name = _normalize_profile_name(match.group(1))
+        if name:
+            return name
+    return ""
+
+
+def _extract_profile_save_request(text: str) -> tuple[str, bool]:
+    raw = str(text or "")
+    lowered = raw.lower()
+    patterns = [
+        r"(?:保存(?:当前)?(?:\s*(?:profile|集群|配置))?(?:为|成)?\s*)([A-Za-z0-9._-]{1,40})",
+        r"(?:save(?:\s+current)?(?:\s+profile)?(?:\s+as)?\s+)([A-Za-z0-9._-]{1,40})",
+    ]
+    name = ""
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if not match:
+            continue
+        name = _normalize_profile_name(match.group(1))
+        if name:
+            break
+    if not name:
+        return "", False
+    activate = any(
+        keyword in lowered
+        for keyword in [
+            "并切换",
+            "并激活",
+            "并使用",
+            "并启用",
+            "and switch",
+            "and activate",
+        ]
+    )
+    return name, activate
+
+
+def _looks_like_target_profile_list_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "profile list",
+        "list profile",
+        "列出profile",
+        "列出集群",
+        "有哪些profile",
+        "有哪些集群",
+    )
+    if any(k in lowered for k in keywords):
+        return True
+    return ("profile" in lowered and "列出" in lowered) or ("集群" in lowered and "列出" in lowered)
+
+
+def _looks_like_target_profile_current_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    if _extract_profile_switch_name(text):
+        return False
+    if _extract_profile_save_request(text)[0]:
+        return False
+    return any(
+        keyword in lowered
+        for keyword in [
+            "当前profile",
+            "current profile",
+            "active profile",
+            "当前集群",
+            "当前激活",
+            "当前环境档案",
+        ]
+    )
+
+
+def _maybe_handle_target_profile_natural_intent(text: str) -> bool:
+    save_name, activate = _extract_profile_save_request(text)
+    if save_name:
+        env = TargetEnvStore(Path(settings.target_profile_file)).load()
+        store = ClusterProfileStore(Path(settings.target_profiles_file))
+        store.upsert_profile(save_name, env, activate=activate)
+        typer.echo(f"已保存 profile: {save_name} (activate={activate})")
+        if activate:
+            typer.echo(f"已切换到 profile: {save_name}")
+        return True
+
+    switch_name = _extract_profile_switch_name(text)
+    if switch_name:
+        store = ClusterProfileStore(Path(settings.target_profiles_file))
+        ok = store.activate(switch_name, target_profile_file=Path(settings.target_profile_file))
+        if not ok:
+            names = store.list_profiles()
+            suffix = f" 可选: {', '.join(names[:8])}" if names else " 当前还没有已保存 profile。"
+            typer.echo(f"profile 不存在: {switch_name}.{suffix}")
+            return True
+        typer.echo(f"已切换到 profile: {switch_name}")
+        return True
+
+    if _looks_like_target_profile_current_request(text):
+        store = ClusterProfileStore(Path(settings.target_profiles_file))
+        active = store.get_active()
+        payload: dict[str, object] = {
+            "active": active or "",
+            "profiles_file": str(settings.target_profiles_file),
+        }
+        if active:
+            env = store.get_profile(active)
+            if env:
+                payload["target"] = env.to_safe_dict()
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return True
+
+    if _looks_like_target_profile_list_request(text):
+        store = ClusterProfileStore(Path(settings.target_profiles_file))
+        payload = {
+            "active": store.get_active(),
+            "profiles": store.list_profiles(),
+            "profiles_file": str(settings.target_profiles_file),
+        }
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return True
+    return False
 
 
 def _build_quick_k8s_action_plan(text: str, options: dict[str, object]) -> dict[str, object] | None:

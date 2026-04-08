@@ -186,6 +186,7 @@ lsre memory search "payment latency" --limit 5
 - “看审批队列 / 执行第1步 / 执行步骤:1,3-4”（不记 `/approve` 也能执行计划步骤）
 - “先只跑只读步骤再执行写操作 / 解释第2步为什么执行”（自然语言策略与计划讲解）
 - “把 namespace 设成 prod / 把 prometheus 设成 http://92.168.69.176:9090 / 查看目标配置”
+- “保存当前为 prod 并切换 / 切到 prod 集群 / 看看当前profile / 列出所有profile”
 
 聊天模式会记住你上次选择的执行模式（execute/dry-run），下次启动自动沿用。
 一键修复时会自动从输入文本和会话记忆补全参数（如 namespace/pod/workload）。
