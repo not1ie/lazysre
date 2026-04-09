@@ -155,6 +155,9 @@ lsre swarm --service lazysre_lazysre --logs
 lsre watch --count 1
 lsre watch --count 10 --interval-sec 60 --output .data/watch.jsonl
 lsre watch --count 1 --no-remember
+lsre watch --count 1 --report-md .data/watch-report.md
+# 直接消费最新巡检证据生成修复计划
+lsre fix "修复巡检发现的问题"
 # 环境预检（依赖/配置/连通性）
 lsre doctor
 lsre doctor --json

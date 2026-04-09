@@ -19,6 +19,8 @@ from lazysre.cli.main import (
     _collect_environment_discovery,
     _collect_swarm_health_report,
     _collect_watch_snapshot,
+    _render_watch_report_markdown,
+    _build_latest_watch_context,
     _default_report_output_path,
     _doctor_is_healthy,
     _extract_template_var_items_from_text,
@@ -74,6 +76,7 @@ from lazysre.cli.main import (
     _looks_like_scale_action_request,
     _looks_like_status_request,
     _extract_swarm_service_name,
+    _looks_like_latest_watch_reference,
     _looks_like_template_library_request,
     _looks_like_with_impact_request,
     _split_fix_plan_read_write_commands,
@@ -321,6 +324,7 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_scan_request("自动检测当前环境并列出问题")
     assert _looks_like_swarm_diagnose_request("看看服务器上的服务有没有异常")
     assert _looks_like_watch_request("开始巡检一下")
+    assert _looks_like_latest_watch_reference("修复巡检发现的问题")
     assert _extract_swarm_service_name("为什么 lazysre_lazysre 服务副本不足") == "lazysre_lazysre"
     assert _looks_like_doctor_request("做一次环境体检")
     assert _looks_like_install_doctor_request("做一下安装检查")
@@ -1266,3 +1270,42 @@ def test_run_watch_snapshots_persists_alert_memory_once(monkeypatch: pytest.Monk
     assert len(saved) == 1
     assert "watch alerts" in str(saved[0]["symptom"])
     assert "swarm_image_pull_failed" in str(saved[0]["root_cause"])
+
+
+def test_watch_report_markdown_and_latest_context(tmp_path: Path) -> None:
+    snapshot = {
+        "generated_at_utc": "2026-04-09T00:00:00+00:00",
+        "cycle": 1,
+        "ok": False,
+        "alerts": [
+            {
+                "source": "swarm-root-cause",
+                "severity": "high",
+                "name": "swarm_image_pull_failed",
+                "detail": "service=api evidence=No such image",
+                "hint": "lazysre swarm --service api --logs",
+            }
+        ],
+        "swarm": {
+            "root_causes": [
+                {
+                    "category": "swarm_image_pull_failed",
+                    "service": "api",
+                    "severity": "high",
+                    "advice": "check registry",
+                }
+            ],
+            "recommendations": ["lazysre swarm --service api --logs"],
+        },
+    }
+    markdown = _render_watch_report_markdown([snapshot])
+    assert "# LazySRE Watch Report" in markdown
+    assert "swarm_image_pull_failed" in markdown
+    assert "lazysre swarm --service api --logs" in markdown
+
+    watch_file = tmp_path / "watch-last.json"
+    watch_file.write_text(json.dumps(snapshot), encoding="utf-8")
+    context = _build_latest_watch_context("修复巡检发现的问题", path=watch_file)
+    assert "Latest watch snapshot" in context
+    assert "swarm_image_pull_failed" in context
+    assert _build_latest_watch_context("普通问题", path=watch_file) == ""

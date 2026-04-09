@@ -297,6 +297,7 @@ def watch(
     remember: Annotated[bool, typer.Option("--remember/--no-remember", help="Persist alert summaries to long-term memory.")] = True,
     timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Per-check timeout seconds.")] = 5,
     output: Annotated[str, typer.Option("--output", help="Optional JSONL output path.")] = "",
+    report_md: Annotated[str, typer.Option("--report-md", help="Optional markdown report output path.")] = "",
     as_json: Annotated[bool, typer.Option("--json", help="Print watch snapshots as JSON.")] = False,
 ) -> None:
     snapshots = _run_watch_snapshots(
@@ -308,6 +309,10 @@ def watch(
         timeout_sec=timeout_sec,
         output=Path(output).expanduser() if output.strip() else None,
     )
+    if report_md.strip():
+        out_path = Path(report_md).expanduser()
+        _write_text_file(out_path, _render_watch_report_markdown(snapshots))
+        typer.echo(f"Watch report exported: {out_path}")
     if as_json or (not _console):
         typer.echo(json.dumps(snapshots, ensure_ascii=False, indent=2))
         return
@@ -1168,6 +1173,9 @@ def _run_fix(
         prompt = f"{prompt}\n\n[dialogue]\n{dialogue_context}"
     if memory_context:
         prompt = f"{prompt}\n\n[memory]\n{memory_context}"
+    watch_context = _build_latest_watch_context(instruction)
+    if watch_context:
+        prompt = f"{prompt}\n\n[latest_watch]\n{watch_context}"
     prompt = context_window.fit_text(prompt, max_chars=9500)
 
     streamed_chunks: list[str] = []
@@ -3996,6 +4004,7 @@ def _run_watch_snapshots(
             timeout_sec=timeout_sec,
         )
         snapshots.append(snapshot)
+        _write_latest_watch_snapshot(snapshot)
         if remember:
             signature = _watch_alert_signature(snapshot)
             if signature and signature not in remembered:
@@ -4007,6 +4016,28 @@ def _run_watch_snapshots(
         if idx < cycles - 1:
             time.sleep(interval)
     return snapshots
+
+
+def _latest_watch_file() -> Path:
+    return Path(settings.data_dir) / "lsre-watch-last.json"
+
+
+def _write_latest_watch_snapshot(snapshot: dict[str, object]) -> Path:
+    path = _latest_watch_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _load_latest_watch_snapshot(path: Path | None = None) -> dict[str, object]:
+    candidate = path or _latest_watch_file()
+    if not candidate.exists():
+        return {}
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _collect_watch_snapshot(
@@ -4205,6 +4236,95 @@ def _render_watch_snapshot(snapshot: dict[str, object]) -> None:
                 str(item.get("hint", ""))[:140],
             )
     _console.print(table)
+
+
+def _render_watch_report_markdown(snapshots: list[dict[str, object]]) -> str:
+    generated = datetime.now(timezone.utc).isoformat()
+    lines = [
+        "# LazySRE Watch Report",
+        "",
+        f"- Generated: {generated}",
+        f"- Snapshots: {len(snapshots)}",
+        "",
+    ]
+    total_alerts = sum(len(s.get("alerts", [])) for s in snapshots if isinstance(s.get("alerts", []), list))
+    unhealthy_services = 0
+    root_causes: list[dict[str, object]] = []
+    for snapshot in snapshots:
+        swarm = snapshot.get("swarm", {})
+        if isinstance(swarm, dict):
+            unhealthy = swarm.get("unhealthy_services", [])
+            if isinstance(unhealthy, list):
+                unhealthy_services += len(unhealthy)
+            causes = swarm.get("root_causes", [])
+            if isinstance(causes, list):
+                root_causes.extend([item for item in causes if isinstance(item, dict)])
+    lines.extend(
+        [
+            "## Summary",
+            "",
+            f"- Total alerts: {total_alerts}",
+            f"- Unhealthy Swarm service observations: {unhealthy_services}",
+            f"- Classified root causes: {len(root_causes)}",
+            "",
+        ]
+    )
+    if root_causes:
+        lines.extend(["## Root Causes", ""])
+        for item in root_causes[:20]:
+            lines.append(
+                f"- `{item.get('category', 'unknown')}` service=`{item.get('service', '-')}` "
+                f"severity=`{item.get('severity', '-')}`"
+            )
+            advice = str(item.get("advice", "")).strip()
+            if advice:
+                lines.append(f"  Advice: {advice}")
+        lines.append("")
+    lines.extend(["## Alerts", ""])
+    if total_alerts == 0:
+        lines.append("- No alerts detected.")
+    else:
+        for snapshot in snapshots:
+            cycle = snapshot.get("cycle", "-")
+            for alert in snapshot.get("alerts", []):
+                if not isinstance(alert, dict):
+                    continue
+                lines.append(
+                    f"- cycle={cycle} source=`{alert.get('source', '-')}` "
+                    f"name=`{alert.get('name', '-')}` severity=`{alert.get('severity', '-')}`"
+                )
+                detail = str(alert.get("detail", "")).strip()
+                hint = str(alert.get("hint", "")).strip()
+                if detail:
+                    lines.append(f"  Detail: {detail[:300]}")
+                if hint:
+                    lines.append(f"  Hint: {hint[:300]}")
+    lines.append("")
+    lines.extend(["## Suggested Commands", ""])
+    suggested = _extract_watch_suggested_commands(snapshots)
+    if suggested:
+        lines.extend(["```bash", *suggested, "```"])
+    else:
+        lines.append("- No direct commands suggested.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _extract_watch_suggested_commands(snapshots: list[dict[str, object]]) -> list[str]:
+    commands: list[str] = []
+    seen: set[str] = set()
+    for snapshot in snapshots:
+        alerts = snapshot.get("alerts", [])
+        if not isinstance(alerts, list):
+            continue
+        for alert in alerts:
+            if not isinstance(alert, dict):
+                continue
+            hint = str(alert.get("hint", "")).strip()
+            if hint.startswith("lazysre ") and hint not in seen:
+                seen.add(hint)
+                commands.append(hint)
+    return commands[:12]
 
 
 def _safe_int(value: str) -> int:
@@ -8646,6 +8766,64 @@ def _build_memory_context(instruction: str) -> str:
         return format_memory_context(store.search_similar(instruction, limit=3))
     except Exception:
         return ""
+
+
+def _build_latest_watch_context(instruction: str, *, path: Path | None = None, max_chars: int = 3200) -> str:
+    if not _looks_like_latest_watch_reference(instruction):
+        return ""
+    snapshot = _load_latest_watch_snapshot(path)
+    if not snapshot:
+        return ""
+    alerts = snapshot.get("alerts", [])
+    swarm = snapshot.get("swarm", {})
+    lines = [
+        f"Latest watch snapshot at {snapshot.get('generated_at_utc', '(unknown time)')}",
+        f"cycle={snapshot.get('cycle', '-')}, ok={snapshot.get('ok', False)}",
+        "Alerts:",
+    ]
+    if isinstance(alerts, list) and alerts:
+        for alert in alerts[:12]:
+            if isinstance(alert, dict):
+                lines.append(
+                    f"- source={alert.get('source', '-')} severity={alert.get('severity', '-')} "
+                    f"name={alert.get('name', '-')} detail={str(alert.get('detail', ''))[:220]} "
+                    f"hint={str(alert.get('hint', ''))[:180]}"
+                )
+    else:
+        lines.append("- none")
+    if isinstance(swarm, dict):
+        root_causes = swarm.get("root_causes", [])
+        if isinstance(root_causes, list) and root_causes:
+            lines.append("Swarm root causes:")
+            for item in root_causes[:8]:
+                if isinstance(item, dict):
+                    lines.append(
+                        f"- category={item.get('category', '-')} service={item.get('service', '-')} "
+                        f"severity={item.get('severity', '-')} advice={str(item.get('advice', ''))[:220]}"
+                    )
+        recommendations = swarm.get("recommendations", [])
+        if isinstance(recommendations, list) and recommendations:
+            lines.append("Recommendations:")
+            for item in recommendations[:6]:
+                lines.append(f"- {str(item)[:220]}")
+    return "\n".join(lines)[:max_chars]
+
+
+def _looks_like_latest_watch_reference(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        key in lowered
+        for key in (
+            "巡检",
+            "watch",
+            "最新异常",
+            "最新告警",
+            "刚才的异常",
+            "刚才告警",
+            "修复异常",
+            "处理异常",
+        )
+    )
 
 
 def _persist_successful_fix_case(
