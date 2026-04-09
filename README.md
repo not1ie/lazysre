@@ -25,6 +25,7 @@ python -m lazysre
 lazysre install-doctor
 # 零配置环境扫描（安装后也会自动跑一次，不需要 K8s token）
 lazysre scan
+# 输出包含 AI Briefing：可纳管目标、关键问题和推荐下一步
 # Docker Swarm 健康检查（服务副本、任务失败证据、可选日志）
 lazysre swarm --logs
 # 远程服务器只读诊断（目标机无需安装 LazySRE，只需可 SSH）
@@ -167,6 +168,7 @@ lsre status --probe --json
 # 零配置自动发现：Docker/Swarm/K8s/Prometheus/Provider Key（只读，无需 K8s token）
 lsre scan
 lsre scan --json
+# scan/remote/connect 的输出都包含 AI Briefing，优先看结论和下一步命令
 # Docker Swarm 一等公民：检查 service 副本、节点、任务失败证据
 lsre swarm
 lsre swarm --logs

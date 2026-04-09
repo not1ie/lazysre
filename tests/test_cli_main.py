@@ -17,6 +17,7 @@ from lazysre.cli.main import (
     _compute_doctor_autofix,
     _collect_runtime_status,
     _collect_environment_discovery,
+    _build_environment_scan_briefing,
     _collect_swarm_health_report,
     _collect_remote_docker_report,
     _remote_shell_command,
@@ -1241,6 +1242,27 @@ def test_collect_environment_discovery_scans_without_k8s_token(
     assert "k8s.problem_pods" in names
     assert "llm.provider_key" in names
     assert any(str(x.get("name")) == "k8s.problem_pods" for x in report["issues"] if isinstance(x, dict))
+    assert report["briefing"]["status"] == "attention"
+    assert "docker-swarm" in report["briefing"]["headline"]
+    assert report["briefing"]["next"] == "lazysre swarm --logs"
+
+
+def test_build_environment_scan_briefing_when_no_targets() -> None:
+    report = {
+        "summary": {"pass": 1, "warn": 2, "error": 0},
+        "usable_targets": [],
+        "issues": [
+            {"name": "binary.docker", "severity": "warn", "detail": "(not found)", "hint": "install docker"}
+        ],
+        "suggestions": ["帮我解释为什么当前机器还不能被 LazySRE 纳管"],
+        "next_actions": ["未发现可直接访问的运维目标；建议先确认 docker daemon 或 kubectl kubeconfig 是否可用"],
+    }
+
+    briefing = _build_environment_scan_briefing(report)
+
+    assert briefing["status"] == "attention"
+    assert "暂未发现" in briefing["headline"]
+    assert briefing["next"].startswith("未发现可直接访问")
 
 
 def test_collect_swarm_health_report_detects_unhealthy_service(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -3347,7 +3347,7 @@ def _collect_environment_discovery(
     if isinstance(prometheus_discovery, dict) and bool(prometheus_discovery.get("reachable")):
         usable_targets.append("prometheus")
 
-    return {
+    payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "mode": "read-only/no-secret",
         "timeout_sec": per_check_timeout,
@@ -3359,6 +3359,8 @@ def _collect_environment_discovery(
         "suggestions": _build_environment_scan_suggestions(discoveries, usable_targets, issues),
         "next_actions": _build_environment_scan_next_actions(checks, usable_targets),
     }
+    payload["briefing"] = _build_environment_scan_briefing(payload)
+    return payload
 
 
 def _scan_binary_check(name: str, path: str, *, optional: bool) -> dict[str, object]:
@@ -3649,6 +3651,66 @@ def _probe_detail(probe: dict[str, object]) -> str:
     return text[:500]
 
 
+def _build_environment_scan_briefing(report: dict[str, object]) -> dict[str, object]:
+    summary = report.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    usable_targets = report.get("usable_targets", [])
+    targets = [str(item) for item in usable_targets] if isinstance(usable_targets, list) else []
+    issues = report.get("issues", [])
+    issue_items = [item for item in issues if isinstance(item, dict)] if isinstance(issues, list) else []
+    suggestions = report.get("suggestions", [])
+    suggestion_items = [str(item) for item in suggestions] if isinstance(suggestions, list) else []
+    next_actions = report.get("next_actions", [])
+    action_items = [str(item) for item in next_actions] if isinstance(next_actions, list) else []
+
+    error_count = int(summary.get("error", 0) or 0)
+    warn_count = int(summary.get("warn", 0) or 0)
+    status = "healthy"
+    if error_count:
+        status = "blocked"
+    elif warn_count or issue_items:
+        status = "attention"
+
+    if targets and issue_items:
+        headline = f"已发现可纳管目标：{', '.join(targets)}，同时有 {len(issue_items)} 个需要关注的问题。"
+    elif targets:
+        headline = f"已发现可纳管目标：{', '.join(targets)}，可以直接开始自然语言诊断。"
+    else:
+        headline = "暂未发现可直接访问的运维目标，请先确认 Docker、kubectl 或 Prometheus 配置。"
+
+    evidence = [
+        f"checks: pass={summary.get('pass', 0)} warn={warn_count} error={error_count}",
+        f"usable_targets={', '.join(targets) if targets else 'none'}",
+    ]
+    for item in issue_items[:3]:
+        evidence.append(
+            f"{item.get('severity', '-')}: {item.get('name', '-')} {str(item.get('detail', '')).strip()[:120]}"
+        )
+
+    next_step = ""
+    if targets:
+        if "docker-swarm" in targets:
+            next_step = "lazysre swarm --logs"
+        elif "kubernetes" in targets:
+            next_step = 'lazysre "检查 K8s 异常 Pod 和 Warning Events"'
+        elif "docker" in targets:
+            next_step = 'lazysre "检查 Docker 容器有没有异常退出"'
+    if not next_step and action_items:
+        next_step = action_items[0]
+    if not next_step and suggestion_items:
+        next_step = f'lazysre "{suggestion_items[0]}"'
+    if not next_step:
+        next_step = "lazysre doctor"
+
+    return {
+        "status": status,
+        "headline": headline,
+        "evidence": evidence[:5],
+        "next": next_step,
+    }
+
+
 def _non_empty_lines(text: str) -> list[str]:
     return [line.strip() for line in str(text or "").splitlines() if line.strip()]
 
@@ -3756,6 +3818,19 @@ def _render_environment_discovery(report: dict[str, object]) -> None:
     )
     if Panel:
         _console.print(Panel(summary_text, title="Environment Scan", border_style="cyan"))
+    briefing = report.get("briefing", {})
+    if isinstance(briefing, dict) and Panel:
+        evidence = briefing.get("evidence", [])
+        evidence_lines = [f"- {item}" for item in evidence[:5]] if isinstance(evidence, list) else []
+        lines = [
+            f"状态: {briefing.get('status', '-')}",
+            f"结论: {briefing.get('headline', '-')}",
+        ]
+        if evidence_lines:
+            lines.extend(["证据:", *[str(item) for item in evidence_lines]])
+        if str(briefing.get("next", "")).strip():
+            lines.append(f"下一步: {briefing.get('next')}")
+        _console.print(Panel("\n".join(lines), title="AI Briefing", border_style="magenta"))
     table = Table(title="Auto Discovery Checks")
     table.add_column("Check", style="cyan")
     table.add_column("Severity", style="white", no_wrap=True)
