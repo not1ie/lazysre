@@ -42,10 +42,17 @@ function run(command, args, options = {}) {
   });
 }
 
+function isSupportedPython(command) {
+  const result = run(command, [
+    "-c",
+    "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+  ]);
+  return result.status === 0;
+}
+
 function findPython() {
   for (const candidate of pythonCandidates()) {
-    const result = run(candidate, ["--version"]);
-    if (result.status === 0) {
+    if (isSupportedPython(candidate)) {
       return candidate;
     }
   }

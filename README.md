@@ -65,14 +65,15 @@ lazysre login --provider kimi
 ```
 
 说明：`npm install -g lazysre` 安装的是跨平台启动器；首次运行会自动检查并安装 Python 版 LazySRE 内核。  
-`scripts/install_user.sh` 安装成功后默认执行一次 `lazysre scan`，只读识别本机 Docker/Swarm、kubectl kubeconfig、Prometheus 常见地址和模型 Key 状态；它不需要手填 K8s token，也不会执行写操作。
+`scripts/install_user.sh` 安装成功后默认执行一次 `lazysre brief --no-remote`，只读识别本机 Docker/Swarm、kubectl kubeconfig、Prometheus 常见地址和模型 Key 状态，并给出结论与下一步；它不需要手填 K8s token，也不会执行写操作。
 可选环境变量：
 - `LAZYSRE_PIP_INDEX_URL`：指定 pip 镜像源
 - `LAZYSRE_PIP_EXTRA_INDEX_URL`：额外镜像源
 - `LAZYSRE_PIP_TRUSTED_HOST`：可信 host（逗号分隔）
 - `LAZYSRE_PIP_SOURCE`：指定安装源（支持本地目录、tgz、git URL）
 - `LAZYSRE_NO_AUTO_INSTALL=1`：禁止启动器自动安装 Python 内核
-- `LAZYSRE_POST_INSTALL_SCAN=0`：一键脚本安装后不自动执行环境扫描
+- `LAZYSRE_POST_INSTALL_BRIEF=0`：一键脚本安装后不自动生成启动总览
+- `LAZYSRE_POST_INSTALL_SCAN=0`：兼容旧变量，同样会跳过安装后总览
 
 国内服务器说明：`scripts/install_user.sh` 默认使用阿里云 PyPI 镜像安装 Python 依赖；如果服务器不能访问 GitHub，可先在本地打包上传源码，再执行 `LAZYSRE_PIP_SOURCE=/opt/lazysre-src scripts/install_user.sh`。
 

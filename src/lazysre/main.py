@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from lazysre import __version__
 from lazysre.models import MemorySearchResponse, TaskCreateRequest, TaskRecord
 from lazysre.platform.models import (
     AgentCreateRequest,
@@ -35,7 +36,7 @@ from lazysre.platform.models import (
 from lazysre.platform.service import PlatformService
 from lazysre.services.task_service import TaskService
 
-app = FastAPI(title="LazySRE", version="0.1.0")
+app = FastAPI(title="LazySRE", version=__version__)
 task_service = TaskService()
 platform_service = PlatformService()
 web_dir = Path(__file__).resolve().parent / "web"

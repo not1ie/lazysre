@@ -10,6 +10,12 @@ TARGET_VERSION="${1:-}"
 FAILS=0
 WARNS=0
 
+# Keep npm diagnostics inside the repository so preflight also works in
+# sandboxed shells and CI runners with restricted home directories.
+export npm_config_cache="${npm_config_cache:-${PWD}/.data/npm-cache}"
+export npm_config_logs_dir="${npm_config_logs_dir:-${PWD}/.data/npm-logs}"
+mkdir -p "${npm_config_cache}" "${npm_config_logs_dir}"
+
 pass() {
   echo "[PASS] $*"
 }
@@ -68,6 +74,28 @@ if [[ ${FAILS} -eq 0 ]]; then
     else
       pass "target version matches package.json"
     fi
+  fi
+
+  if [[ -f "pyproject.toml" ]]; then
+    PYPROJECT_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -n 1)"
+    if [[ "${PYPROJECT_VERSION}" == "${PKG_VERSION}" ]]; then
+      pass "pyproject version matches package.json"
+    else
+      fail "pyproject version (${PYPROJECT_VERSION:-missing}) differs from package.json (${PKG_VERSION})"
+    fi
+  else
+    fail "pyproject.toml not found."
+  fi
+
+  if [[ -f "src/lazysre/__init__.py" ]]; then
+    PY_INIT_VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/lazysre/__init__.py | head -n 1)"
+    if [[ "${PY_INIT_VERSION}" == "${PKG_VERSION}" ]]; then
+      pass "python __version__ matches package.json"
+    else
+      fail "python __version__ (${PY_INIT_VERSION:-missing}) differs from package.json (${PKG_VERSION})"
+    fi
+  else
+    fail "src/lazysre/__init__.py not found."
   fi
 fi
 

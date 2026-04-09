@@ -125,6 +125,8 @@ from lazysre.cli.main import (
     _collect_install_doctor_report,
     _write_first_scan_marker,
     _render_cached_startup_brief,
+    _version_info,
+    _version_text,
     _safe_run_command,
     _should_launch_assistant,
 )
@@ -261,6 +263,12 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv18 = ["lsre", "brief", "--json"]
     _rewrite_argv_for_default_run(argv18)
     assert argv18 == ["lsre", "brief", "--json"]
+    argv19 = ["lsre", "version"]
+    _rewrite_argv_for_default_run(argv19)
+    assert argv19 == ["lsre", "version"]
+    argv20 = ["lsre", "--version"]
+    _rewrite_argv_for_default_run(argv20)
+    assert argv20 == ["lsre", "--version"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -615,7 +623,29 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["runbook"]) is False
     assert _should_launch_assistant(["approve"]) is False
     assert _should_launch_assistant(["memory"]) is False
+    assert _should_launch_assistant(["version"]) is False
+    assert _should_launch_assistant(["--version"]) is False
     assert _should_launch_assistant(["检查k8s"]) is False
+
+
+def test_version_info_and_cli_version_output() -> None:
+    info = _version_info()
+    assert info["name"] == "lazysre"
+    assert isinstance(info["version"], str)
+    assert _version_text(info).startswith(f"lazysre {info['version']}")
+
+    env = {**os.environ, "PYTHONPATH": str(Path.cwd() / "src")}
+    result = subprocess.run(
+        [sys.executable, "-m", "lazysre", "--version"],
+        cwd=Path.cwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "lazysre" in result.stdout
+    assert str(info["version"]) in result.stdout
 
 
 def test_extract_named_field_handles_markdown_and_plain_prefix() -> None:

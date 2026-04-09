@@ -13,21 +13,27 @@ PIP_TRUSTED_HOST_VALUE="${LAZYSRE_PIP_TRUSTED_HOST:-${PIP_TRUSTED_HOST:-mirrors.
 echo "[lazysre] source: ${SOURCE}"
 echo "[lazysre] pip index: ${PIP_INDEX_URL_VALUE:-default}"
 
+if ! "${PYTHON_BIN}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+  echo "[lazysre] Python 3.11+ is required. Current ${PYTHON_BIN} is too old or unavailable."
+  echo "[lazysre] Set PYTHON_BIN=/path/to/python3.11 and retry."
+  exit 1
+fi
+
 run_post_install_scan() {
-  if [[ "${LAZYSRE_POST_INSTALL_SCAN:-1}" != "1" ]]; then
-    echo "[lazysre] post-install scan skipped (LAZYSRE_POST_INSTALL_SCAN=0)."
+  if [[ "${LAZYSRE_POST_INSTALL_BRIEF:-${LAZYSRE_POST_INSTALL_SCAN:-1}}" != "1" ]]; then
+    echo "[lazysre] post-install briefing skipped (LAZYSRE_POST_INSTALL_BRIEF=0)."
     return
   fi
-  echo "[lazysre] running zero-config environment scan..."
+  echo "[lazysre] generating zero-config startup brief..."
   if command -v lazysre >/dev/null 2>&1; then
-    lazysre scan || true
+    lazysre brief --no-remote || lazysre scan || true
     return
   fi
   if [[ -x "${INSTALL_ROOT}/venv/bin/lazysre" ]]; then
-    "${INSTALL_ROOT}/venv/bin/lazysre" scan || true
+    "${INSTALL_ROOT}/venv/bin/lazysre" brief --no-remote || "${INSTALL_ROOT}/venv/bin/lazysre" scan || true
     return
   fi
-  echo "[lazysre] scan skipped: lazysre is installed but not yet on PATH."
+  echo "[lazysre] startup brief skipped: lazysre is installed but not yet on PATH."
 }
 
 PIP_ARGS=()

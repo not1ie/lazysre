@@ -18,6 +18,7 @@ from typing import Annotated
 
 import typer
 
+from lazysre import __version__
 from lazysre.cli.audit import AuditLogger
 from lazysre.cli.brain import BrainContext
 from lazysre.cli.context_window import ContextWindowManager
@@ -109,6 +110,7 @@ template_app = typer.Typer(help="One-click remediation templates.")
 @app.callback(invoke_without_command=True)
 def root(
     ctx: typer.Context,
+    version: Annotated[bool, typer.Option("--version", "-V", help="Show LazySRE version and exit.", is_eager=True)] = False,
     execute: Annotated[bool, typer.Option("--execute", help="Run commands for real. Default is dry-run.")] = False,
     approve: Annotated[bool, typer.Option("--approve", help="Acknowledge policy gate for high-risk commands.")] = False,
     interactive_approval: Annotated[bool, typer.Option("--interactive-approval/--no-interactive-approval", help="Prompt y/n confirmation for risky write actions in execute mode.")] = True,
@@ -126,6 +128,9 @@ def root(
     provider: Annotated[str, typer.Option(help=f"LLM provider: {provider_mode_help_text()}")] = "auto",
     max_steps: Annotated[int, typer.Option(help="Max function-calling iterations.")] = 6,
 ) -> None:
+    if version:
+        typer.echo(_version_text())
+        raise typer.Exit()
     ctx.obj = {
         "execute": execute,
         "approve": approve,
@@ -166,6 +171,17 @@ def root(
         )
         _assistant_chat_loop(options)
         raise typer.Exit()
+
+
+@app.command("version")
+def version_command(
+    as_json: Annotated[bool, typer.Option("--json", help="Print version details as JSON.")] = False,
+) -> None:
+    info = _version_info()
+    if as_json:
+        typer.echo(json.dumps(info, ensure_ascii=False, indent=2))
+        return
+    typer.echo(_version_text(info))
 
 
 @app.command("run")
@@ -11335,6 +11351,23 @@ def _resolve_session_file(ctx: typer.Context, session_file: str | None) -> Path:
     return Path(candidate or ".data/lsre-session.json")
 
 
+def _version_info() -> dict[str, object]:
+    return {
+        "name": "lazysre",
+        "version": __version__,
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "executable": sys.executable,
+    }
+
+
+def _version_text(info: dict[str, object] | None = None) -> str:
+    payload = info or _version_info()
+    return (
+        f"{payload.get('name', 'lazysre')} {payload.get('version', __version__)} "
+        f"(python {payload.get('python', '-')})"
+    )
+
+
 def main() -> None:
     _rewrite_argv_for_default_run(sys.argv)
     app()
@@ -11373,7 +11406,10 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "target",
         "history",
         "memory",
+        "version",
         "--help",
+        "--version",
+        "-V",
         "-h",
     }
     options_with_value = {
@@ -11438,7 +11474,10 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "target",
         "history",
         "memory",
+        "version",
         "--help",
+        "--version",
+        "-V",
         "-h",
     }
     options_with_value = {

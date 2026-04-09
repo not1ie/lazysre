@@ -27,9 +27,9 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ -x "./scripts/check_npm_release.sh" ]]; then
-  echo "[release] running npm preflight checks..."
-  ./scripts/check_npm_release.sh "${VERSION}"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required."
+  exit 1
 fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -45,13 +45,40 @@ if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
   exit 1
 fi
 
-CURRENT_VERSION="$(npm pkg get version | tr -d '\"')"
-if [[ "${CURRENT_VERSION}" != "${VERSION}" ]]; then
-  npm version "${VERSION}" --no-git-tag-version
-  git add package.json
-  git commit -m "chore(release): npm v${VERSION}"
+VERSION="${VERSION}" python3 - <<'PY'
+import json
+import os
+import re
+from pathlib import Path
+
+version = os.environ["VERSION"]
+
+package_path = Path("package.json")
+package = json.loads(package_path.read_text(encoding="utf-8"))
+package["version"] = version
+package_path.write_text(json.dumps(package, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+pyproject_path = Path("pyproject.toml")
+pyproject = pyproject_path.read_text(encoding="utf-8")
+pyproject = re.sub(r'^version = ".*"$', f'version = "{version}"', pyproject, count=1, flags=re.MULTILINE)
+pyproject_path.write_text(pyproject, encoding="utf-8")
+
+init_path = Path("src/lazysre/__init__.py")
+init_text = init_path.read_text(encoding="utf-8")
+init_text = re.sub(r'^__version__ = ".*"$', f'__version__ = "{version}"', init_text, count=1, flags=re.MULTILINE)
+init_path.write_text(init_text, encoding="utf-8")
+PY
+
+if [[ -x "./scripts/check_npm_release.sh" ]]; then
+  echo "[release] running npm preflight checks..."
+  ./scripts/check_npm_release.sh "${VERSION}"
+fi
+
+if git diff --quiet -- package.json pyproject.toml src/lazysre/__init__.py; then
+  echo "package.json/pyproject.toml/__init__.py already at version ${VERSION}, skip version bump commit."
 else
-  echo "package.json already at version ${VERSION}, skip version bump commit."
+  git add package.json pyproject.toml src/lazysre/__init__.py
+  git commit -m "chore(release): v${VERSION}"
 fi
 
 git tag "${TAG}"
