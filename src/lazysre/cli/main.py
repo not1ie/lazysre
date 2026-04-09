@@ -320,6 +320,24 @@ def watch(
         _render_watch_snapshot(snapshot)
 
 
+@app.command("actions")
+def actions(
+    from_watch: Annotated[str, typer.Option("--from-watch", help="Watch snapshot JSON path. Defaults to latest watch.")] = "",
+    as_json: Annotated[bool, typer.Option("--json", help="Print action inbox as JSON.")] = False,
+    report_md: Annotated[str, typer.Option("--report-md", help="Optional markdown action report path.")] = "",
+) -> None:
+    snapshot = _load_latest_watch_snapshot(Path(from_watch).expanduser() if from_watch.strip() else None)
+    inbox = _build_action_inbox_from_watch(snapshot)
+    if report_md.strip():
+        out_path = Path(report_md).expanduser()
+        _write_text_file(out_path, _render_action_inbox_markdown(inbox))
+        typer.echo(f"Action report exported: {out_path}")
+    if as_json or (not _console):
+        typer.echo(json.dumps(inbox, ensure_ascii=False, indent=2))
+        return
+    _render_action_inbox(inbox)
+
+
 @app.command("doctor")
 def doctor(
     ctx: typer.Context,
@@ -4310,6 +4328,228 @@ def _render_watch_report_markdown(snapshots: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
+def _build_action_inbox_from_watch(snapshot: dict[str, object]) -> dict[str, object]:
+    if not snapshot:
+        return {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "source": "latest-watch",
+            "ok": False,
+            "actions": [],
+            "summary": {"total": 0, "high": 0, "medium": 0, "low": 0},
+            "message": "No watch snapshot found. Run: lazysre watch --count 1",
+        }
+    actions: list[dict[str, object]] = []
+    seen: set[str] = set()
+    swarm = snapshot.get("swarm", {})
+    if isinstance(swarm, dict):
+        for cause in list(swarm.get("root_causes", []))[:12]:
+            if not isinstance(cause, dict):
+                continue
+            action = _action_from_swarm_root_cause(cause)
+            if action:
+                _append_action(actions, seen, action)
+        for service in list(swarm.get("unhealthy_services", []))[:12]:
+            if not isinstance(service, dict):
+                continue
+            action = _action_from_unhealthy_swarm_service(service)
+            _append_action(actions, seen, action)
+    alerts = snapshot.get("alerts", [])
+    if isinstance(alerts, list):
+        for alert in alerts[:20]:
+            if not isinstance(alert, dict):
+                continue
+            action = _action_from_watch_alert(alert)
+            if action:
+                _append_action(actions, seen, action)
+    for idx, action in enumerate(actions, 1):
+        action["id"] = idx
+    severity_counts = {"high": 0, "medium": 0, "low": 0}
+    for action in actions:
+        sev = str(action.get("severity", "low"))
+        if sev not in severity_counts:
+            sev = "low"
+        severity_counts[sev] += 1
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "latest-watch",
+        "watch_generated_at_utc": snapshot.get("generated_at_utc", ""),
+        "ok": bool(actions),
+        "summary": {"total": len(actions), **severity_counts},
+        "actions": actions,
+        "message": "" if actions else "No actionable watch findings. Run lazysre watch --count 1 --logs for deeper evidence.",
+    }
+
+
+def _append_action(actions: list[dict[str, object]], seen: set[str], action: dict[str, object]) -> None:
+    key = str(action.get("dedupe_key", "") or action.get("command", "") or action.get("title", ""))
+    if not key or key in seen:
+        return
+    seen.add(key)
+    action.pop("dedupe_key", None)
+    actions.append(action)
+
+
+def _action_from_swarm_root_cause(cause: dict[str, object]) -> dict[str, object] | None:
+    category = str(cause.get("category", "")).strip()
+    service = str(cause.get("service", "")).strip()
+    severity = str(cause.get("severity", "medium")).strip() or "medium"
+    advice = str(cause.get("advice", "")).strip()
+    if not category:
+        return None
+    template = ""
+    command = ""
+    title = category
+    if category == "swarm_image_pull_failed":
+        template = "swarm-image-pull-failed"
+        title = f"修复 Swarm 镜像拉取失败: {service or 'service'}"
+        command = f"lazysre template run {template} --var service={service or 'SERVICE'} --apply"
+    elif category in {"swarm_service_replicas_unhealthy", "swarm_task_rejected_or_crashing"}:
+        template = "swarm-replicas-unhealthy"
+        title = f"恢复 Swarm 副本健康: {service or 'service'}"
+        command = f"lazysre template run {template} --var service={service or 'SERVICE'} --apply"
+    elif category == "swarm_port_conflict":
+        title = f"排查 Swarm 端口冲突: {service or 'service'}"
+        command = f"lazysre swarm --service {service or 'SERVICE'} --logs"
+    elif category == "swarm_scheduler_no_suitable_node":
+        title = f"排查 Swarm 调度失败: {service or 'service'}"
+        command = "lazysre swarm --logs"
+    elif category == "swarm_task_oom":
+        title = f"排查 Swarm OOM: {service or 'service'}"
+        command = f"lazysre swarm --service {service or 'SERVICE'} --logs"
+    else:
+        command = f"lazysre swarm --service {service} --logs" if service else "lazysre swarm --logs"
+    return {
+        "title": title,
+        "source": "swarm-root-cause",
+        "severity": "high" if severity == "high" else "medium",
+        "risk_level": "high" if template else "low",
+        "template": template,
+        "variables": {"service": service} if service else {},
+        "command": command,
+        "reason": advice or str(cause.get("evidence", ""))[:240],
+        "dedupe_key": f"cause:{category}:{service}:{command}",
+    }
+
+
+def _action_from_unhealthy_swarm_service(service: dict[str, object]) -> dict[str, object]:
+    name = str(service.get("name", "")).strip()
+    return {
+        "title": f"查看 Swarm service 失败任务: {name or 'service'}",
+        "source": "swarm",
+        "severity": "medium",
+        "risk_level": "low",
+        "template": "",
+        "variables": {"service": name} if name else {},
+        "command": f"lazysre swarm --service {name or 'SERVICE'} --logs",
+        "reason": f"replicas={service.get('replicas', '-')}",
+        "dedupe_key": f"service:{name}",
+    }
+
+
+def _action_from_watch_alert(alert: dict[str, object]) -> dict[str, object] | None:
+    hint = str(alert.get("hint", "")).strip()
+    name = str(alert.get("name", "")).strip()
+    source = str(alert.get("source", "watch")).strip()
+    severity = str(alert.get("severity", "low")).strip()
+    if hint.startswith("lazysre "):
+        return {
+            "title": f"执行建议: {name or source}",
+            "source": source,
+            "severity": "medium" if severity == "warn" else severity,
+            "risk_level": "low",
+            "template": "",
+            "variables": {},
+            "command": hint,
+            "reason": str(alert.get("detail", ""))[:240],
+            "dedupe_key": f"hint:{hint}",
+        }
+    if name == "docker.version":
+        return {
+            "title": "修复 Docker daemon 访问权限",
+            "source": source,
+            "severity": "medium",
+            "risk_level": "low",
+            "template": "",
+            "variables": {},
+            "command": "lazysre scan",
+            "reason": "Docker 已安装但当前用户无法访问 daemon；修复后重新扫描。",
+            "dedupe_key": "docker-daemon-access",
+        }
+    if name.startswith("k8s."):
+        return {
+            "title": f"补齐 K8s 访问能力: {name}",
+            "source": source,
+            "severity": "low",
+            "risk_level": "low",
+            "template": "",
+            "variables": {},
+            "command": "lazysre scan",
+            "reason": str(alert.get("hint", "") or alert.get("detail", ""))[:240],
+            "dedupe_key": f"k8s-access:{name}",
+        }
+    return None
+
+
+def _render_action_inbox(inbox: dict[str, object]) -> None:
+    if not (_console and Table):
+        typer.echo(json.dumps(inbox, ensure_ascii=False, indent=2))
+        return
+    summary = inbox.get("summary", {})
+    summary_text = (
+        f"actions={summary.get('total', 0)} high={summary.get('high', 0)} "
+        f"medium={summary.get('medium', 0)} low={summary.get('low', 0)}"
+    )
+    if Panel:
+        _console.print(Panel(summary_text, title="Action Inbox", border_style="cyan"))
+    table = Table(title="Recommended Actions")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Severity", style="yellow", no_wrap=True)
+    table.add_column("Title", style="white")
+    table.add_column("Command", style="green")
+    for raw in inbox.get("actions", []):
+        item = raw if isinstance(raw, dict) else {}
+        table.add_row(
+            str(item.get("id", "-")),
+            str(item.get("severity", "-")),
+            str(item.get("title", "-"))[:80],
+            str(item.get("command", ""))[:120],
+        )
+    _console.print(table)
+
+
+def _render_action_inbox_markdown(inbox: dict[str, object]) -> str:
+    lines = [
+        "# LazySRE Action Inbox",
+        "",
+        f"- Generated: {inbox.get('generated_at_utc', '')}",
+        f"- Watch Snapshot: {inbox.get('watch_generated_at_utc', '')}",
+        "",
+        "## Actions",
+        "",
+    ]
+    actions = inbox.get("actions", [])
+    if not isinstance(actions, list) or not actions:
+        lines.append(str(inbox.get("message", "No actions.")))
+        lines.append("")
+        return "\n".join(lines)
+    for item in actions:
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"### {item.get('id', '-')}. {item.get('title', '-')}")
+        lines.append("")
+        lines.append(f"- Severity: `{item.get('severity', '-')}`")
+        lines.append(f"- Risk: `{item.get('risk_level', '-')}`")
+        if str(item.get("template", "")).strip():
+            lines.append(f"- Template: `{item.get('template')}`")
+        reason = str(item.get("reason", "")).strip()
+        if reason:
+            lines.append(f"- Reason: {reason}")
+        command = str(item.get("command", "")).strip()
+        if command:
+            lines.extend(["", "```bash", command, "```", ""])
+    return "\n".join(lines)
+
+
 def _extract_watch_suggested_commands(snapshots: list[dict[str, object]]) -> list[str]:
     commands: list[str] = []
     seen: set[str] = set()
@@ -5717,6 +5957,7 @@ def _render_chat_short_help() -> None:
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
         "- /swarm [--logs]: 检查 Docker Swarm 服务、副本、任务失败证据",
         "- /watch [--count N]: 持续巡检并输出异常摘要",
+        "- /actions: 把最近一次巡检结果整理成编号行动清单",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
@@ -5781,6 +6022,7 @@ def _normalize_natural_language_text(text: str) -> str:
         (r"\baprove\b", "approve"),
         (r"\bmemroy\b", "memory"),
         (r"\bsacn\b", "scan"),
+        (r"\bactons\b", "actions"),
     ]
     for pattern, replacement in replacements:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
@@ -5810,6 +6052,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "aprove": "approve",
         "memroy": "memory",
         "sacn": "scan",
+        "actons": "actions",
         "hepl": "help",
     }
     known = [
@@ -5825,6 +6068,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "scan",
         "swarm",
         "watch",
+        "actions",
         "setup",
         "status",
         "doctor",
@@ -5945,6 +6189,14 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                     _render_watch_snapshot(snapshot)
             else:
                 typer.echo(json.dumps(snapshots, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/actions"):
+            snapshot = _load_latest_watch_snapshot(None)
+            inbox = _build_action_inbox_from_watch(snapshot)
+            if _console:
+                _render_action_inbox(inbox)
+            else:
+                typer.echo(json.dumps(inbox, ensure_ascii=False, indent=2))
             continue
         if text.lower().startswith("/mode "):
             tail = text[len("/mode ") :].strip().lower()
@@ -6533,6 +6785,14 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             reset_session=False,
             session_file=str(options["session_file"]),
         )
+        return True
+    if _looks_like_actions_request(text):
+        snapshot = _load_latest_watch_snapshot(None)
+        inbox = _build_action_inbox_from_watch(snapshot)
+        if _console:
+            _render_action_inbox(inbox)
+        else:
+            typer.echo(json.dumps(inbox, ensure_ascii=False, indent=2))
         return True
     if _looks_like_scan_request(text):
         report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
@@ -8403,6 +8663,29 @@ def _looks_like_watch_request(text: str) -> bool:
     return any(k in lowered for k in keywords)
 
 
+def _looks_like_actions_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "下一步做什么",
+        "接下来做什么",
+        "下一步怎么办",
+        "下一步建议",
+        "行动清单",
+        "推荐动作",
+        "推荐操作",
+        "建议动作",
+        "建议操作",
+        "可执行动作",
+        "action inbox",
+        "next action",
+        "next steps",
+        "what next",
+    )
+    return any(k in lowered for k in keywords)
+
+
 def _extract_swarm_service_name(text: str) -> str:
     raw = str(text or "").strip()
     if not raw:
@@ -8968,6 +9251,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "scan",
         "swarm",
         "watch",
+        "actions",
         "doctor",
         "install-doctor",
         "setup",
@@ -9028,6 +9312,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "scan",
         "swarm",
         "watch",
+        "actions",
         "doctor",
         "install-doctor",
         "setup",

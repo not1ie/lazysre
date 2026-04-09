@@ -19,7 +19,9 @@ from lazysre.cli.main import (
     _collect_environment_discovery,
     _collect_swarm_health_report,
     _collect_watch_snapshot,
+    _build_action_inbox_from_watch,
     _render_watch_report_markdown,
+    _render_action_inbox_markdown,
     _build_latest_watch_context,
     _default_report_output_path,
     _doctor_is_healthy,
@@ -59,6 +61,7 @@ from lazysre.cli.main import (
     _looks_like_scan_request,
     _looks_like_swarm_diagnose_request,
     _looks_like_watch_request,
+    _looks_like_actions_request,
     _looks_like_report_request,
     _looks_like_target_show_request,
     _looks_like_target_update_request,
@@ -217,6 +220,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv13 = ["lsre", "undo"]
     _rewrite_argv_for_default_run(argv13)
     assert argv13 == ["lsre", "undo"]
+    argv14 = ["lsre", "actions", "--json"]
+    _rewrite_argv_for_default_run(argv14)
+    assert argv14 == ["lsre", "actions", "--json"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -324,6 +330,8 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_scan_request("自动检测当前环境并列出问题")
     assert _looks_like_swarm_diagnose_request("看看服务器上的服务有没有异常")
     assert _looks_like_watch_request("开始巡检一下")
+    assert _looks_like_actions_request("巡检之后下一步做什么")
+    assert _looks_like_actions_request("给我推荐动作")
     assert _looks_like_latest_watch_reference("修复巡检发现的问题")
     assert _extract_swarm_service_name("为什么 lazysre_lazysre 服务副本不足") == "lazysre_lazysre"
     assert _looks_like_doctor_request("做一次环境体检")
@@ -539,6 +547,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["scan"]) is False
     assert _should_launch_assistant(["swarm"]) is False
     assert _should_launch_assistant(["watch"]) is False
+    assert _should_launch_assistant(["actions"]) is False
     assert _should_launch_assistant(["doctor"]) is False
     assert _should_launch_assistant(["install-doctor"]) is False
     assert _should_launch_assistant(["setup"]) is False
@@ -1309,3 +1318,40 @@ def test_watch_report_markdown_and_latest_context(tmp_path: Path) -> None:
     assert "Latest watch snapshot" in context
     assert "swarm_image_pull_failed" in context
     assert _build_latest_watch_context("普通问题", path=watch_file) == ""
+
+
+def test_action_inbox_maps_watch_to_swarm_template() -> None:
+    snapshot = {
+        "generated_at_utc": "2026-04-09T00:00:00+00:00",
+        "alerts": [
+            {
+                "source": "swarm-root-cause",
+                "severity": "high",
+                "name": "swarm_image_pull_failed",
+                "detail": "service=api evidence=No such image",
+                "hint": "lazysre swarm --service api --logs",
+            }
+        ],
+        "swarm": {
+            "root_causes": [
+                {
+                    "category": "swarm_image_pull_failed",
+                    "service": "api",
+                    "severity": "high",
+                    "advice": "registry auth failed",
+                }
+            ],
+            "unhealthy_services": [{"name": "api", "replicas": "0/1"}],
+        },
+    }
+
+    inbox = _build_action_inbox_from_watch(snapshot)
+
+    assert inbox["summary"]["total"] >= 2
+    first = inbox["actions"][0]
+    assert first["template"] == "swarm-image-pull-failed"
+    assert first["command"] == "lazysre template run swarm-image-pull-failed --var service=api --apply"
+    markdown = _render_action_inbox_markdown(inbox)
+    assert "# LazySRE Action Inbox" in markdown
+    assert "swarm-image-pull-failed" in markdown
+    assert "lazysre template run swarm-image-pull-failed --var service=api --apply" in markdown
