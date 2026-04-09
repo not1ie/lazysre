@@ -16,6 +16,7 @@ def test_cluster_profile_store_save_activate_remove(tmp_path: Path) -> None:
         k8s_namespace="default",
         k8s_bearer_token="",
         k8s_verify_tls=False,
+        ssh_target="root@192.168.10.101",
     )
     store.upsert_profile("dev", env, activate=True)
     assert "dev" in store.list_profiles()
@@ -25,6 +26,7 @@ def test_cluster_profile_store_save_activate_remove(tmp_path: Path) -> None:
     assert ok is True
     runtime_env = TargetEnvStore(runtime_target_file).load()
     assert runtime_env.k8s_context == "dev"
+    assert runtime_env.ssh_target == "root@192.168.10.101"
 
     removed = store.remove_profile("dev")
     assert removed is True
@@ -44,6 +46,7 @@ def test_cluster_profile_store_export_and_import_payload(tmp_path: Path) -> None
         k8s_namespace="default",
         k8s_bearer_token="",
         k8s_verify_tls=False,
+        ssh_target="root@192.168.10.101",
     )
     src.upsert_profile("dev", env, activate=True)
 
@@ -56,6 +59,9 @@ def test_cluster_profile_store_export_and_import_payload(tmp_path: Path) -> None
     assert result["created"] == 1
     assert result["active"] == "dev"
     assert "dev" in dst.list_profiles()
+    imported_env = dst.get_profile("dev")
+    assert imported_env is not None
+    assert imported_env.ssh_target == "root@192.168.10.101"
 
 
 def test_cluster_profile_store_import_replace(tmp_path: Path) -> None:
@@ -80,6 +86,7 @@ def test_cluster_profile_store_import_replace(tmp_path: Path) -> None:
                 "k8s_namespace": "prod",
                 "k8s_bearer_token": "",
                 "k8s_verify_tls": False,
+                "ssh_target": "root@192.168.10.102",
             }
         },
     }
@@ -87,3 +94,6 @@ def test_cluster_profile_store_import_replace(tmp_path: Path) -> None:
     assert result["total"] == 1
     assert result["active"] == "new"
     assert store.list_profiles() == ["new"]
+    new_env = store.get_profile("new")
+    assert new_env is not None
+    assert new_env.ssh_target == "root@192.168.10.102"

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     target_k8s_namespace: str = "default"
     target_k8s_bearer_token: str = ""
     target_k8s_verify_tls: bool = False
+    target_ssh_target: str = ""
     openai_api_key: str = Field(default="", validation_alias="OPENAI_API_KEY")
     anthropic_api_key: str = Field(default="", validation_alias="ANTHROPIC_API_KEY")
     gemini_api_key: str = Field(

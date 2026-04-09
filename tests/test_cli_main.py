@@ -21,6 +21,7 @@ from lazysre.cli.main import (
     _collect_remote_docker_report,
     _remote_shell_command,
     _normalize_ssh_target,
+    _resolve_ssh_target_arg,
     _collect_watch_snapshot,
     _run_autopilot_cycle,
     _run_remote_autopilot_cycle,
@@ -352,6 +353,7 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_swarm_diagnose_request("看看服务器上的服务有没有异常")
     assert _looks_like_remote_diagnose_request("远程诊断 root@192.168.10.101 的 docker swarm")
     assert _extract_ssh_target_from_text("请 ssh root@192.168.10.101 看看") == "root@192.168.10.101"
+    assert _looks_like_target_update_request("把远程服务器设成 root@192.168.10.101")
     assert _looks_like_watch_request("开始巡检一下")
     assert _looks_like_actions_request("巡检之后下一步做什么")
     assert _looks_like_actions_request("给我推荐动作")
@@ -413,12 +415,14 @@ def test_extract_step_selection_from_text() -> None:
 
 def test_extract_target_updates_from_text() -> None:
     payload = _extract_target_updates_from_text(
-        "把 prometheus 设成 http://92.168.69.176:9090 ，k8s api 改成 https://192.168.10.1:6443 ，namespace 改成 prod，开启tls校验"
+        "把 prometheus 设成 http://92.168.69.176:9090 ，k8s api 改成 https://192.168.10.1:6443 ，namespace 改成 prod，把远程服务器设成 root@192.168.10.101，开启tls校验"
     )
     assert payload["prometheus_url"] == "http://92.168.69.176:9090"
     assert payload["k8s_api_url"] == "https://192.168.10.1:6443"
     assert payload["k8s_namespace"] == "prod"
+    assert payload["ssh_target"] == "root@192.168.10.101"
     assert payload["k8s_verify_tls"] is True
+    assert "ssh_target" not in _extract_target_updates_from_text("远程诊断 root@192.168.10.101 的 docker swarm")
 
 
 def test_extract_profile_switch_name() -> None:
@@ -875,6 +879,7 @@ def test_target_runbook_context_vars(tmp_path: Path, monkeypatch) -> None:
                 "k8s_api_url": "https://127.0.0.1:6443",
                 "k8s_context": "dev",
                 "k8s_namespace": "payments",
+                "ssh_target": "root@192.168.10.101",
             },
             ensure_ascii=False,
         ),
@@ -884,7 +889,59 @@ def test_target_runbook_context_vars(tmp_path: Path, monkeypatch) -> None:
     values = _target_runbook_context_vars(profile_file=target_file)
     assert values["namespace"] == "payments"
     assert values["k8s_context"] == "dev"
+    assert values["ssh_target"] == "root@192.168.10.101"
     assert values["target_profile"] == "prod"
+
+
+def test_resolve_ssh_target_arg_uses_target_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target_file = tmp_path / "target.json"
+    old_profile = settings.target_profile_file
+    try:
+        settings.target_profile_file = str(target_file)
+        target_file.write_text(
+            json.dumps({"ssh_target": "root@192.168.10.101"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        assert _resolve_ssh_target_arg("") == "root@192.168.10.101"
+        assert _resolve_ssh_target_arg("@target") == "root@192.168.10.101"
+        assert _resolve_ssh_target_arg("root@192.168.10.102") == "root@192.168.10.102"
+        assert _resolve_ssh_target_arg("not-a-host") == ""
+    finally:
+        settings.target_profile_file = old_profile
+
+
+def test_remote_intent_and_action_use_saved_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target_file = tmp_path / "target.json"
+    old_profile = settings.target_profile_file
+    calls: list[dict[str, object]] = []
+
+    def fake_remote(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {
+            "target": kwargs.get("target", ""),
+            "ok": True,
+            "summary": {"pass": 1, "warn": 0, "error": 0},
+            "checks": [],
+            "unhealthy_services": [],
+            "bad_nodes": [],
+            "root_causes": [],
+            "recommendations": [],
+        }
+
+    try:
+        settings.target_profile_file = str(target_file)
+        target_file.write_text(
+            json.dumps({"ssh_target": "root@192.168.10.101"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cli_main, "_collect_remote_docker_report", fake_remote)
+
+        assert _looks_like_remote_diagnose_request("远程诊断一下 docker swarm")
+        assert _run_action_command("lazysre remote --logs", options={}, execute_mode=False) is True
+        assert calls[0]["target"] == "root@192.168.10.101"
+        assert calls[0]["include_logs"] is True
+    finally:
+        settings.target_profile_file = old_profile
 
 
 def test_resolve_runbook_vars_prefers_cli_over_target(tmp_path: Path, monkeypatch) -> None:

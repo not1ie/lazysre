@@ -403,7 +403,7 @@ def autopilot(
     if remote_target.strip():
         report = _run_remote_autopilot_cycle(
             goal=goal,
-            target=remote_target,
+            target=_resolve_ssh_target_arg(remote_target),
             service_filter=service,
             include_logs=include_logs,
             timeout_sec=timeout_sec,
@@ -455,7 +455,7 @@ def autopilot(
 
 @app.command("remote")
 def remote(
-    target: Annotated[str, typer.Argument(help="SSH target, e.g. root@192.168.10.101")],
+    target: Annotated[str, typer.Argument(help="SSH target, e.g. root@192.168.10.101. Omit to use target.ssh_target.")] = "",
     service: Annotated[str, typer.Option("--service", help="Optional Docker Swarm service filter.")] = "",
     logs: Annotated[bool, typer.Option("--logs", help="Include remote Swarm service logs.")] = False,
     tail: Annotated[int, typer.Option("--tail", help="Remote log/task tail lines.")] = 80,
@@ -463,8 +463,9 @@ def remote(
     as_json: Annotated[bool, typer.Option("--json", help="Print remote report as JSON.")] = False,
     report_md: Annotated[str, typer.Option("--report-md", help="Optional markdown remote report path.")] = "",
 ) -> None:
+    resolved_target = _resolve_ssh_target_arg(target)
     report = _collect_remote_docker_report(
-        target=target,
+        target=resolved_target,
         service_filter=service,
         include_logs=logs,
         tail=tail,
@@ -1566,6 +1567,7 @@ def target_show(
 def target_set(
     profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
     prometheus_url: Annotated[str | None, typer.Option("--prometheus-url", help="Prometheus base URL.")] = None,
+    ssh_target: Annotated[str | None, typer.Option("--ssh-target", help="Default SSH target for remote Docker/Swarm diagnosis.")] = None,
     k8s_api_url: Annotated[str | None, typer.Option("--k8s-api-url", help="Kubernetes API URL.")] = None,
     k8s_context: Annotated[str | None, typer.Option("--k8s-context", help="kubectl context name.")] = None,
     k8s_namespace: Annotated[str | None, typer.Option("--k8s-namespace", help="Default Kubernetes namespace.")] = None,
@@ -1575,6 +1577,7 @@ def target_set(
     store = TargetEnvStore(Path(profile_file))
     updated = store.update(
         prometheus_url=prometheus_url,
+        ssh_target=ssh_target,
         k8s_api_url=k8s_api_url,
         k8s_context=k8s_context,
         k8s_namespace=k8s_namespace,
@@ -2267,6 +2270,8 @@ def _target_runbook_context_vars(*, profile_file: Path) -> dict[str, str]:
         values["k8s_api_url"] = target.k8s_api_url.strip()
     if target.prometheus_url.strip():
         values["prometheus_url"] = target.prometheus_url.strip()
+    if str(getattr(target, "ssh_target", "")).strip():
+        values["ssh_target"] = str(getattr(target, "ssh_target", "")).strip()
     if active_profile:
         values["target_profile"] = active_profile
     return values
@@ -4551,6 +4556,13 @@ def _normalize_ssh_target(target: str) -> str:
     return value
 
 
+def _resolve_ssh_target_arg(target: str) -> str:
+    value = str(target or "").strip()
+    if value in {"", "@target", "@active", "@ssh", "target"}:
+        return str(TargetEnvStore(Path(settings.target_profile_file)).load().ssh_target or "").strip()
+    return _normalize_ssh_target(value)
+
+
 def _remote_shell_command(args: list[str]) -> str:
     return " ".join(shlex.quote(str(item)) for item in args)
 
@@ -5269,9 +5281,9 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
         return True
 
     if subcommand == "remote":
-        target = _extract_ssh_target_from_text(" ".join(tokens[1:]))
+        target = _resolve_ssh_target_arg(_extract_ssh_target_from_text(" ".join(tokens[1:])))
         if not target:
-            typer.echo("remote action 缺少 SSH target。")
+            typer.echo("remote action 缺少 SSH target。请先执行：lsre target set --ssh-target root@host")
             return False
         service = ""
         include_logs = False
@@ -5798,6 +5810,7 @@ def _render_status_snapshot(snapshot: dict[str, object]) -> None:
     table.add_row("K8s API", str(target_payload.get("k8s_api_url", "-") or "-"))
     table.add_row("K8s Context", str(target_payload.get("k8s_context", "-") or "-"))
     table.add_row("K8s Namespace", str(target_payload.get("k8s_namespace", "-") or "-"))
+    table.add_row("SSH Target", str(target_payload.get("ssh_target", "-") or "-"))
     memory = snapshot.get("memory", {})
     if isinstance(memory, dict):
         table.add_row("Memory Cases", str(memory.get("cases", 0)))
@@ -6657,6 +6670,16 @@ def _doctor_target_checks(target) -> list[dict[str, object]]:
             "hint": "" if prom else "使用 lsre target set --prometheus-url <url> 配置",
         }
     )
+    ssh_target = str(getattr(target, "ssh_target", "") or "").strip()
+    checks.append(
+        {
+            "name": "target.ssh_target",
+            "ok": bool(ssh_target),
+            "severity": "pass" if ssh_target else "warn",
+            "detail": ssh_target or "(unset)",
+            "hint": "" if ssh_target else "使用 lsre target set --ssh-target root@host 配置远程 Docker/Swarm 诊断目标",
+        }
+    )
     k8s_api = (target.k8s_api_url or "").strip()
     checks.append(
         {
@@ -7101,12 +7124,12 @@ def _render_chat_short_help() -> None:
         "- /watch [--count N]: 持续巡检并输出异常摘要",
         "- /actions [id]: 把最近一次巡检结果整理成编号行动清单，可直接执行某个建议",
         "- /autopilot [目标]: 自动扫描 -> 巡检 -> 行动清单，可加 --fix 生成修复计划",
-        "- /remote <user@host> [--logs]: 通过 SSH 只读诊断远程 Docker/Swarm",
+        "- /remote [user@host] [--logs]: 通过 SSH 只读诊断远程 Docker/Swarm；已保存 ssh_target 时可省略主机",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
         "- 输入容错：/quikstart /stauts /templete 会自动纠正",
-        "- 自然语言目标配置：把 namespace 设成 prod / 把 prometheus 设成 http://x:9090",
+        "- 自然语言目标配置：把 namespace 设成 prod / 把 prometheus 设成 http://x:9090 / 把远程服务器设成 root@host",
         "- 自然语言多集群：保存当前为 prod 并切换 / 切到 prod 集群 / 看看当前profile",
         "- 自然语言档案管理：导出profile到 .data/p.json / 从 .data/p.json 导入profile / 删除profile prod（需确认）",
         "- /reset: 重置引导与聊天模式记忆",
@@ -8011,9 +8034,9 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
         )
         return True
     if _looks_like_remote_diagnose_request(text):
-        target = _extract_ssh_target_from_text(text)
+        target = _resolve_ssh_target_arg(_extract_ssh_target_from_text(text))
         if not target:
-            typer.echo("请提供 SSH target，例如：远程诊断 root@192.168.10.101")
+            typer.echo("请提供 SSH target，例如：远程诊断 root@192.168.10.101；或先执行 lsre target set --ssh-target root@host")
             return True
         service_text = text.replace(target, " ")
         report = _collect_remote_docker_report(
@@ -9142,6 +9165,28 @@ def _extract_target_updates_from_text(text: str) -> dict[str, object]:
     if token:
         updates["k8s_bearer_token"] = token
 
+    ssh_target = _first(
+        [
+            r"(?:ssh\s*target|ssh|远程(?:服务器|主机|目标)?|服务器|主机|remote(?:\s*host)?)[\s:=：]*(?:是|为|改成|设成|设置为|用|保存为|配置为)?\s*([A-Za-z0-9._-]+@[A-Za-z0-9._:-]+)",
+        ]
+    )
+    if not ssh_target:
+        maybe_target = _extract_ssh_target_from_text(raw)
+        explicit_target_update = (
+            "ssh target",
+            "保存远程",
+            "配置远程",
+            "设置远程",
+            "远程目标",
+            "remote host",
+        )
+        if maybe_target and any(k in lowered for k in explicit_target_update):
+            ssh_target = maybe_target
+    if ssh_target:
+        normalized_target = _normalize_ssh_target(ssh_target)
+        if normalized_target:
+            updates["ssh_target"] = normalized_target
+
     disable_tls_keywords = (
         "skip tls",
         "skip-tls",
@@ -9831,6 +9876,12 @@ def _looks_like_target_update_request(text: str) -> bool:
         "命名空间",
         "context",
         "token",
+        "ssh",
+        "远程",
+        "服务器",
+        "主机",
+        "remote host",
+        "ssh target",
         "tls",
         "证书",
     )
@@ -9950,8 +10001,6 @@ def _looks_like_remote_diagnose_request(text: str) -> bool:
     lowered = text.lower().strip()
     if not lowered:
         return False
-    if not _extract_ssh_target_from_text(text):
-        return False
     keywords = (
         "远程",
         "ssh",
@@ -9969,7 +10018,10 @@ def _looks_like_remote_diagnose_request(text: str) -> bool:
         "diagnose",
         "check",
     )
-    return any(k in lowered for k in keywords) and any(k in lowered for k in diagnose_words)
+    has_intent = any(k in lowered for k in keywords) and any(k in lowered for k in diagnose_words)
+    if not has_intent:
+        return False
+    return bool(_extract_ssh_target_from_text(text) or _resolve_ssh_target_arg(""))
 
 
 def _extract_ssh_target_from_text(text: str) -> str:

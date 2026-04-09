@@ -18,6 +18,7 @@ class TargetEnvironment:
     k8s_namespace: str = "default"
     k8s_bearer_token: str = ""
     k8s_verify_tls: bool = False
+    ssh_target: str = ""
 
     def to_safe_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -41,6 +42,7 @@ class TargetEnvStore:
             k8s_namespace=settings.target_k8s_namespace.strip() or "default",
             k8s_bearer_token=settings.target_k8s_bearer_token.strip(),
             k8s_verify_tls=bool(settings.target_k8s_verify_tls),
+            ssh_target=settings.target_ssh_target.strip(),
         )
         if not self.path.exists():
             return base
@@ -60,6 +62,7 @@ class TargetEnvStore:
             k8s_namespace=str(payload.get("k8s_namespace", base.k8s_namespace)).strip() or "default",
             k8s_bearer_token=str(payload.get("k8s_bearer_token", base.k8s_bearer_token)).strip(),
             k8s_verify_tls=bool(payload.get("k8s_verify_tls", base.k8s_verify_tls)),
+            ssh_target=str(payload.get("ssh_target", base.ssh_target)).strip(),
         )
 
     def save(self, env: TargetEnvironment) -> None:

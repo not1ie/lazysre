@@ -29,6 +29,9 @@ lazysre scan
 lazysre swarm --logs
 # 远程服务器只读诊断（目标机无需安装 LazySRE，只需可 SSH）
 lazysre remote root@192.168.10.101 --logs
+# 保存默认远程目标后，后续可以直接 lazysre remote
+lazysre target set --ssh-target root@192.168.10.101
+lazysre remote --logs
 # 持续巡检（默认会把异常摘要写入长期记忆，可用 --no-remember 关闭）
 lazysre watch --count 1
 # 把最近一次巡检转换成编号行动清单
@@ -153,6 +156,7 @@ lsre approve --steps 2 --execute --yes --allow-high-risk
 # 目标环境配置与连通性探针
 lsre target show
 lsre target set --prometheus-url http://92.168.69.176:9090 --k8s-api-url https://192.168.10.1:6443 --k8s-skip-tls-verify
+lsre target set --ssh-target root@192.168.10.101
 lsre target probe --json
 # 运行时状态总览
 lsre status
@@ -169,6 +173,8 @@ lsre remote root@192.168.10.101
 lsre remote root@192.168.10.101 --logs
 lsre remote root@192.168.10.101 --service lazysre_lazysre --logs
 lsre remote root@192.168.10.101 --report-md .data/remote-101.md
+# 已保存 ssh_target 后可省略主机
+lsre remote --logs
 # 持续巡检、JSONL 留痕与异常记忆
 lsre watch --count 1
 lsre watch --count 10 --interval-sec 60 --output .data/watch.jsonl
@@ -185,6 +191,7 @@ lsre autopilot "帮我看下当前服务器有没有问题" --json
 lsre autopilot --report-md .data/autopilot.md
 lsre autopilot "修复巡检发现的问题" --fix
 lsre autopilot --remote root@192.168.10.101 --logs --report-md .data/remote-autopilot.md
+lsre autopilot --remote @target --logs
 # 直接消费最新巡检证据生成修复计划
 lsre fix "修复巡检发现的问题"
 # 环境预检（依赖/配置/连通性）

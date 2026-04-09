@@ -189,4 +189,5 @@ def _env_from_dict(raw: dict[str, Any]) -> TargetEnvironment:
         k8s_namespace=str(raw.get("k8s_namespace", "default")).strip() or "default",
         k8s_bearer_token=str(raw.get("k8s_bearer_token", "")).strip(),
         k8s_verify_tls=bool(raw.get("k8s_verify_tls", False)),
+        ssh_target=str(raw.get("ssh_target", "")).strip(),
     )

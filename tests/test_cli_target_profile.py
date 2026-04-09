@@ -85,10 +85,12 @@ def test_target_store_update_and_mask_token(tmp_path: Path) -> None:
         k8s_namespace="ops",
         k8s_bearer_token="abcdef1234567890",
         k8s_verify_tls=False,
+        ssh_target="root@192.168.10.101",
     )
     safe = env.to_safe_dict()
     assert safe["k8s_bearer_token"] != "abcdef1234567890"
     assert safe["k8s_context"] == "prod-context"
+    assert safe["ssh_target"] == "root@192.168.10.101"
 
 
 async def test_observer_tools_use_target_profile_defaults(tmp_path: Path) -> None:
