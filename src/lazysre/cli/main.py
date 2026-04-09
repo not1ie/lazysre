@@ -322,10 +322,31 @@ def watch(
 
 @app.command("actions")
 def actions(
+    ctx: typer.Context,
     from_watch: Annotated[str, typer.Option("--from-watch", help="Watch snapshot JSON path. Defaults to latest watch.")] = "",
     as_json: Annotated[bool, typer.Option("--json", help="Print action inbox as JSON.")] = False,
     report_md: Annotated[str, typer.Option("--report-md", help="Optional markdown action report path.")] = "",
+    run_id: Annotated[int, typer.Option("--run", help="Run a recommended action by ID. Default is dry-run unless global --execute is set.")] = 0,
 ) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
     snapshot = _load_latest_watch_snapshot(Path(from_watch).expanduser() if from_watch.strip() else None)
     inbox = _build_action_inbox_from_watch(snapshot)
     if report_md.strip():
@@ -334,8 +355,15 @@ def actions(
         typer.echo(f"Action report exported: {out_path}")
     if as_json or (not _console):
         typer.echo(json.dumps(inbox, ensure_ascii=False, indent=2))
-        return
-    _render_action_inbox(inbox)
+    else:
+        _render_action_inbox(inbox)
+    if run_id > 0:
+        _run_action_inbox_item(
+            inbox=inbox,
+            action_id=run_id,
+            options=options,
+            execute_mode=bool(options["execute"]),
+        )
 
 
 @app.command("autopilot")
@@ -4626,6 +4654,195 @@ def _render_action_inbox_markdown(inbox: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _find_action_inbox_item(inbox: dict[str, object], action_id: int) -> dict[str, object] | None:
+    actions = inbox.get("actions", [])
+    if not isinstance(actions, list):
+        return None
+    for raw in actions:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            current = int(raw.get("id", 0))
+        except Exception:
+            current = 0
+        if current == action_id:
+            return raw
+    return None
+
+
+def _run_action_inbox_item(
+    *,
+    inbox: dict[str, object],
+    action_id: int,
+    options: dict[str, object],
+    execute_mode: bool,
+) -> bool:
+    item = _find_action_inbox_item(inbox, action_id)
+    if not item:
+        typer.echo(f"Action not found: {action_id}")
+        return False
+    title = str(item.get("title", f"action {action_id}")).strip()
+    command = str(item.get("command", "")).strip()
+    if not command:
+        typer.echo(f"Action {action_id} has no command.")
+        return False
+    typer.echo(f"Running action {action_id}: {title}")
+    return _run_action_command(
+        command,
+        options=options,
+        execute_mode=execute_mode,
+    )
+
+
+def _run_action_command(command_text: str, *, options: dict[str, object], execute_mode: bool) -> bool:
+    try:
+        tokens = shlex.split(command_text)
+    except ValueError as exc:
+        typer.echo(f"无法解析行动命令: {exc}")
+        return False
+    if not tokens:
+        typer.echo("行动命令为空。")
+        return False
+    if tokens[0] in {"lazysre", "lsre"}:
+        tokens = tokens[1:]
+    if len(tokens) >= 3 and tokens[:3] == ["python", "-m", "lazysre"]:
+        tokens = tokens[3:]
+    if not tokens:
+        typer.echo("行动命令缺少 LazySRE 子命令。")
+        return False
+
+    subcommand = tokens[0]
+    if subcommand == "template":
+        try:
+            parsed = _parse_chat_template_command(shlex.join(tokens[1:]))
+        except ValueError as exc:
+            typer.echo(f"template action parse failed: {exc}")
+            return False
+        action = str(parsed.get("action", "list"))
+        if action == "list":
+            template_list()
+            return True
+        if action == "show":
+            template_show(name=str(parsed.get("name", "")))
+            return True
+        _run_remediation_template(
+            template_name=str(parsed.get("name", "")),
+            var_items=[str(x) for x in list(parsed.get("var_items", []))],
+            apply=bool(parsed.get("apply", False)),
+            max_apply_steps=int(parsed.get("max_apply_steps", 6)),
+            allow_high_risk=bool(parsed.get("allow_high_risk", False)),
+            auto_approve_low_risk=bool(parsed.get("auto_approve_low_risk", True)),
+            execute=_resolve_execute_for_apply_request(
+                execute_mode,
+                label=f"执行行动项模板 {parsed.get('name', '')}",
+                apply=bool(parsed.get("apply", False)),
+            ),
+            approval_mode=str(options["approval_mode"]),
+            audit_log=str(options["audit_log"]),
+            model=str(options["model"]),
+            provider=str(options["provider"]),
+        )
+        return True
+
+    if subcommand == "swarm":
+        service = ""
+        include_logs = False
+        tail = 120
+        idx = 1
+        while idx < len(tokens):
+            token = tokens[idx]
+            if token == "--logs":
+                include_logs = True
+                idx += 1
+                continue
+            if token == "--service":
+                idx += 1
+                if idx < len(tokens):
+                    service = tokens[idx]
+                idx += 1
+                continue
+            if token.startswith("--service="):
+                service = token.split("=", 1)[1]
+                idx += 1
+                continue
+            if token == "--tail":
+                idx += 1
+                if idx < len(tokens):
+                    tail = max(1, min(_safe_int(tokens[idx]), 1000))
+                idx += 1
+                continue
+            if token.startswith("--tail="):
+                tail = max(1, min(_safe_int(token.split("=", 1)[1]), 1000))
+                idx += 1
+                continue
+            idx += 1
+        report = _collect_swarm_health_report(
+            service_filter=service,
+            include_logs=include_logs,
+            tail=tail,
+            timeout_sec=6,
+        )
+        if _console:
+            _render_swarm_health_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return True
+
+    if subcommand == "scan":
+        report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
+        if _console:
+            _render_environment_discovery(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return True
+
+    if subcommand == "fix":
+        instruction = " ".join(tokens[1:]).strip() or "修复巡检发现的问题"
+        _run_fix(
+            instruction=instruction,
+            apply=False,
+            max_apply_steps=6,
+            allow_high_risk=False,
+            auto_approve_low_risk=True,
+            export_plan_md="",
+            export_plan_json="",
+            execute=execute_mode,
+            approve=bool(options["approve"]),
+            interactive_approval=bool(options["interactive_approval"]),
+            stream_output=bool(options["stream_output"]),
+            verbose_reasoning=bool(options["verbose_reasoning"]),
+            approval_mode=str(options["approval_mode"]),
+            audit_log=str(options["audit_log"]),
+            lock_file=str(options["lock_file"]),
+            session_file=str(options["session_file"]),
+            deny_tool=list(options["deny_tool"]),
+            deny_prefix=list(options["deny_prefix"]),
+            tool_pack=list(options["tool_pack"]),
+            remote_gateway=list(options["remote_gateway"]),
+            model=str(options["model"]),
+            provider=str(options["provider"]),
+            max_steps=int(options["max_steps"]),
+        )
+        return True
+
+    if subcommand in {"kubectl", "docker", "curl"}:
+        _execute_fix_plan_steps(
+            plan=FixPlan(apply_commands=[shlex.join(tokens)], rollback_commands=[]),
+            max_apply_steps=1,
+            execute=execute_mode,
+            approval_mode=str(options["approval_mode"]),
+            audit_log=str(options["audit_log"]),
+            allow_high_risk=False,
+            auto_approve_low_risk=True,
+            model=str(options["model"]),
+            provider=str(options["provider"]),
+        )
+        return True
+
+    typer.echo(f"暂不支持自动执行该行动命令: {command_text}")
+    return False
+
+
 def _latest_autopilot_file() -> Path:
     return Path(settings.data_dir) / "lsre-autopilot-last.json"
 
@@ -6236,7 +6453,7 @@ def _render_chat_short_help() -> None:
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
         "- /swarm [--logs]: 检查 Docker Swarm 服务、副本、任务失败证据",
         "- /watch [--count N]: 持续巡检并输出异常摘要",
-        "- /actions: 把最近一次巡检结果整理成编号行动清单",
+        "- /actions [id]: 把最近一次巡检结果整理成编号行动清单，可直接执行某个建议",
         "- /autopilot [目标]: 自动扫描 -> 巡检 -> 行动清单，可加 --fix 生成修复计划",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
@@ -6474,12 +6691,21 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 typer.echo(json.dumps(snapshots, ensure_ascii=False, indent=2))
             continue
         if text.lower().startswith("/actions"):
+            tail = text[len("/actions") :].strip()
             snapshot = _load_latest_watch_snapshot(None)
             inbox = _build_action_inbox_from_watch(snapshot)
             if _console:
                 _render_action_inbox(inbox)
             else:
                 typer.echo(json.dumps(inbox, ensure_ascii=False, indent=2))
+            action_id = _extract_action_id_from_text(tail)
+            if action_id > 0:
+                _run_action_inbox_item(
+                    inbox=inbox,
+                    action_id=action_id,
+                    options=options,
+                    execute_mode=runtime_execute,
+                )
             continue
         if text.lower().startswith("/autopilot"):
             tail = text[len("/autopilot") :].strip()
@@ -7159,6 +7385,20 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
                 provider=str(options["provider"]),
                 max_steps=int(options["max_steps"]),
             )
+        return True
+    if _looks_like_action_run_request(text):
+        snapshot = _load_latest_watch_snapshot(None)
+        inbox = _build_action_inbox_from_watch(snapshot)
+        action_id = _extract_action_id_from_text(text)
+        if action_id <= 0:
+            typer.echo("请指定要执行的行动编号，例如：执行第1个建议")
+            return True
+        _run_action_inbox_item(
+            inbox=inbox,
+            action_id=action_id,
+            options=options,
+            execute_mode=execute_mode,
+        )
         return True
     if _looks_like_actions_request(text):
         snapshot = _load_latest_watch_snapshot(None)
@@ -9058,6 +9298,45 @@ def _looks_like_actions_request(text: str) -> bool:
         "what next",
     )
     return any(k in lowered for k in keywords)
+
+
+def _looks_like_action_run_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    action_words = (
+        "建议",
+        "动作",
+        "行动",
+        "推荐",
+        "action",
+    )
+    run_words = (
+        "执行",
+        "运行",
+        "处理",
+        "run",
+        "apply",
+    )
+    return any(k in lowered for k in action_words) and any(k in lowered for k in run_words) and _extract_action_id_from_text(text) > 0
+
+
+def _extract_action_id_from_text(text: str) -> int:
+    raw = str(text or "").strip()
+    if not raw:
+        return 0
+    patterns = [
+        r"(?:执行|运行|处理|应用)\s*(?:第)?\s*(\d+)\s*(?:个)?\s*(?:建议|动作|行动|推荐)",
+        r"(?:建议|动作|行动|推荐)\s*(?:第)?\s*(\d+)",
+        r"(?:run|apply)\s+(?:action\s+)?(\d+)",
+        r"action\s+(\d+)",
+        r"^(\d+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            return _safe_int(match.group(1))
+    return 0
 
 
 def _looks_like_autopilot_request(text: str) -> bool:

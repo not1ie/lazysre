@@ -31,6 +31,8 @@ lazysre swarm --logs
 lazysre watch --count 1
 # 把最近一次巡检转换成编号行动清单
 lazysre actions
+# 直接运行第 1 个建议（默认 dry-run，真实执行需加全局 --execute）
+lazysre actions --run 1
 # 自动驾驶：扫描 -> 巡检 -> 行动清单，可选生成修复计划
 lazysre autopilot
 # 首次启动向导（安装检查+LLM Key+目标连通性）
@@ -166,6 +168,7 @@ lsre watch --count 1 --report-md .data/watch-report.md
 lsre actions
 lsre actions --json
 lsre actions --report-md .data/actions.md
+lsre actions --run 1
 # 自动驾驶：一次跑完整观察链路，并可导出报告或生成修复计划
 lsre autopilot
 lsre autopilot "帮我看下当前服务器有没有问题" --json
@@ -250,6 +253,7 @@ lsre memory search "payment latency" --limit 5
 - “为什么 lazysre_lazysre 服务副本不足”
 - “开始巡检一下”
 - “下一步做什么 / 给我推荐动作 / 生成行动清单”
+- “执行第1个建议 / 运行第2个动作”
 - “自动驾驶排查一下 / 一键巡检并诊断 / 从巡检到修复”
 - “做一次环境体检”
 - “导出复盘报告”

@@ -23,6 +23,8 @@ from lazysre.cli.main import (
     _build_autopilot_report,
     _render_autopilot_report_markdown,
     _build_action_inbox_from_watch,
+    _find_action_inbox_item,
+    _run_action_command,
     _render_watch_report_markdown,
     _render_action_inbox_markdown,
     _build_latest_watch_context,
@@ -65,6 +67,7 @@ from lazysre.cli.main import (
     _looks_like_swarm_diagnose_request,
     _looks_like_watch_request,
     _looks_like_actions_request,
+    _looks_like_action_run_request,
     _looks_like_autopilot_request,
     _looks_like_report_request,
     _looks_like_target_show_request,
@@ -86,6 +89,7 @@ from lazysre.cli.main import (
     _looks_like_latest_watch_reference,
     _looks_like_template_library_request,
     _looks_like_with_impact_request,
+    _extract_action_id_from_text,
     _split_fix_plan_read_write_commands,
     _parse_step_selection,
     _read_last_fix_plan_summary,
@@ -339,6 +343,8 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_watch_request("开始巡检一下")
     assert _looks_like_actions_request("巡检之后下一步做什么")
     assert _looks_like_actions_request("给我推荐动作")
+    assert _looks_like_action_run_request("执行第1个建议")
+    assert _extract_action_id_from_text("执行第12个动作") == 12
     assert _looks_like_autopilot_request("帮我自动驾驶排查一下")
     assert _looks_like_autopilot_request("一键巡检并诊断")
     assert _looks_like_latest_watch_reference("修复巡检发现的问题")
@@ -1365,6 +1371,47 @@ def test_action_inbox_maps_watch_to_swarm_template() -> None:
     assert "# LazySRE Action Inbox" in markdown
     assert "swarm-image-pull-failed" in markdown
     assert "lazysre template run swarm-image-pull-failed --var service=api --apply" in markdown
+    assert _find_action_inbox_item(inbox, 1) == first
+    assert _find_action_inbox_item(inbox, 999) is None
+
+
+def test_run_action_command_dispatches_template(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_template(**kwargs: object) -> None:
+        calls.append(dict(kwargs))
+
+    monkeypatch.setattr(cli_main, "_run_remediation_template", fake_template)
+    options = {
+        "execute": False,
+        "approve": False,
+        "interactive_approval": True,
+        "stream_output": False,
+        "verbose_reasoning": False,
+        "approval_mode": "balanced",
+        "audit_log": str(tmp_path / "audit.jsonl"),
+        "lock_file": str(tmp_path / "lock.json"),
+        "session_file": str(tmp_path / "session.json"),
+        "deny_tool": [],
+        "deny_prefix": [],
+        "tool_pack": ["builtin"],
+        "remote_gateway": [],
+        "model": "gpt-5.4-mini",
+        "provider": "mock",
+        "max_steps": 6,
+    }
+
+    ok = _run_action_command(
+        "lazysre template run swarm-image-pull-failed --var service=api --apply",
+        options=options,
+        execute_mode=False,
+    )
+
+    assert ok is True
+    assert calls[0]["template_name"] == "swarm-image-pull-failed"
+    assert calls[0]["var_items"] == ["service=api"]
+    assert calls[0]["apply"] is True
+    assert calls[0]["execute"] is False
 
 
 def test_build_autopilot_report_promotes_first_action() -> None:
