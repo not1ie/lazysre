@@ -36,7 +36,9 @@ function run(command, args, options = {}) {
     stdio: options.stdio || "pipe",
     encoding: "utf-8",
     shell: false,
-    windowsHide: true
+    windowsHide: true,
+    env: options.env || process.env,
+    cwd: options.cwd
   });
 }
 
@@ -118,6 +120,34 @@ function launcherVenvPythonCmd() {
   return launcherVenvPythonPath();
 }
 
+function localSourceRoot() {
+  const cwd = process.cwd();
+  const byCwd = path.join(cwd, "src", "lazysre", "__main__.py");
+  if (fs.existsSync(byCwd)) {
+    return cwd;
+  }
+  const launcherRoot = path.resolve(__dirname, "..");
+  const byLauncher = path.join(launcherRoot, "src", "lazysre", "__main__.py");
+  if (fs.existsSync(byLauncher)) {
+    return launcherRoot;
+  }
+  return "";
+}
+
+function envWithPythonPath(projectRoot) {
+  const srcPath = path.join(projectRoot, "src");
+  const env = { ...process.env };
+  const key = process.platform === "win32" ? "Path" : "PATH";
+  if (!env[key]) {
+    env[key] = process.env[key] || "";
+  }
+  const existing = env.PYTHONPATH ? env.PYTHONPATH.split(path.delimiter) : [];
+  if (!existing.includes(srcPath)) {
+    env.PYTHONPATH = [srcPath, ...existing].filter(Boolean).join(path.delimiter);
+  }
+  return env;
+}
+
 function ensureLauncherVenv(basePythonCmd) {
   const pythonPath = launcherVenvPythonPath();
   if (!fs.existsSync(pythonPath)) {
@@ -134,9 +164,30 @@ function ensureLauncherVenv(basePythonCmd) {
 }
 
 function ensureLazySRE(pythonCmd) {
+  const localRoot = localSourceRoot();
+  if (localRoot) {
+    const localEnv = envWithPythonPath(localRoot);
+    const localImportCheck = run(pythonCmd, ["-c", "import lazysre"], { stdio: "pipe", env: localEnv });
+    if (localImportCheck.status === 0) {
+      return {
+        installedNow: false,
+        source: localRoot,
+        runtimePython: pythonCmd,
+        installMethod: "local-source",
+        runtimeEnv: localEnv
+      };
+    }
+  }
+
   const importCheck = run(pythonCmd, ["-c", "import lazysre"], { stdio: "pipe" });
   if (importCheck.status === 0) {
-    return { installedNow: false, source: "", runtimePython: pythonCmd, installMethod: "system" };
+    return {
+      installedNow: false,
+      source: "",
+      runtimePython: pythonCmd,
+      installMethod: "system",
+      runtimeEnv: process.env
+    };
   }
 
   const existingVenvPy = launcherVenvPythonCmd();
@@ -147,7 +198,8 @@ function ensureLazySRE(pythonCmd) {
         installedNow: false,
         source: "launcher-venv",
         runtimePython: existingVenvPy,
-        installMethod: "launcher-venv"
+        installMethod: "launcher-venv",
+        runtimeEnv: process.env
       };
     }
   }
@@ -162,7 +214,7 @@ function ensureLazySRE(pythonCmd) {
 
   const preferred = process.env.LAZYSRE_PIP_SOURCE
     ? [process.env.LAZYSRE_PIP_SOURCE]
-    : ["lazysre", "https://github.com/not1ie/lazysre/archive/refs/heads/main.zip"];
+    : ["https://github.com/not1ie/lazysre/archive/refs/heads/main.zip", "lazysre"];
 
   let installed = false;
   let usedSource = "";
@@ -222,7 +274,8 @@ function ensureLazySRE(pythonCmd) {
     installedNow: true,
     source: usedSource,
     runtimePython,
-    installMethod
+    installMethod,
+    runtimeEnv: process.env
   };
 }
 
@@ -278,11 +331,12 @@ function main() {
       emitFirstRunHint(`${state.source} (${state.installMethod})`);
     }
     const runtimePython = state.runtimePython || pythonCmd;
+    const runtimeEnv = state.runtimeEnv || process.env;
     const args = process.argv.slice(2);
     const result = run(
       runtimePython,
       ["-m", "lazysre", ...args],
-      { stdio: "inherit" }
+      { stdio: "inherit", env: runtimeEnv }
     );
     process.exit(result.status == null ? 1 : result.status);
   } catch (err) {
