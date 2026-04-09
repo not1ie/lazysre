@@ -504,6 +504,8 @@ def remediate(
     rollback_on_failure: Annotated[bool, typer.Option("--rollback-on-failure", help="Run rollback commands when apply or verify fails in execute mode.")] = False,
     from_last_plan: Annotated[bool, typer.Option("--from-last-plan", help="Use .data/lsre-fix-last.json instead of deriving a plan from observation.")] = False,
     max_apply_steps: Annotated[int, typer.Option("--max-apply-steps", help="Max apply commands to run.")] = 6,
+    report_md: Annotated[str, typer.Option("--report-md", help="Optional markdown closed-loop report path.")] = "",
+    report_json: Annotated[str, typer.Option("--report-json", help="Optional JSON closed-loop report path.")] = "",
     as_json: Annotated[bool, typer.Option("--json", help="Print closed-loop report as JSON.")] = False,
 ) -> None:
     options = _merged_options(
@@ -543,6 +545,14 @@ def remediate(
         model=str(options["model"]),
         provider=str(options["provider"]),
     )
+    if report_json.strip():
+        out_path = Path(report_json).expanduser()
+        _write_json_file(out_path, report)
+        typer.echo(f"Remediation JSON report exported: {out_path}")
+    if report_md.strip():
+        out_path = Path(report_md).expanduser()
+        _write_text_file(out_path, _render_closed_loop_report_markdown(report))
+        typer.echo(f"Remediation markdown report exported: {out_path}")
     if as_json or (not _console):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return
@@ -7916,6 +7926,7 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 _draw_tui(stdscr, snapshot=snapshot, history=history, input_text=input_text, status=status)
                 output = _handle_tui_input(text, options)
                 history.append(("LazySRE", output.strip() or "(no output)"))
+                snapshot.update(_build_tui_dashboard_snapshot(options))
                 status = "ready"
                 continue
             if key in {"\x7f", "\b"}:
@@ -7996,6 +8007,19 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
     lowered = normalized.lower()
     if lowered in {"/help", "help", "?"}:
         return _render_tui_demo_text(_build_tui_dashboard_snapshot(options))
+    if lowered in {"/mode", "/mode show"}:
+        return f"当前模式: {'execute' if bool(options.get('execute', False)) else 'dry-run'}"
+    if lowered.startswith("/mode "):
+        tail = lowered[len("/mode ") :].strip()
+        if tail in {"execute", "exec", "on", "real"}:
+            options["execute"] = True
+            _save_chat_runtime_state(True)
+            return "已切换到 execute 模式。写操作仍会经过风险评估和确认。"
+        if tail in {"dry-run", "dryrun", "preview", "off"}:
+            options["execute"] = False
+            _save_chat_runtime_state(False)
+            return "已切换到 dry-run 模式。"
+        return "用法：/mode execute 或 /mode dry-run"
     if lowered.startswith("/brief"):
         tail = normalized[len("/brief") :].strip()
         return _capture_plain_output(lambda: _render_overview_brief_report(_build_overview_brief_report(target=tail, include_remote=True, include_logs="--logs" in lowered, timeout_sec=5)))
@@ -8006,6 +8030,36 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
     if lowered.startswith("/autopilot"):
         goal = normalized[len("/autopilot") :].strip() or "巡检当前环境并给出下一步行动"
         return _capture_plain_output(lambda: _render_autopilot_report(_run_autopilot_cycle(goal=goal, include_swarm=True, include_logs="--logs" in lowered, remember=True, timeout_sec=5)))
+    if lowered.startswith("/remote"):
+        tail = normalized[len("/remote") :].strip()
+        target = _resolve_ssh_target_arg(_extract_ssh_target_from_text(tail))
+        if not target:
+            return "用法：/remote [root@host] [--logs] [--service name]；或先 /connect root@host"
+        service_text = tail.replace(target, " ")
+        return _capture_plain_output(
+            lambda: _render_remote_docker_report(
+                _collect_remote_docker_report(
+                    target=target,
+                    service_filter=_extract_swarm_service_name(service_text),
+                    include_logs="--logs" in lowered or "日志" in normalized,
+                    tail=120,
+                    timeout_sec=8,
+                )
+            )
+        )
+    if lowered.startswith("/connect"):
+        tail = normalized[len("/connect") :].strip()
+        return _capture_plain_output(
+            lambda: _render_remote_docker_report(
+                _run_remote_connect_flow(
+                    target=_extract_ssh_target_from_text(tail),
+                    save_target=True,
+                    include_logs="--logs" in lowered or "日志" in normalized,
+                    tail=80,
+                    timeout_sec=8,
+                )
+            )
+        )
     if lowered.startswith("/remediate"):
         objective = normalized[len("/remediate") :].strip() or "修复当前巡检发现的问题"
         return _capture_plain_output(
@@ -8868,6 +8922,10 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             )
             continue
 
+        if _looks_like_remediate_request(text):
+            _run_remediate_from_text(text, options, execute_mode=runtime_execute)
+            continue
+
         if _looks_like_init_request(text):
             report = _interactive_init_wizard(
                 profile_file=Path(settings.target_profile_file),
@@ -9607,6 +9665,61 @@ def _render_closed_loop_report(report: dict[str, object]) -> None:
         f"下一步: {report.get('next_step', '')}",
     ]
     _console.print(Panel("\n".join(lines), title="Closed Loop Remediation", border_style="green" if report.get("ok") else "yellow"))
+
+
+def _render_closed_loop_report_markdown(report: dict[str, object]) -> str:
+    observation = report.get("observation", {})
+    if not isinstance(observation, dict):
+        observation = {}
+    plan = report.get("plan", {})
+    if not isinstance(plan, dict):
+        plan = {}
+    execution = report.get("execution", {})
+    if not isinstance(execution, dict):
+        execution = {}
+    lines = [
+        "# LazySRE Closed-loop Remediation Report",
+        "",
+        f"- Generated: {report.get('generated_at_utc', '')}",
+        f"- Objective: {report.get('objective', '')}",
+        f"- Mode: `{report.get('mode', '-')}`",
+        f"- OK: `{report.get('ok', False)}`",
+        f"- Next Step: {report.get('next_step', '')}",
+        "",
+        "## Observation",
+        "",
+        f"- Source: `{observation.get('source', '-')}`",
+        f"- Status: `{observation.get('status', '-')}`",
+        f"- Summary: `{json.dumps(observation.get('summary', {}), ensure_ascii=False)}`",
+        f"- Suggested Next: {observation.get('next_step', '')}",
+        "",
+        "## Plan",
+        "",
+        f"- Source: `{plan.get('source', '-')}`",
+        f"- Template: `{plan.get('template', '-') or '-'}`",
+    ]
+    for title, key in [
+        ("Diagnose Commands", "diagnose_commands"),
+        ("Apply Commands", "apply_commands"),
+        ("Verify Commands", "verify_commands"),
+        ("Rollback Commands", "rollback_commands"),
+    ]:
+        commands = [str(x) for x in list(plan.get(key, [])) if str(x).strip()]
+        lines.extend(["", f"### {title}", ""])
+        if commands:
+            lines.extend(["```bash", *commands, "```"])
+        else:
+            lines.append("- None")
+    lines.extend(["", "## Execution", ""])
+    for stage in ["diagnose", "apply", "verify", "rollback"]:
+        payload = execution.get(stage, {})
+        if not isinstance(payload, dict):
+            payload = {}
+        lines.append(
+            f"- {stage}: executed={payload.get('executed', 0)} "
+            f"succeeded={payload.get('succeeded', 0)} failed={payload.get('failed', 0)}"
+        )
+    return "\n".join(lines)
 
 
 def _run_remediation_template(
@@ -10986,6 +11099,54 @@ def _maybe_execute_quick_k8s_action(text: str, options: dict[str, object], *, ex
         provider=str(options["provider"]),
     )
     return True
+
+
+def _looks_like_remediate_request(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        phrase in lowered
+        for phrase in [
+            "闭环修复",
+            "生产修复",
+            "修复并验证",
+            "修复后验证",
+            "自动回滚",
+            "失败回滚",
+            "remediate",
+            "closed-loop",
+        ]
+    )
+
+
+def _run_remediate_from_text(text: str, options: dict[str, object], *, execute_mode: bool) -> None:
+    apply_requested = any(x in str(text).lower() for x in ["执行", "--apply", "apply", "真实修复"])
+    rollback_requested = any(x in str(text).lower() for x in ["失败回滚", "自动回滚", "--rollback-on-failure"])
+    report = _run_closed_loop_remediation(
+        objective=str(text).strip() or "修复当前巡检发现的问题",
+        remote_target=_extract_ssh_target_from_text(text),
+        service_filter=_extract_swarm_service_name(text),
+        include_logs="--logs" in str(text).lower() or "日志" in str(text),
+        apply=apply_requested,
+        verify=True,
+        rollback_on_failure=rollback_requested,
+        from_last_plan="最近计划" in str(text) or "last plan" in str(text).lower(),
+        max_apply_steps=6,
+        execute=_resolve_execute_for_apply_request(
+            execute_mode,
+            label="闭环修复执行",
+            apply=apply_requested,
+        ),
+        approval_mode=str(options["approval_mode"]),
+        audit_log=str(options["audit_log"]),
+        allow_high_risk=False,
+        auto_approve_low_risk=True,
+        model=str(options["model"]),
+        provider=str(options["provider"]),
+    )
+    if _console:
+        _render_closed_loop_report(report)
+    else:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 
 
 def _extract_requested_replicas(text: str) -> int:

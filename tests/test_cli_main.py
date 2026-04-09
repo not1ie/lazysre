@@ -131,6 +131,8 @@ from lazysre.cli.main import (
     _render_tui_demo_text,
     _derive_closed_loop_plan,
     _infer_verification_commands,
+    _looks_like_remediate_request,
+    _render_closed_loop_report_markdown,
     _safe_run_command,
     _should_launch_assistant,
 )
@@ -671,6 +673,13 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/swarm --logs" in rendered
 
 
+def test_natural_language_remediate_detection() -> None:
+    assert _looks_like_remediate_request("闭环修复 swarm 副本不足")
+    assert _looks_like_remediate_request("修复并验证 payment")
+    assert _looks_like_remediate_request("失败自动回滚")
+    assert not _looks_like_remediate_request("普通查看状态")
+
+
 def test_closed_loop_template_plan_infers_verify_commands() -> None:
     plan = _derive_closed_loop_plan(
         objective="swarm 副本不足",
@@ -692,6 +701,37 @@ def test_closed_loop_template_plan_infers_verify_commands() -> None:
     assert "docker service update --force api" in plan["apply_commands"]
     assert "docker service rollback api" in plan["rollback_commands"]
     assert any("docker service ps api" in cmd for cmd in plan["verify_commands"])
+
+
+def test_closed_loop_report_markdown_includes_commands() -> None:
+    markdown = _render_closed_loop_report_markdown(
+        {
+            "generated_at_utc": "2026-04-09T00:00:00Z",
+            "objective": "repair api",
+            "mode": "dry-run",
+            "ok": False,
+            "next_step": "review",
+            "observation": {"source": "autopilot", "status": "needs_attention", "summary": {"actions": 1}},
+            "plan": {
+                "source": "template",
+                "template": "swarm-replicas-unhealthy",
+                "diagnose_commands": ["docker service ps api --no-trunc"],
+                "apply_commands": ["docker service update --force api"],
+                "verify_commands": ["docker service ps api --no-trunc"],
+                "rollback_commands": ["docker service rollback api"],
+            },
+            "execution": {
+                "diagnose": {"executed": 1, "succeeded": 1, "failed": 0},
+                "apply": {"executed": 0, "succeeded": 0, "failed": 0},
+                "verify": {"executed": 1, "succeeded": 1, "failed": 0},
+                "rollback": {"executed": 0, "succeeded": 0, "failed": 0},
+            },
+        }
+    )
+
+    assert "Closed-loop Remediation Report" in markdown
+    assert "docker service update --force api" in markdown
+    assert "docker service rollback api" in markdown
 
 
 def test_infer_verification_commands_for_k8s_and_swarm() -> None:

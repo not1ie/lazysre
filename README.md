@@ -55,6 +55,7 @@ lazysre autopilot --remote root@192.168.10.101 --logs
 # 生产闭环修复：Observe -> Plan -> Apply -> Verify -> Rollback Advice
 lazysre remediate "修复 swarm 副本不足"
 lazysre --execute remediate "修复 swarm 副本不足" --apply --rollback-on-failure
+lazysre remediate "修复 swarm 副本不足" --report-md .data/remediate.md --report-json .data/remediate.json
 # 首次启动向导（安装检查+LLM Key+目标连通性）
 lazysre setup
 # 交互式初始化（更像 Gemini/Claude：一步步填完即可）
@@ -222,6 +223,7 @@ lsre fix "修复巡检发现的问题"
 # 闭环修复会先只读诊断，再执行修复，再只读验证；失败时可自动给出/执行回滚路径
 lsre remediate "修复巡检发现的问题"
 lsre --execute remediate "修复巡检发现的问题" --apply --rollback-on-failure
+lsre remediate "修复巡检发现的问题" --report-md .data/remediate.md
 # 环境预检（依赖/配置/连通性）
 lsre doctor
 lsre doctor --json
