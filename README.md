@@ -31,6 +31,8 @@ lazysre swarm --logs
 lazysre watch --count 1
 # 把最近一次巡检转换成编号行动清单
 lazysre actions
+# 自动驾驶：扫描 -> 巡检 -> 行动清单，可选生成修复计划
+lazysre autopilot
 # 首次启动向导（安装检查+LLM Key+目标连通性）
 lazysre setup
 # 交互式初始化（更像 Gemini/Claude：一步步填完即可）
@@ -102,6 +104,7 @@ lazysre --provider kimi chat
 - Docker Swarm 观察者：内置 service/node/task/logs 健康检查能力
 - 持续巡检：`watch` 可定期扫描环境并输出异常摘要/JSONL
 - 行动收件箱：`actions` 将最近巡检结果转换成编号建议、模板命令与风险提示
+- 自动驾驶：`autopilot` 串起扫描、巡检、行动清单和修复计划
 - 异常记忆：`watch` 发现的问题会写入长期记忆，后续相似诊断会自动引用历史经验
 - 安全执行器：支持 Dry-run、风险分级、审批确认、审计日志
 - ReAct 风格修复：支持自动生成修复计划与回滚命令
@@ -120,7 +123,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /scan /swarm /watch /actions /doctor [/doctor fix] [/doctor strict]
+# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /scan /swarm /watch /actions /autopilot /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
@@ -163,6 +166,11 @@ lsre watch --count 1 --report-md .data/watch-report.md
 lsre actions
 lsre actions --json
 lsre actions --report-md .data/actions.md
+# 自动驾驶：一次跑完整观察链路，并可导出报告或生成修复计划
+lsre autopilot
+lsre autopilot "帮我看下当前服务器有没有问题" --json
+lsre autopilot --report-md .data/autopilot.md
+lsre autopilot "修复巡检发现的问题" --fix
 # 直接消费最新巡检证据生成修复计划
 lsre fix "修复巡检发现的问题"
 # 环境预检（依赖/配置/连通性）
@@ -242,6 +250,7 @@ lsre memory search "payment latency" --limit 5
 - “为什么 lazysre_lazysre 服务副本不足”
 - “开始巡检一下”
 - “下一步做什么 / 给我推荐动作 / 生成行动清单”
+- “自动驾驶排查一下 / 一键巡检并诊断 / 从巡检到修复”
 - “做一次环境体检”
 - “导出复盘报告”
 - “一键修复 CrashLoopBackOff”

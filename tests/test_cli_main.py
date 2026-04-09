@@ -19,6 +19,9 @@ from lazysre.cli.main import (
     _collect_environment_discovery,
     _collect_swarm_health_report,
     _collect_watch_snapshot,
+    _run_autopilot_cycle,
+    _build_autopilot_report,
+    _render_autopilot_report_markdown,
     _build_action_inbox_from_watch,
     _render_watch_report_markdown,
     _render_action_inbox_markdown,
@@ -62,6 +65,7 @@ from lazysre.cli.main import (
     _looks_like_swarm_diagnose_request,
     _looks_like_watch_request,
     _looks_like_actions_request,
+    _looks_like_autopilot_request,
     _looks_like_report_request,
     _looks_like_target_show_request,
     _looks_like_target_update_request,
@@ -223,6 +227,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv14 = ["lsre", "actions", "--json"]
     _rewrite_argv_for_default_run(argv14)
     assert argv14 == ["lsre", "actions", "--json"]
+    argv15 = ["lsre", "autopilot", "--json"]
+    _rewrite_argv_for_default_run(argv15)
+    assert argv15 == ["lsre", "autopilot", "--json"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -332,6 +339,8 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_watch_request("开始巡检一下")
     assert _looks_like_actions_request("巡检之后下一步做什么")
     assert _looks_like_actions_request("给我推荐动作")
+    assert _looks_like_autopilot_request("帮我自动驾驶排查一下")
+    assert _looks_like_autopilot_request("一键巡检并诊断")
     assert _looks_like_latest_watch_reference("修复巡检发现的问题")
     assert _extract_swarm_service_name("为什么 lazysre_lazysre 服务副本不足") == "lazysre_lazysre"
     assert _looks_like_doctor_request("做一次环境体检")
@@ -548,6 +557,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["swarm"]) is False
     assert _should_launch_assistant(["watch"]) is False
     assert _should_launch_assistant(["actions"]) is False
+    assert _should_launch_assistant(["autopilot"]) is False
     assert _should_launch_assistant(["doctor"]) is False
     assert _should_launch_assistant(["install-doctor"]) is False
     assert _should_launch_assistant(["setup"]) is False
@@ -1355,3 +1365,88 @@ def test_action_inbox_maps_watch_to_swarm_template() -> None:
     assert "# LazySRE Action Inbox" in markdown
     assert "swarm-image-pull-failed" in markdown
     assert "lazysre template run swarm-image-pull-failed --var service=api --apply" in markdown
+
+
+def test_build_autopilot_report_promotes_first_action() -> None:
+    scan_report = {
+        "summary": {"warn": 1, "error": 0},
+        "usable_targets": ["docker-swarm"],
+        "issues": [{"name": "docker.swarm", "severity": "warn", "detail": "service unhealthy"}],
+        "suggestions": ["检查 Swarm 服务"],
+    }
+    watch_snapshot = {
+        "generated_at_utc": "2026-04-09T00:00:00+00:00",
+        "ok": False,
+        "alerts": [{"source": "swarm", "severity": "high", "name": "api", "detail": "0/1"}],
+    }
+    action_inbox = {
+        "summary": {"total": 1, "high": 1, "medium": 0, "low": 0},
+        "actions": [
+            {
+                "id": 1,
+                "title": "修复 Swarm 镜像拉取失败: api",
+                "command": "lazysre template run swarm-image-pull-failed --var service=api --apply",
+            }
+        ],
+    }
+
+    report = _build_autopilot_report(
+        goal="自动排查",
+        scan_report=scan_report,
+        watch_snapshot=watch_snapshot,
+        action_inbox=action_inbox,
+    )
+
+    assert report["status"] == "needs_attention"
+    assert report["recommended_commands"][0] == "lazysre template run swarm-image-pull-failed --var service=api --apply"
+    assert "优先处理" in str(report["next_step"])
+    markdown = _render_autopilot_report_markdown(report)
+    assert "# LazySRE Autopilot Report" in markdown
+    assert "lazysre template run swarm-image-pull-failed --var service=api --apply" in markdown
+
+
+def test_run_autopilot_cycle_builds_watch_actions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fake_scan(*, timeout_sec: int, secrets_file: Path | None) -> dict[str, object]:
+        return {
+            "summary": {"warn": 1, "error": 0},
+            "usable_targets": ["docker-swarm"],
+            "issues": [],
+            "suggestions": [],
+        }
+
+    def fake_watch(**kwargs: object) -> list[dict[str, object]]:
+        return [
+            {
+                "generated_at_utc": "2026-04-09T00:00:00+00:00",
+                "ok": False,
+                "alerts": [],
+                "swarm": {
+                    "root_causes": [
+                        {
+                            "category": "swarm_image_pull_failed",
+                            "service": "api",
+                            "severity": "high",
+                            "advice": "registry auth failed",
+                        }
+                    ],
+                    "unhealthy_services": [],
+                },
+            }
+        ]
+
+    monkeypatch.setattr(cli_main, "_collect_environment_discovery", fake_scan)
+    monkeypatch.setattr(cli_main, "_run_watch_snapshots", fake_watch)
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+
+    report = _run_autopilot_cycle(
+        goal="自动驾驶排查",
+        include_swarm=True,
+        include_logs=False,
+        remember=False,
+        timeout_sec=1,
+    )
+
+    assert report["status"] == "needs_attention"
+    assert report["summary"]["actions"] == 1
+    assert report["recommended_commands"][0] == "lazysre template run swarm-image-pull-failed --var service=api --apply"
+    assert (tmp_path / "lsre-autopilot-last.json").exists()

@@ -338,6 +338,82 @@ def actions(
     _render_action_inbox(inbox)
 
 
+@app.command("autopilot")
+def autopilot(
+    ctx: typer.Context,
+    goal: Annotated[str, typer.Argument(help="Natural-language objective for the autopilot run.")] = "巡检当前环境并给出下一步行动",
+    include_swarm: Annotated[bool, typer.Option("--swarm/--no-swarm", help="Include Docker Swarm diagnosis.")] = True,
+    include_logs: Annotated[bool, typer.Option("--logs", help="Include logs for unhealthy Swarm services.")] = False,
+    remember: Annotated[bool, typer.Option("--remember/--no-remember", help="Persist watch alerts to incident memory.")] = True,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Per-check timeout seconds.")] = 5,
+    plan_fix: Annotated[bool, typer.Option("--fix", help="Generate a fix plan after observing and building actions.")] = False,
+    apply_fix: Annotated[bool, typer.Option("--apply", help="Generate and apply the fix plan using the current execute mode.")] = False,
+    report_md: Annotated[str, typer.Option("--report-md", help="Optional markdown autopilot report path.")] = "",
+    as_json: Annotated[bool, typer.Option("--json", help="Print autopilot report as JSON.")] = False,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
+    report = _run_autopilot_cycle(
+        goal=goal,
+        include_swarm=include_swarm,
+        include_logs=include_logs,
+        remember=remember,
+        timeout_sec=timeout_sec,
+    )
+    if report_md.strip():
+        out_path = Path(report_md).expanduser()
+        _write_text_file(out_path, _render_autopilot_report_markdown(report))
+        typer.echo(f"Autopilot report exported: {out_path}")
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        _render_autopilot_report(report)
+
+    if plan_fix or apply_fix:
+        _run_fix(
+            instruction=_build_autopilot_fix_instruction(goal, report),
+            apply=apply_fix,
+            max_apply_steps=6,
+            allow_high_risk=False,
+            auto_approve_low_risk=True,
+            export_plan_md="",
+            export_plan_json="",
+            execute=bool(options["execute"]),
+            approve=bool(options["approve"]),
+            interactive_approval=bool(options["interactive_approval"]),
+            stream_output=bool(options["stream_output"]),
+            verbose_reasoning=bool(options["verbose_reasoning"]),
+            approval_mode=str(options["approval_mode"]),
+            audit_log=str(options["audit_log"]),
+            lock_file=str(options["lock_file"]),
+            session_file=str(options["session_file"]),
+            deny_tool=list(options["deny_tool"]),
+            deny_prefix=list(options["deny_prefix"]),
+            tool_pack=list(options["tool_pack"]),
+            remote_gateway=list(options["remote_gateway"]),
+            model=str(options["model"]),
+            provider=str(options["provider"]),
+            max_steps=int(options["max_steps"]),
+        )
+
+
 @app.command("doctor")
 def doctor(
     ctx: typer.Context,
@@ -4550,6 +4626,209 @@ def _render_action_inbox_markdown(inbox: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _latest_autopilot_file() -> Path:
+    return Path(settings.data_dir) / "lsre-autopilot-last.json"
+
+
+def _write_latest_autopilot_report(report: dict[str, object]) -> Path:
+    path = _latest_autopilot_file()
+    _write_json_file(path, report)
+    return path
+
+
+def _run_autopilot_cycle(
+    *,
+    goal: str,
+    include_swarm: bool,
+    include_logs: bool,
+    remember: bool,
+    timeout_sec: int,
+) -> dict[str, object]:
+    scan_report = _collect_environment_discovery(timeout_sec=timeout_sec, secrets_file=None)
+    snapshots = _run_watch_snapshots(
+        interval_sec=60,
+        count=1,
+        include_swarm=include_swarm,
+        include_logs=include_logs,
+        remember=remember,
+        timeout_sec=timeout_sec,
+        output=None,
+    )
+    watch_snapshot = snapshots[-1] if snapshots else {}
+    action_inbox = _build_action_inbox_from_watch(watch_snapshot)
+    report = _build_autopilot_report(
+        goal=goal,
+        scan_report=scan_report,
+        watch_snapshot=watch_snapshot,
+        action_inbox=action_inbox,
+    )
+    _write_latest_autopilot_report(report)
+    return report
+
+
+def _build_autopilot_report(
+    *,
+    goal: str,
+    scan_report: dict[str, object],
+    watch_snapshot: dict[str, object],
+    action_inbox: dict[str, object],
+) -> dict[str, object]:
+    scan_summary = scan_report.get("summary", {})
+    if not isinstance(scan_summary, dict):
+        scan_summary = {}
+    action_summary = action_inbox.get("summary", {})
+    if not isinstance(action_summary, dict):
+        action_summary = {}
+    scan_warn = int(scan_summary.get("warn", 0) or 0)
+    scan_error = int(scan_summary.get("error", 0) or 0)
+    action_total = int(action_summary.get("total", 0) or 0)
+    alert_count = len(watch_snapshot.get("alerts", [])) if isinstance(watch_snapshot.get("alerts", []), list) else 0
+    needs_attention = bool(scan_warn or scan_error or alert_count or action_total)
+    actions = action_inbox.get("actions", [])
+    first_action = actions[0] if isinstance(actions, list) and actions and isinstance(actions[0], dict) else {}
+    commands: list[str] = []
+    first_command = str(first_action.get("command", "")).strip()
+    if first_command:
+        commands.append(first_command)
+    commands.append("lazysre actions")
+    if needs_attention:
+        commands.append('lazysre fix "修复巡检发现的问题"')
+    else:
+        commands.append("lazysre watch --count 1")
+    commands = _dedupe_strings(commands)[:6]
+    usable_targets = scan_report.get("usable_targets", [])
+    if not isinstance(usable_targets, list):
+        usable_targets = []
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "autopilot",
+        "goal": str(goal or "").strip() or "巡检当前环境并给出下一步行动",
+        "status": "needs_attention" if needs_attention else "clear",
+        "ok": not needs_attention,
+        "summary": {
+            "scan_warn": scan_warn,
+            "scan_error": scan_error,
+            "watch_alerts": alert_count,
+            "actions": action_total,
+            "usable_targets": len(usable_targets),
+        },
+        "usable_targets": usable_targets[:8],
+        "scan": {
+            "summary": scan_summary,
+            "issues": scan_report.get("issues", [])[:12] if isinstance(scan_report.get("issues", []), list) else [],
+            "suggestions": scan_report.get("suggestions", [])[:8] if isinstance(scan_report.get("suggestions", []), list) else [],
+        },
+        "watch": {
+            "generated_at_utc": watch_snapshot.get("generated_at_utc", ""),
+            "ok": bool(watch_snapshot.get("ok", False)),
+            "alerts": watch_snapshot.get("alerts", [])[:20] if isinstance(watch_snapshot.get("alerts", []), list) else [],
+        },
+        "action_inbox": action_inbox,
+        "recommended_commands": commands,
+        "next_step": _build_autopilot_next_step(needs_attention=needs_attention, first_action=first_action),
+    }
+
+
+def _build_autopilot_next_step(*, needs_attention: bool, first_action: dict[str, object]) -> str:
+    command = str(first_action.get("command", "")).strip()
+    title = str(first_action.get("title", "")).strip()
+    if command:
+        prefix = f"优先处理：{title}。" if title else "优先处理首个建议动作。"
+        return f"{prefix}建议先执行或审阅：{command}"
+    if needs_attention:
+        return '已有异常证据但没有直接动作，建议执行：lazysre fix "修复巡检发现的问题"'
+    return "当前没有发现明确异常，建议保持 watch 定期巡检。"
+
+
+def _dedupe_strings(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = str(item or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _render_autopilot_report(report: dict[str, object]) -> None:
+    if not (_console and Table):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    summary = report.get("summary", {})
+    summary_text = (
+        f"status={report.get('status', '-')} "
+        f"targets={summary.get('usable_targets', 0)} "
+        f"scan_warn={summary.get('scan_warn', 0)} "
+        f"scan_error={summary.get('scan_error', 0)} "
+        f"watch_alerts={summary.get('watch_alerts', 0)} "
+        f"actions={summary.get('actions', 0)}"
+    )
+    if Panel:
+        _console.print(Panel(summary_text, title="LazySRE Autopilot", border_style="cyan"))
+        _console.print(Panel(str(report.get("next_step", "")), title="Next Step", border_style="green"))
+    commands = report.get("recommended_commands", [])
+    table = Table(title="Autopilot Commands")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Command", style="green")
+    if isinstance(commands, list):
+        for idx, command in enumerate(commands[:8], 1):
+            table.add_row(str(idx), str(command))
+    _console.print(table)
+    inbox = report.get("action_inbox", {})
+    if isinstance(inbox, dict):
+        _render_action_inbox(inbox)
+
+
+def _render_autopilot_report_markdown(report: dict[str, object]) -> str:
+    summary = report.get("summary", {})
+    lines = [
+        "# LazySRE Autopilot Report",
+        "",
+        f"- Generated: {report.get('generated_at_utc', '')}",
+        f"- Goal: {report.get('goal', '')}",
+        f"- Status: `{report.get('status', '-')}`",
+        f"- Usable targets: `{summary.get('usable_targets', 0)}`",
+        f"- Scan warn/error: `{summary.get('scan_warn', 0)}/{summary.get('scan_error', 0)}`",
+        f"- Watch alerts: `{summary.get('watch_alerts', 0)}`",
+        f"- Actions: `{summary.get('actions', 0)}`",
+        "",
+        "## Next Step",
+        "",
+        str(report.get("next_step", "")),
+        "",
+        "## Recommended Commands",
+        "",
+    ]
+    commands = report.get("recommended_commands", [])
+    if isinstance(commands, list) and commands:
+        lines.extend(["```bash", *[str(item) for item in commands], "```", ""])
+    else:
+        lines.extend(["- No commands suggested.", ""])
+    inbox = report.get("action_inbox", {})
+    if isinstance(inbox, dict):
+        lines.extend(["## Action Inbox", "", _render_action_inbox_markdown(inbox)])
+    return "\n".join(lines)
+
+
+def _build_autopilot_fix_instruction(goal: str, report: dict[str, object]) -> str:
+    compact = {
+        "goal": report.get("goal", goal),
+        "status": report.get("status", ""),
+        "summary": report.get("summary", {}),
+        "next_step": report.get("next_step", ""),
+        "recommended_commands": report.get("recommended_commands", []),
+        "actions": (report.get("action_inbox", {}) if isinstance(report.get("action_inbox", {}), dict) else {}).get("actions", [])[:6],
+    }
+    return (
+        f"{goal or '修复当前环境问题'}\n\n"
+        "[autopilot]\n"
+        f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n\n"
+        "请基于 autopilot 已收集的证据生成最小风险修复计划，优先只读验证，再给出写操作和回滚命令。"
+    )
+
+
 def _extract_watch_suggested_commands(snapshots: list[dict[str, object]]) -> list[str]:
     commands: list[str] = []
     seen: set[str] = set()
@@ -5958,6 +6237,7 @@ def _render_chat_short_help() -> None:
         "- /swarm [--logs]: 检查 Docker Swarm 服务、副本、任务失败证据",
         "- /watch [--count N]: 持续巡检并输出异常摘要",
         "- /actions: 把最近一次巡检结果整理成编号行动清单",
+        "- /autopilot [目标]: 自动扫描 -> 巡检 -> 行动清单，可加 --fix 生成修复计划",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
@@ -6023,6 +6303,7 @@ def _normalize_natural_language_text(text: str) -> str:
         (r"\bmemroy\b", "memory"),
         (r"\bsacn\b", "scan"),
         (r"\bactons\b", "actions"),
+        (r"\bauto[-_\s]?pilot\b", "autopilot"),
     ]
     for pattern, replacement in replacements:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
@@ -6053,6 +6334,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "memroy": "memory",
         "sacn": "scan",
         "actons": "actions",
+        "auto-pilot": "autopilot",
         "hepl": "help",
     }
     known = [
@@ -6069,6 +6351,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "swarm",
         "watch",
         "actions",
+        "autopilot",
         "setup",
         "status",
         "doctor",
@@ -6197,6 +6480,54 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 _render_action_inbox(inbox)
             else:
                 typer.echo(json.dumps(inbox, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/autopilot"):
+            tail = text[len("/autopilot") :].strip()
+            include_logs = "--logs" in tail.lower() or "日志" in tail
+            plan_fix = "--fix" in tail.lower() or "修复计划" in tail
+            apply_fix = "--apply" in tail.lower() or "执行修复" in tail
+            goal = re.sub(r"--(?:logs|fix|apply)\b", "", tail, flags=re.IGNORECASE).strip()
+            report = _run_autopilot_cycle(
+                goal=goal or "巡检当前环境并给出下一步行动",
+                include_swarm=True,
+                include_logs=include_logs,
+                remember=True,
+                timeout_sec=5,
+            )
+            if _console:
+                _render_autopilot_report(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+            if plan_fix or apply_fix:
+                _run_fix(
+                    instruction=_build_autopilot_fix_instruction(goal, report),
+                    apply=apply_fix,
+                    max_apply_steps=6,
+                    allow_high_risk=False,
+                    auto_approve_low_risk=True,
+                    export_plan_md="",
+                    export_plan_json="",
+                    execute=_resolve_execute_for_apply_request(
+                        runtime_execute,
+                        label="Autopilot 修复执行",
+                        apply=apply_fix,
+                    ),
+                    approve=bool(options["approve"]),
+                    interactive_approval=bool(options["interactive_approval"]),
+                    stream_output=bool(options["stream_output"]),
+                    verbose_reasoning=bool(options["verbose_reasoning"]),
+                    approval_mode=str(options["approval_mode"]),
+                    audit_log=str(options["audit_log"]),
+                    lock_file=str(options["lock_file"]),
+                    session_file=str(options["session_file"]),
+                    deny_tool=list(options["deny_tool"]),
+                    deny_prefix=list(options["deny_prefix"]),
+                    tool_pack=list(options["tool_pack"]),
+                    remote_gateway=list(options["remote_gateway"]),
+                    model=str(options["model"]),
+                    provider=str(options["provider"]),
+                    max_steps=int(options["max_steps"]),
+                )
             continue
         if text.lower().startswith("/mode "):
             tail = text[len("/mode ") :].strip().lower()
@@ -6785,6 +7116,49 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             reset_session=False,
             session_file=str(options["session_file"]),
         )
+        return True
+    if _looks_like_autopilot_request(text):
+        report = _run_autopilot_cycle(
+            goal=text,
+            include_swarm=True,
+            include_logs=any(k in lowered for k in ("日志", "logs")),
+            remember=True,
+            timeout_sec=5,
+        )
+        if _console:
+            _render_autopilot_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        if _looks_like_fix_request(text) or _looks_like_auto_fix_request(text):
+            _run_fix(
+                instruction=_build_autopilot_fix_instruction(text, report),
+                apply=_looks_like_auto_fix_request(text),
+                max_apply_steps=6,
+                allow_high_risk=False,
+                auto_approve_low_risk=True,
+                export_plan_md="",
+                export_plan_json="",
+                execute=_resolve_execute_for_apply_request(
+                    execute_mode,
+                    label="Autopilot 自动修复",
+                    apply=_looks_like_auto_fix_request(text),
+                ),
+                approve=bool(options["approve"]),
+                interactive_approval=bool(options["interactive_approval"]),
+                stream_output=bool(options["stream_output"]),
+                verbose_reasoning=bool(options["verbose_reasoning"]),
+                approval_mode=str(options["approval_mode"]),
+                audit_log=str(options["audit_log"]),
+                lock_file=str(options["lock_file"]),
+                session_file=str(options["session_file"]),
+                deny_tool=list(options["deny_tool"]),
+                deny_prefix=list(options["deny_prefix"]),
+                tool_pack=list(options["tool_pack"]),
+                remote_gateway=list(options["remote_gateway"]),
+                model=str(options["model"]),
+                provider=str(options["provider"]),
+                max_steps=int(options["max_steps"]),
+            )
         return True
     if _looks_like_actions_request(text):
         snapshot = _load_latest_watch_snapshot(None)
@@ -8686,6 +9060,29 @@ def _looks_like_actions_request(text: str) -> bool:
     return any(k in lowered for k in keywords)
 
 
+def _looks_like_autopilot_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "自动驾驶",
+        "自动排查",
+        "全自动排查",
+        "全自动巡检",
+        "自动巡检并",
+        "从巡检到修复",
+        "自己看着办",
+        "帮我看着办",
+        "一键排查",
+        "一键诊断",
+        "一键巡检",
+        "autopilot",
+        "auto pilot",
+        "auto-diagnose",
+    )
+    return any(k in lowered for k in keywords)
+
+
 def _extract_swarm_service_name(text: str) -> str:
     raw = str(text or "").strip()
     if not raw:
@@ -9252,6 +9649,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "swarm",
         "watch",
         "actions",
+        "autopilot",
         "doctor",
         "install-doctor",
         "setup",
@@ -9313,6 +9711,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "swarm",
         "watch",
         "actions",
+        "autopilot",
         "doctor",
         "install-doctor",
         "setup",
