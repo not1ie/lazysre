@@ -267,6 +267,26 @@ def scan(
     _render_environment_discovery(report)
 
 
+@app.command("swarm")
+def swarm(
+    service: Annotated[str, typer.Option("--service", help="Optional service name filter.")] = "",
+    logs: Annotated[bool, typer.Option("--logs", help="Include recent logs for unhealthy/selected services.")] = False,
+    tail: Annotated[int, typer.Option("--tail", help="Log/task tail lines.")] = 80,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Per-check timeout seconds.")] = 6,
+    as_json: Annotated[bool, typer.Option("--json", help="Print Swarm health as JSON.")] = False,
+) -> None:
+    report = _collect_swarm_health_report(
+        service_filter=service,
+        include_logs=logs,
+        tail=tail,
+        timeout_sec=timeout_sec,
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_swarm_health_report(report)
+
+
 @app.command("doctor")
 def doctor(
     ctx: typer.Context,
@@ -3107,6 +3127,7 @@ def _collect_environment_discovery(
         "discoveries": discoveries,
         "checks": checks,
         "issues": issues,
+        "suggestions": _build_environment_scan_suggestions(discoveries, usable_targets, issues),
         "next_actions": _build_environment_scan_next_actions(checks, usable_targets),
     }
 
@@ -3457,6 +3478,42 @@ def _build_environment_scan_next_actions(checks: list[dict[str, object]], usable
     return actions[:8]
 
 
+def _build_environment_scan_suggestions(
+    discoveries: dict[str, object],
+    usable_targets: list[str],
+    issues: list[dict[str, object]],
+) -> list[str]:
+    suggestions: list[str] = []
+    docker_discovery = discoveries.get("docker", {})
+    k8s_discovery = discoveries.get("kubernetes", {})
+    prometheus_discovery = discoveries.get("prometheus", {})
+    providers = discoveries.get("providers", {})
+    if isinstance(docker_discovery, dict) and bool(docker_discovery.get("swarm_active")):
+        suggestions.append("分析 Docker Swarm 服务健康")
+        suggestions.append("列出 Swarm 副本异常的服务并给修复建议")
+    elif isinstance(docker_discovery, dict) and bool(docker_discovery.get("reachable")):
+        suggestions.append("检查 Docker 容器有没有异常退出")
+    if isinstance(k8s_discovery, dict) and bool(k8s_discovery.get("reachable")):
+        suggestions.append("检查 K8s 异常 Pod 和 Warning Events")
+    if isinstance(prometheus_discovery, dict) and bool(prometheus_discovery.get("reachable")):
+        suggestions.append("用 Prometheus 分析当前资源瓶颈")
+    if issues:
+        first_issue = str(issues[0].get("name", "当前问题"))
+        suggestions.append(f"解释 {first_issue} 为什么是问题")
+    if isinstance(providers, dict) and not list(providers.get("configured", [])):
+        suggestions.append("先用 mock 模式预览诊断，或执行 login 接入真实 AI")
+    if not usable_targets:
+        suggestions.append("帮我解释为什么当前机器还不能被 LazySRE 纳管")
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in suggestions:
+        text = item.strip()
+        if text and text not in seen:
+            seen.add(text)
+            deduped.append(text)
+    return deduped[:5]
+
+
 def _render_environment_discovery(report: dict[str, object]) -> None:
     if not (_console and Table):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
@@ -3485,8 +3542,308 @@ def _render_environment_discovery(report: dict[str, object]) -> None:
         )
     _console.print(table)
     actions = report.get("next_actions", [])
+    suggestions = report.get("suggestions", [])
+    if isinstance(suggestions, list) and suggestions and Panel:
+        _console.print(
+            Panel(
+                "\n".join(f"{idx}. {item}" for idx, item in enumerate(suggestions, 1)),
+                title="Try Saying This",
+                border_style="magenta",
+            )
+        )
     if isinstance(actions, list) and actions and Panel:
         _console.print(Panel("\n".join(f"- {item}" for item in actions), title="Next Actions", border_style="green"))
+
+
+def _collect_swarm_health_report(
+    *,
+    service_filter: str = "",
+    include_logs: bool = False,
+    tail: int = 80,
+    timeout_sec: int = 6,
+) -> dict[str, object]:
+    docker_path = shutil.which("docker") or ""
+    per_check_timeout = max(1, min(int(timeout_sec or 6), 10))
+    tail = max(20, min(int(tail or 80), 500))
+    checks: list[dict[str, object]] = [_scan_binary_check("docker", docker_path, optional=False)]
+    if not docker_path:
+        return {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "ok": False,
+            "service_filter": service_filter,
+            "summary": _summarize_doctor_checks(checks),
+            "checks": checks,
+            "services": [],
+            "unhealthy_services": [],
+            "tasks": [],
+            "logs": [],
+            "recommendations": ["安装 Docker 并确保当前用户可以访问 docker daemon"],
+        }
+
+    swarm_probe = _safe_run_command([docker_path, "info", "--format", "{{.Swarm.LocalNodeState}}"], timeout_sec=per_check_timeout)
+    swarm_state = str(swarm_probe.get("stdout", "")).strip().lower() if bool(swarm_probe.get("ok")) else ""
+    swarm_active = swarm_state == "active"
+    checks.append(
+        _scan_check(
+            "docker.swarm",
+            swarm_active,
+            "pass" if swarm_active else "warn",
+            swarm_state or _probe_detail(swarm_probe),
+            "" if swarm_active else "当前 Docker 未处于 Swarm active 状态；如果这是单机 Docker，可用 lazysre scan 查看容器问题",
+        )
+    )
+    if not swarm_active:
+        return {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "ok": False,
+            "service_filter": service_filter,
+            "summary": _summarize_doctor_checks(checks),
+            "checks": checks,
+            "services": [],
+            "unhealthy_services": [],
+            "tasks": [],
+            "logs": [],
+            "recommendations": ["未检测到 Docker Swarm，可直接说：检查 Docker 容器有没有异常退出"],
+        }
+
+    nodes_probe = _safe_run_command(
+        [docker_path, "node", "ls", "--format", "{{.Hostname}}\t{{.Status}}\t{{.Availability}}\t{{.ManagerStatus}}"],
+        timeout_sec=per_check_timeout,
+    )
+    node_rows = _parse_swarm_node_lines(str(nodes_probe.get("stdout", "")))
+    bad_nodes = [
+        row
+        for row in node_rows
+        if str(row.get("status", "")).lower() != "ready"
+        or str(row.get("availability", "")).lower() not in {"active", ""}
+    ]
+    checks.append(
+        _scan_check(
+            "swarm.nodes",
+            bool(nodes_probe.get("ok")) and not bad_nodes,
+            "pass" if bool(nodes_probe.get("ok")) and not bad_nodes else "warn",
+            "all ready" if not bad_nodes else _preview_lines([json.dumps(x, ensure_ascii=False) for x in bad_nodes], limit=6),
+            "" if not bad_nodes else "存在非 Ready/Active 节点，请检查节点网络、磁盘或 Docker daemon",
+        )
+    )
+
+    services_probe = _safe_run_command(
+        [docker_path, "service", "ls", "--format", "{{.Name}}\t{{.Mode}}\t{{.Replicas}}\t{{.Image}}"],
+        timeout_sec=per_check_timeout,
+    )
+    services = _parse_swarm_service_lines(str(services_probe.get("stdout", "")))
+    if service_filter.strip():
+        needle = service_filter.strip().lower()
+        services = [row for row in services if needle in str(row.get("name", "")).lower()]
+    unhealthy = [row for row in services if bool(row.get("unhealthy"))]
+    checks.append(
+        _scan_check(
+            "swarm.services",
+            bool(services_probe.get("ok")) and not unhealthy,
+            "pass" if bool(services_probe.get("ok")) and not unhealthy else "warn",
+            f"services={len(services)} unhealthy={len(unhealthy)}" if bool(services_probe.get("ok")) else _probe_detail(services_probe),
+            "" if not unhealthy else "存在副本未达期望的 service，建议查看 service ps 和 logs",
+        )
+    )
+
+    selected = [str(row.get("name", "")) for row in (unhealthy or services) if str(row.get("name", "")).strip()]
+    task_reports: list[dict[str, object]] = []
+    log_reports: list[dict[str, object]] = []
+    for name in selected[:8]:
+        ps_probe = _safe_run_command(
+            [
+                docker_path,
+                "service",
+                "ps",
+                name,
+                "--no-trunc",
+                "--format",
+                "{{.Name}}\t{{.CurrentState}}\t{{.Error}}\t{{.Node}}",
+            ],
+            timeout_sec=per_check_timeout,
+        )
+        task_reports.append(
+            {
+                "service": name,
+                "ok": bool(ps_probe.get("ok")),
+                "tasks": _parse_swarm_task_lines(str(ps_probe.get("stdout", ""))),
+                "stderr": str(ps_probe.get("stderr", ""))[:500],
+            }
+        )
+        if include_logs:
+            logs_probe = _safe_run_command(
+                [docker_path, "service", "logs", "--tail", str(tail), name],
+                timeout_sec=per_check_timeout,
+            )
+            log_reports.append(
+                {
+                    "service": name,
+                    "ok": bool(logs_probe.get("ok")),
+                    "logs": str(logs_probe.get("stdout", ""))[:5000],
+                    "stderr": str(logs_probe.get("stderr", ""))[:1000],
+                }
+            )
+
+    recommendations = _build_swarm_recommendations(
+        services=services,
+        unhealthy=unhealthy,
+        bad_nodes=bad_nodes,
+        include_logs=include_logs,
+    )
+    summary = _summarize_doctor_checks(checks)
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "ok": bool(summary.get("error", 0) == 0 and len(unhealthy) == 0 and len(bad_nodes) == 0),
+        "service_filter": service_filter,
+        "include_logs": include_logs,
+        "summary": summary,
+        "checks": checks,
+        "nodes": node_rows,
+        "bad_nodes": bad_nodes,
+        "services": services[:80],
+        "unhealthy_services": unhealthy[:40],
+        "tasks": task_reports,
+        "logs": log_reports,
+        "recommendations": recommendations,
+    }
+
+
+def _parse_swarm_service_lines(raw: str) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for line in _non_empty_lines(raw):
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        name, mode, replicas, image = parts[:4]
+        running = 0
+        desired = 0
+        if "/" in replicas:
+            left, right = replicas.split("/", 1)
+            running = _safe_int(left)
+            desired = _safe_int(right)
+        rows.append(
+            {
+                "name": name,
+                "mode": mode,
+                "replicas": replicas,
+                "running": running,
+                "desired": desired,
+                "image": image,
+                "unhealthy": desired > 0 and running < desired,
+            }
+        )
+    return rows
+
+
+def _parse_swarm_node_lines(raw: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for line in _non_empty_lines(raw):
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        rows.append(
+            {
+                "hostname": parts[0],
+                "status": parts[1],
+                "availability": parts[2],
+                "manager_status": parts[3],
+            }
+        )
+    return rows
+
+
+def _parse_swarm_task_lines(raw: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for line in _non_empty_lines(raw):
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        rows.append(
+            {
+                "name": parts[0],
+                "state": parts[1],
+                "error": parts[2],
+                "node": parts[3],
+            }
+        )
+    return rows[:60]
+
+
+def _build_swarm_recommendations(
+    *,
+    services: list[dict[str, object]],
+    unhealthy: list[dict[str, object]],
+    bad_nodes: list[dict[str, object]],
+    include_logs: bool,
+) -> list[str]:
+    items: list[str] = []
+    if unhealthy:
+        for row in unhealthy[:3]:
+            name = str(row.get("name", ""))
+            items.append(f"查看 {name} 的任务失败原因：lazysre swarm --service {name} --logs")
+            items.append(f"自然语言继续：为什么 {name} 副本不足？")
+    elif services:
+        items.append("Swarm service 副本状态正常，可继续说：检查这些服务最近日志有没有错误")
+    if bad_nodes:
+        items.append("存在异常节点，建议检查节点磁盘、网络和 docker daemon 状态")
+    if unhealthy and not include_logs:
+        items.append("如需日志证据，可加 --logs 或直接说：看异常服务日志")
+    if not services:
+        items.append("没有发现 service；请确认当前节点是否为 Swarm manager 或是否有权限")
+    return items[:8]
+
+
+def _render_swarm_health_report(report: dict[str, object]) -> None:
+    if not (_console and Table):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    summary = report.get("summary", {})
+    summary_text = (
+        f"ok={report.get('ok', False)} services={len(report.get('services', []))} "
+        f"unhealthy={len(report.get('unhealthy_services', []))} "
+        f"bad_nodes={len(report.get('bad_nodes', []))} "
+        f"warn={summary.get('warn', 0)} error={summary.get('error', 0)}"
+    )
+    if Panel:
+        _console.print(Panel(summary_text, title="Swarm Health", border_style="cyan"))
+    service_table = Table(title="Swarm Services")
+    service_table.add_column("Service", style="cyan")
+    service_table.add_column("Replicas", style="white", no_wrap=True)
+    service_table.add_column("Image", style="white")
+    service_table.add_column("Status", style="yellow")
+    for row in list(report.get("services", []))[:30]:
+        if not isinstance(row, dict):
+            continue
+        service_table.add_row(
+            str(row.get("name", "-")),
+            str(row.get("replicas", "-")),
+            str(row.get("image", "-"))[:80],
+            "UNHEALTHY" if bool(row.get("unhealthy")) else "OK",
+        )
+    _console.print(service_table)
+    task_lines: list[str] = []
+    for task_report in list(report.get("tasks", []))[:8]:
+        if not isinstance(task_report, dict):
+            continue
+        task_lines.append(f"[{task_report.get('service', '-')}]")
+        for task in list(task_report.get("tasks", []))[:6]:
+            if isinstance(task, dict):
+                task_lines.append(
+                    f"- {task.get('name', '-')} state={task.get('state', '-')} "
+                    f"node={task.get('node', '-')} error={task.get('error', '')}"
+                )
+    if task_lines and Panel:
+        _console.print(Panel("\n".join(task_lines), title="Task Evidence", border_style="yellow"))
+    recommendations = report.get("recommendations", [])
+    if isinstance(recommendations, list) and recommendations and Panel:
+        _console.print(Panel("\n".join(f"- {item}" for item in recommendations), title="Recommendations", border_style="green"))
+
+
+def _safe_int(value: str) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return 0
 
 
 def _default_memory_db_path() -> Path:
@@ -4077,6 +4434,23 @@ def _write_setup_marker(report: dict[str, object]) -> Path:
     return marker
 
 
+def _write_first_scan_marker(report: dict[str, object]) -> Path:
+    marker = Path(settings.data_dir) / "lsre-onboarding.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "ready": False,
+        "first_scan_done": True,
+        "scan_summary": report.get("summary", {}),
+        "usable_targets": report.get("usable_targets", []),
+        "issues": report.get("issues", [])[:8] if isinstance(report.get("issues", []), list) else [],
+        "suggestions": report.get("suggestions", [])[:5] if isinstance(report.get("suggestions", []), list) else [],
+        "next_actions": report.get("next_actions", [])[:8] if isinstance(report.get("next_actions", []), list) else [],
+    }
+    marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return marker
+
+
 def _show_first_run_setup_hint_once() -> None:
     marker = Path(settings.data_dir) / "lsre-onboarding.json"
     if marker.exists():
@@ -4124,34 +4498,14 @@ def _maybe_auto_bootstrap_on_first_chat(options: dict[str, object]) -> None:
     marker = Path(settings.data_dir) / "lsre-onboarding.json"
     if marker.exists():
         return
-    _show_first_run_setup_hint_once()
-    if not _stdin_interactive():
-        return
-    try:
-        wants = typer.confirm("检测到首次使用，是否现在开始 30 秒初始化？", default=True)
-    except (EOFError, KeyboardInterrupt):
-        return
-    if not wants:
-        skip_report = {
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "ready": False,
-            "skipped": True,
-            "next_actions": ["用户跳过初始化，可随时执行：lsre init 或 /init"],
-        }
-        _write_setup_marker(skip_report)
-        return
-    report = _interactive_init_wizard(
-        profile_file=Path(settings.target_profile_file),
-        timeout_sec=6,
-        execute_probe=True,
-        audit_log=Path(str(options["audit_log"])),
-        provider=str(options["provider"]),
-        secrets_file=None,
-    )
+    typer.echo("首次启动：正在自动扫描当前机器（只读，不需要 K8s token）...")
+    report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
+    _write_first_scan_marker(report)
     if _console:
-        _render_setup_report(report)
+        _render_environment_discovery(report)
     else:
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    typer.echo("你可以直接复制上面的建议来问我；需要交互式配置时再输入 /init。")
 
 
 def _maybe_offer_one_click_env_fix(options: dict[str, object]) -> None:
@@ -4873,6 +5227,7 @@ def _render_chat_short_help() -> None:
         "LazySRE Chat 快捷命令",
         "- /help: 查看帮助",
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
+        "- /swarm [--logs]: 检查 Docker Swarm 服务、副本、任务失败证据",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
@@ -4979,6 +5334,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "init",
         "quickstart",
         "scan",
+        "swarm",
         "setup",
         "status",
         "doctor",
@@ -5064,6 +5420,21 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
             if _console:
                 _render_environment_discovery(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/swarm"):
+            tail = text[len("/swarm") :].strip()
+            include_logs = "--logs" in tail.lower() or "日志" in tail
+            service_name = _extract_swarm_service_name(tail)
+            report = _collect_swarm_health_report(
+                service_filter=service_name,
+                include_logs=include_logs,
+                tail=120 if include_logs else 80,
+                timeout_sec=6,
+            )
+            if _console:
+                _render_swarm_health_report(report)
             else:
                 typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
             continue
@@ -5659,6 +6030,19 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
         report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
         if _console:
             _render_environment_discovery(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return True
+    if _looks_like_swarm_diagnose_request(text):
+        include_logs = any(k in lowered for k in ("日志", "logs", "错误栈", "报错"))
+        report = _collect_swarm_health_report(
+            service_filter=_extract_swarm_service_name(text),
+            include_logs=include_logs,
+            tail=160 if include_logs else 80,
+            timeout_sec=6,
+        )
+        if _console:
+            _render_swarm_health_report(report)
         else:
             typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return True
@@ -7459,6 +7843,58 @@ def _looks_like_scan_request(text: str) -> bool:
     return any(k in lowered for k in keywords)
 
 
+def _looks_like_swarm_diagnose_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "swarm",
+        "docker service",
+        "service ls",
+        "service ps",
+        "服务副本",
+        "副本异常",
+        "服务有没有异常",
+        "服务有异常",
+        "服务健康",
+        "服务器上的服务",
+        "看异常服务",
+        "检查服务",
+    )
+    return any(k in lowered for k in keywords)
+
+
+def _extract_swarm_service_name(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    named = _extract_named_field(raw, ["service", "服务"])
+    if named:
+        return named.split()[0].strip()
+    patterns = [
+        r"(?:service|服务)\s*[=:：]\s*([A-Za-z0-9_.:/-]+)",
+        r"(?:为什么|检查|查看|看|分析)\s+([A-Za-z0-9_.:/-]+)\s+(?:服务|service)",
+        r"(?:service|服务)\s+([A-Za-z0-9_.:/-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    tokens = [
+        token.strip()
+        for token in re.split(r"\s+", raw)
+        if token.strip() and not token.startswith("--")
+    ]
+    stop = {"swarm", "logs", "log", "日志", "检查", "查看", "看", "服务", "service"}
+    for token in tokens:
+        normalized = token.lower()
+        if normalized in stop:
+            continue
+        if re.match(r"^[A-Za-z0-9_.:/-]{3,}$", token):
+            return token
+    return ""
+
+
 def _looks_like_quickstart_request(text: str) -> bool:
     lowered = text.lower().strip()
     if not lowered:
@@ -7933,6 +8369,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "approve",
         "status",
         "scan",
+        "swarm",
         "doctor",
         "install-doctor",
         "setup",
@@ -7991,6 +8428,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "approve",
         "status",
         "scan",
+        "swarm",
         "doctor",
         "install-doctor",
         "setup",

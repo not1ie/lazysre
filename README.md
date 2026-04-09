@@ -25,6 +25,8 @@ python -m lazysre
 lazysre install-doctor
 # 零配置环境扫描（安装后也会自动跑一次，不需要 K8s token）
 lazysre scan
+# Docker Swarm 健康检查（服务副本、任务失败证据、可选日志）
+lazysre swarm --logs
 # 首次启动向导（安装检查+LLM Key+目标连通性）
 lazysre setup
 # 交互式初始化（更像 Gemini/Claude：一步步填完即可）
@@ -93,6 +95,7 @@ lazysre --provider kimi chat
 
 - AI 调度：支持 Function Calling，让模型自动选择工具调用顺序
 - 观察者工具集：内置 K8s / Logs / Metrics 观测能力
+- Docker Swarm 观察者：内置 service/node/task/logs 健康检查能力
 - 安全执行器：支持 Dry-run、风险分级、审批确认、审计日志
 - ReAct 风格修复：支持自动生成修复计划与回滚命令
 - Runbook 工作流：内置模板化诊断/修复，一键执行标准排障流程
@@ -140,6 +143,10 @@ lsre status --probe --json
 # 零配置自动发现：Docker/Swarm/K8s/Prometheus/Provider Key（只读，无需 K8s token）
 lsre scan
 lsre scan --json
+# Docker Swarm 一等公民：检查 service 副本、节点、任务失败证据
+lsre swarm
+lsre swarm --logs
+lsre swarm --service lazysre_lazysre --logs
 # 环境预检（依赖/配置/连通性）
 lsre doctor
 lsre doctor --json
@@ -210,6 +217,8 @@ lsre memory search "payment latency" --limit 5
 你可以直接说：
 - “帮我看下当前状态”
 - “自动检测当前环境并列出问题”
+- “看看服务器上的服务有没有异常”
+- “为什么 lazysre_lazysre 服务副本不足”
 - “做一次环境体检”
 - “导出复盘报告”
 - “一键修复 CrashLoopBackOff”

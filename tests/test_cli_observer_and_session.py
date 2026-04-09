@@ -15,6 +15,8 @@ def test_builtin_tools_include_observers_with_schema() -> None:
     assert "get_cluster_context" in specs
     assert "fetch_service_logs" in specs
     assert "get_metrics" in specs
+    assert "get_swarm_context" in specs
+    assert "fetch_swarm_service_logs" in specs
     assert specs["get_metrics"].parameters.get("required") == ["query"]
 
 

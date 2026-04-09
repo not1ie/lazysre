@@ -78,6 +78,46 @@ def builtin_tools() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             spec=ToolSpec(
+                name="get_swarm_context",
+                description=(
+                    "Collect Docker Swarm context: node state, service replica health, "
+                    "failed tasks and recent service task status. Read-only and compressed."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "service": {"type": "string", "description": "Optional service name filter"},
+                        "include_logs": {"type": "boolean", "default": False},
+                        "tail": {"type": "integer", "default": 80},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            handler=_get_swarm_context,
+        ),
+        ToolDefinition(
+            spec=ToolSpec(
+                name="fetch_swarm_service_logs",
+                description=(
+                    "Fetch Docker Swarm service logs by service name, keyword and time window. "
+                    "Output is sanitized and compressed."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "service": {"type": "string"},
+                        "keyword": {"type": "string"},
+                        "since": {"type": "string", "default": "30m"},
+                        "tail": {"type": "integer", "default": 200},
+                    },
+                    "required": ["service"],
+                    "additionalProperties": False,
+                },
+            ),
+            handler=_fetch_swarm_service_logs,
+        ),
+        ToolDefinition(
+            spec=ToolSpec(
                 name="kubectl",
                 description="Run read-only or operational kubectl subcommands.",
                 parameters={
@@ -303,6 +343,122 @@ async def _get_metrics(args: dict[str, object], executor: SafeExecutor) -> ExecR
     )
 
 
+async def _get_swarm_context(args: dict[str, object], executor: SafeExecutor) -> ExecResult:
+    service_filter = str(args.get("service", "")).strip()
+    include_logs = bool(args.get("include_logs", False))
+    tail = max(20, min(int(args.get("tail", 80) or 80), 500))
+
+    info_res = await executor.run(["docker", "info", "--format", "{{json .Swarm}}"])
+    services_cmd = ["docker", "service", "ls", "--format", "{{.Name}}\t{{.Mode}}\t{{.Replicas}}\t{{.Image}}"]
+    services_res = await executor.run(services_cmd)
+    nodes_res = await executor.run(["docker", "node", "ls", "--format", "{{.Hostname}}\t{{.Status}}\t{{.Availability}}\t{{.ManagerStatus}}"])
+
+    service_rows = _parse_swarm_service_rows(services_res.stdout)
+    if service_filter:
+        service_rows = [
+            row
+            for row in service_rows
+            if service_filter.lower() in str(row.get("name", "")).lower()
+        ]
+    unhealthy = [row for row in service_rows if bool(row.get("unhealthy"))]
+
+    task_summaries: list[dict[str, object]] = []
+    log_snippets: list[dict[str, str]] = []
+    selected_services = [str(row.get("name", "")) for row in (unhealthy or service_rows) if str(row.get("name", "")).strip()]
+    for service_name in selected_services[:8]:
+        ps_res = await executor.run(
+            [
+                "docker",
+                "service",
+                "ps",
+                service_name,
+                "--no-trunc",
+                "--format",
+                "{{.Name}}\t{{.CurrentState}}\t{{.Error}}\t{{.Node}}",
+            ]
+        )
+        task_summaries.append(
+            {
+                "service": service_name,
+                "ok": ps_res.ok,
+                "tasks": _summarize_swarm_tasks(ps_res.stdout),
+                "stderr": ps_res.stderr[:500],
+            }
+        )
+        if include_logs:
+            logs_res = await executor.run(["docker", "service", "logs", "--tail", str(tail), service_name])
+            log_snippets.append(
+                {
+                    "service": service_name,
+                    "ok": str(logs_res.ok),
+                    "logs": redact_and_compress(logs_res.stdout, max_lines=80, max_chars=5000),
+                    "stderr": redact_and_compress(logs_res.stderr, max_lines=20, max_chars=1200),
+                }
+            )
+
+    summary = {
+        "swarm": _summarize_swarm_info(info_res.stdout),
+        "nodes": _summarize_swarm_nodes(nodes_res.stdout),
+        "services_count": len(service_rows),
+        "unhealthy_services_count": len(unhealthy),
+        "unhealthy_services": unhealthy[:30],
+        "services": service_rows[:60],
+        "task_summaries": task_summaries,
+        "log_snippets": log_snippets,
+        "probe": {
+            "info_ok": info_res.ok,
+            "services_ok": services_res.ok,
+            "nodes_ok": nodes_res.ok,
+        },
+    }
+    stderr = "\n".join(x for x in [info_res.stderr, services_res.stderr, nodes_res.stderr] if x)
+    rendered = redact_and_compress(json.dumps(summary, ensure_ascii=False, indent=2), max_lines=220, max_chars=14000)
+    ok = bool(info_res.ok and services_res.ok and nodes_res.ok)
+    return ExecResult(
+        ok=ok,
+        command=["observer/get_swarm_context"],
+        stdout=rendered,
+        stderr=redact_and_compress(stderr, max_lines=50, max_chars=1800),
+        exit_code=0 if ok else 1,
+        dry_run=executor.dry_run,
+        risk_level="low",
+        policy_reasons=["swarm observer read-only bundle"],
+    )
+
+
+async def _fetch_swarm_service_logs(args: dict[str, object], executor: SafeExecutor) -> ExecResult:
+    service = str(args.get("service", "")).strip()
+    if not service:
+        return ExecResult(
+            ok=False,
+            command=["observer/fetch_swarm_service_logs"],
+            stderr="missing service",
+            exit_code=2,
+            dry_run=executor.dry_run,
+            risk_level="low",
+        )
+    keyword = str(args.get("keyword", "")).strip().lower()
+    since = str(args.get("since", "30m") or "30m").strip()
+    tail = max(20, min(int(args.get("tail", 200) or 200), 2000))
+    cmd = ["docker", "service", "logs", "--since", since, "--tail", str(tail), service]
+    res = await executor.run(cmd)
+    text = res.stdout
+    if keyword and text:
+        filtered = [line for line in text.splitlines() if keyword in line.lower()]
+        text = "\n".join(filtered) if filtered else "(no lines matched keyword)"
+    compact = redact_and_compress(text, max_lines=180, max_chars=12000)
+    return ExecResult(
+        ok=res.ok,
+        command=["observer/fetch_swarm_service_logs"],
+        stdout=compact,
+        stderr=redact_and_compress(res.stderr, max_lines=50, max_chars=1600),
+        exit_code=res.exit_code,
+        dry_run=res.dry_run,
+        risk_level="low",
+        policy_reasons=["swarm log observer read-only bundle"],
+    )
+
+
 async def _run_kubectl(args: dict[str, object], executor: SafeExecutor) -> ExecResult:
     command = str(args.get("command", "")).strip()
     if not command:
@@ -441,6 +597,90 @@ def _summarize_prom_response(raw: str, *, query: str) -> str:
             last = values[-1][1] if isinstance(values, list) and values and isinstance(values[-1], list) and len(values[-1]) > 1 else "-"
             lines.append(f"- {label_preview} last={last}")
     return "\n".join(lines)
+
+
+def _parse_swarm_service_rows(raw: str) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        name, mode, replicas, image = parts[:4]
+        desired = 0
+        running = 0
+        if "/" in replicas:
+            left, right = replicas.split("/", 1)
+            running = _safe_int(left)
+            desired = _safe_int(right)
+        rows.append(
+            {
+                "name": name,
+                "mode": mode,
+                "replicas": replicas,
+                "running": running,
+                "desired": desired,
+                "image": image,
+                "unhealthy": desired > 0 and running < desired,
+            }
+        )
+    return rows
+
+
+def _summarize_swarm_info(raw: str) -> dict[str, object]:
+    try:
+        payload = json.loads(raw) if raw.strip().startswith("{") else {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "local_node_state": payload.get("LocalNodeState", ""),
+        "control_available": payload.get("ControlAvailable", False),
+        "node_id": payload.get("NodeID", ""),
+        "error": payload.get("Error", ""),
+    }
+
+
+def _summarize_swarm_nodes(raw: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        rows.append(
+            {
+                "hostname": parts[0],
+                "status": parts[1],
+                "availability": parts[2],
+                "manager_status": parts[3],
+            }
+        )
+    return rows[:80]
+
+
+def _summarize_swarm_tasks(raw: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        name, current_state, error, node = parts[:4]
+        rows.append(
+            {
+                "name": name,
+                "state": current_state,
+                "error": error,
+                "node": node,
+            }
+        )
+    return rows[:40]
+
+
+def _safe_int(value: str) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return 0
 
 
 def _url_quote(value: str) -> str:
