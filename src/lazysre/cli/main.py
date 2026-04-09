@@ -294,6 +294,7 @@ def watch(
     count: Annotated[int, typer.Option("--count", help="Number of scan cycles. Use 1 for one-shot.")] = 1,
     include_swarm: Annotated[bool, typer.Option("--swarm/--no-swarm", help="Include Docker Swarm health snapshot.")] = True,
     include_logs: Annotated[bool, typer.Option("--logs", help="Include Swarm logs for unhealthy services.")] = False,
+    remember: Annotated[bool, typer.Option("--remember/--no-remember", help="Persist alert summaries to long-term memory.")] = True,
     timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Per-check timeout seconds.")] = 5,
     output: Annotated[str, typer.Option("--output", help="Optional JSONL output path.")] = "",
     as_json: Annotated[bool, typer.Option("--json", help="Print watch snapshots as JSON.")] = False,
@@ -303,6 +304,7 @@ def watch(
         count=count,
         include_swarm=include_swarm,
         include_logs=include_logs,
+        remember=remember,
         timeout_sec=timeout_sec,
         output=Path(output).expanduser() if output.strip() else None,
     )
@@ -3716,6 +3718,12 @@ def _collect_swarm_health_report(
         bad_nodes=bad_nodes,
         include_logs=include_logs,
     )
+    root_causes = _classify_swarm_root_causes(
+        unhealthy=unhealthy,
+        bad_nodes=bad_nodes,
+        task_reports=task_reports,
+        log_reports=log_reports,
+    )
     summary = _summarize_doctor_checks(checks)
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -3730,6 +3738,7 @@ def _collect_swarm_health_report(
         "unhealthy_services": unhealthy[:40],
         "tasks": task_reports,
         "logs": log_reports,
+        "root_causes": root_causes,
         "recommendations": recommendations,
     }
 
@@ -3819,6 +3828,93 @@ def _build_swarm_recommendations(
     return items[:8]
 
 
+def _classify_swarm_root_causes(
+    *,
+    unhealthy: list[dict[str, object]],
+    bad_nodes: list[dict[str, object]],
+    task_reports: list[dict[str, object]],
+    log_reports: list[dict[str, object]],
+) -> list[dict[str, str]]:
+    causes: list[dict[str, str]] = []
+    if bad_nodes:
+        causes.append(
+            {
+                "category": "swarm_node_unavailable",
+                "severity": "high",
+                "evidence": f"bad_nodes={len(bad_nodes)}",
+                "advice": "先恢复节点 Ready/Active，再观察 service 是否自动调度恢复。",
+            }
+        )
+    for service in unhealthy:
+        service_name = str(service.get("name", "service"))
+        service_text_parts: list[str] = [json.dumps(service, ensure_ascii=False)]
+        for report in task_reports:
+            if not isinstance(report, dict) or str(report.get("service", "")) != service_name:
+                continue
+            service_text_parts.append(json.dumps(report.get("tasks", []), ensure_ascii=False))
+            service_text_parts.append(str(report.get("stderr", "")))
+        for report in log_reports:
+            if not isinstance(report, dict) or str(report.get("service", "")) != service_name:
+                continue
+            service_text_parts.append(str(report.get("logs", "")))
+            service_text_parts.append(str(report.get("stderr", "")))
+        evidence_text = "\n".join(service_text_parts).lower()
+        category, advice = _classify_swarm_text(evidence_text)
+        causes.append(
+            {
+                "category": category,
+                "severity": "high" if category != "swarm_service_replicas_unhealthy" else "medium",
+                "service": service_name,
+                "evidence": _compact_swarm_evidence(evidence_text),
+                "advice": advice,
+            }
+        )
+    return causes[:12]
+
+
+def _classify_swarm_text(text: str) -> tuple[str, str]:
+    lowered = text.lower()
+    if any(k in lowered for k in ("no such image", "pull access denied", "manifest unknown", "not found", "denied")):
+        return (
+            "swarm_image_pull_failed",
+            "检查镜像 tag、仓库登录状态和节点到镜像仓库的网络；修复后使用 docker service update --image 或 --force 滚动恢复。",
+        )
+    if any(k in lowered for k in ("port is already allocated", "bind: address already in use", "port already in use")):
+        return (
+            "swarm_port_conflict",
+            "检查发布端口是否被宿主机进程或其他 service 占用，必要时调整 published port 后滚动更新。",
+        )
+    if any(k in lowered for k in ("no suitable node", "constraints not satisfied", "insufficient resources")):
+        return (
+            "swarm_scheduler_no_suitable_node",
+            "检查 node 资源、placement constraint、label、磁盘和内存压力，先恢复可调度节点。",
+        )
+    if any(k in lowered for k in ("oom", "out of memory", "killed")):
+        return (
+            "swarm_task_oom",
+            "检查容器内存限制和应用内存曲线，必要时先扩容/调高 limit，再分析泄漏。",
+        )
+    if any(k in lowered for k in ("rejected", "failed", "shutdown", "starting", "pending")):
+        return (
+            "swarm_task_rejected_or_crashing",
+            "查看 service ps 与 logs 的首个错误，优先确认镜像、端口、配置和依赖连通性。",
+        )
+    return (
+        "swarm_service_replicas_unhealthy",
+        "副本未达期望但证据不足；建议加 --logs 重新检查 task error 和应用日志。",
+    )
+
+
+def _compact_swarm_evidence(text: str) -> str:
+    lines = _non_empty_lines(text)
+    interesting = [
+        line
+        for line in lines
+        if any(k in line.lower() for k in ("error", "failed", "rejected", "denied", "no such image", "oom", "port", "constraint"))
+    ]
+    return _preview_lines(interesting or lines, limit=4)[:500] if lines else ""
+
+
 def _render_swarm_health_report(report: dict[str, object]) -> None:
     if not (_console and Table):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
@@ -3860,6 +3956,17 @@ def _render_swarm_health_report(report: dict[str, object]) -> None:
                 )
     if task_lines and Panel:
         _console.print(Panel("\n".join(task_lines), title="Task Evidence", border_style="yellow"))
+    root_causes = report.get("root_causes", [])
+    if isinstance(root_causes, list) and root_causes and Panel:
+        lines = []
+        for item in root_causes[:8]:
+            if isinstance(item, dict):
+                lines.append(
+                    f"- {item.get('category', '-')} service={item.get('service', '-')} "
+                    f"severity={item.get('severity', '-')} advice={item.get('advice', '')}"
+                )
+        if lines:
+            _console.print(Panel("\n".join(lines), title="Root Cause Classifier", border_style="magenta"))
     recommendations = report.get("recommendations", [])
     if isinstance(recommendations, list) and recommendations and Panel:
         _console.print(Panel("\n".join(f"- {item}" for item in recommendations), title="Recommendations", border_style="green"))
@@ -3872,11 +3979,13 @@ def _run_watch_snapshots(
     include_swarm: bool,
     include_logs: bool,
     timeout_sec: int,
+    remember: bool = True,
     output: Path | None = None,
 ) -> list[dict[str, object]]:
     cycles = max(1, min(int(count or 1), 1000))
     interval = max(1, min(int(interval_sec or 60), 24 * 60 * 60))
     snapshots: list[dict[str, object]] = []
+    remembered: set[str] = set()
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
     for idx in range(cycles):
@@ -3887,6 +3996,11 @@ def _run_watch_snapshots(
             timeout_sec=timeout_sec,
         )
         snapshots.append(snapshot)
+        if remember:
+            signature = _watch_alert_signature(snapshot)
+            if signature and signature not in remembered:
+                remembered.add(signature)
+                _persist_watch_alert_memory(snapshot)
         if output:
             with output.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
@@ -3924,6 +4038,7 @@ def _collect_watch_snapshot(
             "summary": swarm_report.get("summary", {}) if isinstance(swarm_report, dict) else {},
             "unhealthy_services": swarm_report.get("unhealthy_services", []) if isinstance(swarm_report, dict) else [],
             "bad_nodes": swarm_report.get("bad_nodes", []) if isinstance(swarm_report, dict) else [],
+            "root_causes": swarm_report.get("root_causes", []) if isinstance(swarm_report, dict) else [],
             "recommendations": swarm_report.get("recommendations", []) if isinstance(swarm_report, dict) else [],
         },
         "suggestions": scan_report.get("suggestions", []),
@@ -3966,6 +4081,17 @@ def _build_watch_alerts(
                         "hint": f"lazysre swarm --service {row.get('name', '')} --logs",
                     }
                 )
+        for row in list(swarm_report.get("root_causes", []))[:10]:
+            if isinstance(row, dict):
+                alerts.append(
+                    {
+                        "source": "swarm-root-cause",
+                        "severity": str(row.get("severity", "warn")),
+                        "name": str(row.get("category", "swarm_root_cause")),
+                        "detail": f"service={row.get('service', '-')} evidence={row.get('evidence', '')}"[:240],
+                        "hint": str(row.get("advice", ""))[:240],
+                    }
+                )
         for row in list(swarm_report.get("bad_nodes", []))[:10]:
             if isinstance(row, dict):
                 alerts.append(
@@ -3978,6 +4104,76 @@ def _build_watch_alerts(
                     }
                 )
     return alerts[:30]
+
+
+def _watch_alert_signature(snapshot: dict[str, object]) -> str:
+    alerts = snapshot.get("alerts", [])
+    if not isinstance(alerts, list) or not alerts:
+        return ""
+    parts: list[str] = []
+    for item in alerts[:12]:
+        if not isinstance(item, dict):
+            continue
+        parts.append(
+            "|".join(
+                [
+                    str(item.get("source", "")),
+                    str(item.get("name", "")),
+                    str(item.get("detail", ""))[:80],
+                ]
+            )
+        )
+    return "\n".join(parts)
+
+
+def _persist_watch_alert_memory(snapshot: dict[str, object]) -> None:
+    alerts = snapshot.get("alerts", [])
+    if not isinstance(alerts, list) or not alerts:
+        return
+    root_causes: list[str] = []
+    swarm = snapshot.get("swarm", {})
+    if isinstance(swarm, dict):
+        for item in list(swarm.get("root_causes", []))[:6]:
+            if isinstance(item, dict):
+                root_causes.append(
+                    f"{item.get('category', 'unknown')} service={item.get('service', '-')} advice={item.get('advice', '')}"
+                )
+    if not root_causes:
+        root_causes = [
+            f"{item.get('source', 'scan')}:{item.get('name', 'alert')} {item.get('detail', '')}"
+            for item in alerts[:6]
+            if isinstance(item, dict)
+        ]
+    fix_commands: list[str] = []
+    rollback_commands: list[str] = []
+    for item in alerts[:8]:
+        if not isinstance(item, dict):
+            continue
+        hint = str(item.get("hint", "")).strip()
+        if hint.startswith("lazysre "):
+            fix_commands.append(hint)
+    try:
+        store = _open_incident_memory_store()
+        if not store:
+            return
+        store.add_case(
+            symptom="watch alerts: " + "; ".join(
+                f"{item.get('source', '-')}/{item.get('name', '-')}"
+                for item in alerts[:6]
+                if isinstance(item, dict)
+            ),
+            root_cause="\n".join(root_causes)[:1200] or "watch detected alerts",
+            fix_commands=fix_commands[:6],
+            rollback_commands=rollback_commands,
+            metadata={
+                "source": "lsre-watch",
+                "cycle": snapshot.get("cycle", 1),
+                "generated_at_utc": snapshot.get("generated_at_utc", ""),
+                "alert_count": len(alerts),
+            },
+        )
+    except Exception:
+        return
 
 
 def _render_watch_snapshot(snapshot: dict[str, object]) -> None:

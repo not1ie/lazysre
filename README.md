@@ -27,7 +27,7 @@ lazysre install-doctor
 lazysre scan
 # Docker Swarm 健康检查（服务副本、任务失败证据、可选日志）
 lazysre swarm --logs
-# 持续巡检（默认单次，可用 --count 多轮）
+# 持续巡检（默认会把异常摘要写入长期记忆，可用 --no-remember 关闭）
 lazysre watch --count 1
 # 首次启动向导（安装检查+LLM Key+目标连通性）
 lazysre setup
@@ -99,6 +99,7 @@ lazysre --provider kimi chat
 - 观察者工具集：内置 K8s / Logs / Metrics 观测能力
 - Docker Swarm 观察者：内置 service/node/task/logs 健康检查能力
 - 持续巡检：`watch` 可定期扫描环境并输出异常摘要/JSONL
+- 异常记忆：`watch` 发现的问题会写入长期记忆，后续相似诊断会自动引用历史经验
 - 安全执行器：支持 Dry-run、风险分级、审批确认、审计日志
 - ReAct 风格修复：支持自动生成修复计划与回滚命令
 - Runbook 工作流：内置模板化诊断/修复，一键执行标准排障流程
@@ -150,9 +151,10 @@ lsre scan --json
 lsre swarm
 lsre swarm --logs
 lsre swarm --service lazysre_lazysre --logs
-# 持续巡检与 JSONL 留痕
+# 持续巡检、JSONL 留痕与异常记忆
 lsre watch --count 1
 lsre watch --count 10 --interval-sec 60 --output .data/watch.jsonl
+lsre watch --count 1 --no-remember
 # 环境预检（依赖/配置/连通性）
 lsre doctor
 lsre doctor --json

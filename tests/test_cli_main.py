@@ -1169,6 +1169,7 @@ def test_collect_swarm_health_report_detects_unhealthy_service(monkeypatch: pyte
     assert report["unhealthy_services"][0]["name"] == "api"
     assert "No such image" in report["tasks"][0]["tasks"][0]["error"]
     assert report["logs"][0]["service"] == "api"
+    assert report["root_causes"][0]["category"] == "swarm_image_pull_failed"
 
 
 def test_collect_watch_snapshot_rolls_up_scan_and_swarm_alerts(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1188,6 +1189,15 @@ def test_collect_watch_snapshot_rolls_up_scan_and_swarm_alerts(monkeypatch: pyte
             "summary": {"warn": 1, "error": 0},
             "unhealthy_services": [{"name": "api", "replicas": "0/1"}],
             "bad_nodes": [],
+            "root_causes": [
+                {
+                    "category": "swarm_image_pull_failed",
+                    "severity": "high",
+                    "service": "api",
+                    "evidence": "No such image",
+                    "advice": "check registry",
+                }
+            ],
             "recommendations": ["lazysre swarm --service api --logs"],
         }
 
@@ -1199,3 +1209,60 @@ def test_collect_watch_snapshot_rolls_up_scan_and_swarm_alerts(monkeypatch: pyte
     assert snapshot["ok"] is False
     assert snapshot["usable_targets"] == ["docker-swarm"]
     assert any(alert["source"] == "swarm" and alert["name"] == "api" for alert in snapshot["alerts"])
+    assert any(alert["source"] == "swarm-root-cause" for alert in snapshot["alerts"])
+
+
+def test_run_watch_snapshots_persists_alert_memory_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    saved: list[dict[str, object]] = []
+
+    class FakeStore:
+        path = Path("/tmp/fake-memory.db")
+
+        def add_case(self, **kwargs: object) -> None:
+            saved.append(dict(kwargs))
+
+    def fake_snapshot(**kwargs: object) -> dict[str, object]:
+        return {
+            "generated_at_utc": "2026-04-09T00:00:00+00:00",
+            "cycle": kwargs.get("cycle", 1),
+            "ok": False,
+            "alerts": [
+                {
+                    "source": "swarm-root-cause",
+                    "severity": "high",
+                    "name": "swarm_image_pull_failed",
+                    "detail": "service=api evidence=No such image",
+                    "hint": "check registry",
+                }
+            ],
+            "swarm": {
+                "root_causes": [
+                    {
+                        "category": "swarm_image_pull_failed",
+                        "service": "api",
+                        "advice": "check registry",
+                    }
+                ]
+            },
+            "usable_targets": ["docker-swarm"],
+            "suggestions": [],
+        }
+
+    monkeypatch.setattr(cli_main, "_collect_watch_snapshot", fake_snapshot)
+    monkeypatch.setattr(cli_main, "_open_incident_memory_store", lambda: FakeStore())
+    monkeypatch.setattr(cli_main.time, "sleep", lambda _: None)
+
+    snapshots = cli_main._run_watch_snapshots(
+        interval_sec=1,
+        count=2,
+        include_swarm=True,
+        include_logs=False,
+        timeout_sec=1,
+        remember=True,
+        output=None,
+    )
+
+    assert len(snapshots) == 2
+    assert len(saved) == 1
+    assert "watch alerts" in str(saved[0]["symptom"])
+    assert "swarm_image_pull_failed" in str(saved[0]["root_cause"])
