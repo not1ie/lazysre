@@ -23,7 +23,9 @@ from lazysre.cli.main import (
     _normalize_ssh_target,
     _collect_watch_snapshot,
     _run_autopilot_cycle,
+    _run_remote_autopilot_cycle,
     _build_autopilot_report,
+    _build_remote_autopilot_report,
     _render_autopilot_report_markdown,
     _build_action_inbox_from_watch,
     _find_action_inbox_item,
@@ -1510,6 +1512,60 @@ def test_build_autopilot_report_promotes_first_action() -> None:
     markdown = _render_autopilot_report_markdown(report)
     assert "# LazySRE Autopilot Report" in markdown
     assert "lazysre template run swarm-image-pull-failed --var service=api --apply" in markdown
+
+
+def test_build_remote_autopilot_report_promotes_remote_recommendations() -> None:
+    remote_report = {
+        "generated_at_utc": "2026-04-09T00:00:00+00:00",
+        "target": "root@192.168.10.101",
+        "ok": False,
+        "summary": {"warn": 1, "error": 0},
+        "unhealthy_services": [{"name": "api", "replicas": "0/1"}],
+        "root_causes": [
+            {
+                "category": "swarm_image_pull_failed",
+                "service": "api",
+                "severity": "high",
+                "advice": "registry auth failed",
+            }
+        ],
+        "recommendations": ["lazysre remote root@192.168.10.101 --service api --logs"],
+    }
+
+    report = _build_remote_autopilot_report(goal="远程自动驾驶", remote_report=remote_report)
+
+    assert report["source"] == "remote-autopilot"
+    assert report["status"] == "needs_attention"
+    assert report["recommended_commands"][0] == "lazysre remote root@192.168.10.101 --service api --logs"
+    assert report["action_inbox"]["actions"][0]["source"] == "remote-root-cause"
+
+
+def test_run_remote_autopilot_cycle_writes_latest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fake_remote(**kwargs: object) -> dict[str, object]:
+        return {
+            "generated_at_utc": "2026-04-09T00:00:00+00:00",
+            "target": kwargs.get("target", ""),
+            "ok": True,
+            "summary": {"warn": 0, "error": 0},
+            "unhealthy_services": [],
+            "root_causes": [],
+            "recommendations": ["lazysre remote root@192.168.10.101 --json"],
+        }
+
+    monkeypatch.setattr(cli_main, "_collect_remote_docker_report", fake_remote)
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+
+    report = _run_remote_autopilot_cycle(
+        goal="远程巡检",
+        target="root@192.168.10.101",
+        service_filter="",
+        include_logs=False,
+        timeout_sec=1,
+    )
+
+    assert report["source"] == "remote-autopilot"
+    assert report["status"] == "clear"
+    assert (tmp_path / "lsre-autopilot-last.json").exists()
 
 
 def test_run_autopilot_cycle_builds_watch_actions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

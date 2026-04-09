@@ -37,6 +37,8 @@ lazysre actions
 lazysre actions --run 1
 # 自动驾驶：扫描 -> 巡检 -> 行动清单，可选生成修复计划
 lazysre autopilot
+# 远程自动驾驶：通过 SSH 诊断远程 Docker/Swarm
+lazysre autopilot --remote root@192.168.10.101 --logs
 # 首次启动向导（安装检查+LLM Key+目标连通性）
 lazysre setup
 # 交互式初始化（更像 Gemini/Claude：一步步填完即可）
@@ -182,6 +184,7 @@ lsre autopilot
 lsre autopilot "帮我看下当前服务器有没有问题" --json
 lsre autopilot --report-md .data/autopilot.md
 lsre autopilot "修复巡检发现的问题" --fix
+lsre autopilot --remote root@192.168.10.101 --logs --report-md .data/remote-autopilot.md
 # 直接消费最新巡检证据生成修复计划
 lsre fix "修复巡检发现的问题"
 # 环境预检（依赖/配置/连通性）

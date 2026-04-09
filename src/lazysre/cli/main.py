@@ -370,6 +370,8 @@ def actions(
 def autopilot(
     ctx: typer.Context,
     goal: Annotated[str, typer.Argument(help="Natural-language objective for the autopilot run.")] = "巡检当前环境并给出下一步行动",
+    remote_target: Annotated[str, typer.Option("--remote", help="Run autopilot against an SSH target, e.g. root@192.168.10.101.")] = "",
+    service: Annotated[str, typer.Option("--service", help="Optional remote Swarm service filter when --remote is set.")] = "",
     include_swarm: Annotated[bool, typer.Option("--swarm/--no-swarm", help="Include Docker Swarm diagnosis.")] = True,
     include_logs: Annotated[bool, typer.Option("--logs", help="Include logs for unhealthy Swarm services.")] = False,
     remember: Annotated[bool, typer.Option("--remember/--no-remember", help="Persist watch alerts to incident memory.")] = True,
@@ -398,13 +400,22 @@ def autopilot(
         provider=None,
         max_steps=None,
     )
-    report = _run_autopilot_cycle(
-        goal=goal,
-        include_swarm=include_swarm,
-        include_logs=include_logs,
-        remember=remember,
-        timeout_sec=timeout_sec,
-    )
+    if remote_target.strip():
+        report = _run_remote_autopilot_cycle(
+            goal=goal,
+            target=remote_target,
+            service_filter=service,
+            include_logs=include_logs,
+            timeout_sec=timeout_sec,
+        )
+    else:
+        report = _run_autopilot_cycle(
+            goal=goal,
+            include_swarm=include_swarm,
+            include_logs=include_logs,
+            remember=remember,
+            timeout_sec=timeout_sec,
+        )
     if report_md.strip():
         out_path = Path(report_md).expanduser()
         _write_text_file(out_path, _render_autopilot_report_markdown(report))
@@ -5393,6 +5404,26 @@ def _run_autopilot_cycle(
     return report
 
 
+def _run_remote_autopilot_cycle(
+    *,
+    goal: str,
+    target: str,
+    service_filter: str,
+    include_logs: bool,
+    timeout_sec: int,
+) -> dict[str, object]:
+    remote_report = _collect_remote_docker_report(
+        target=target,
+        service_filter=service_filter,
+        include_logs=include_logs,
+        tail=120 if include_logs else 80,
+        timeout_sec=timeout_sec,
+    )
+    report = _build_remote_autopilot_report(goal=goal, remote_report=remote_report)
+    _write_latest_autopilot_report(report)
+    return report
+
+
 def _build_autopilot_report(
     *,
     goal: str,
@@ -5453,6 +5484,111 @@ def _build_autopilot_report(
         "action_inbox": action_inbox,
         "recommended_commands": commands,
         "next_step": _build_autopilot_next_step(needs_attention=needs_attention, first_action=first_action),
+    }
+
+
+def _build_remote_autopilot_report(*, goal: str, remote_report: dict[str, object]) -> dict[str, object]:
+    remote_summary = remote_report.get("summary", {})
+    if not isinstance(remote_summary, dict):
+        remote_summary = {}
+    recommendations = remote_report.get("recommendations", [])
+    commands = _dedupe_strings([str(x) for x in recommendations]) if isinstance(recommendations, list) else []
+    target = str(remote_report.get("target", "")).strip()
+    root_causes = remote_report.get("root_causes", [])
+    if isinstance(root_causes, list) and root_causes and target:
+        commands.append(f'lazysre fix "远程 {target} 的 Docker/Swarm 异常"')
+    commands = _dedupe_strings(commands)[:8]
+    action_inbox = _build_remote_action_inbox(remote_report, commands)
+    warn_count = int(remote_summary.get("warn", 0) or 0)
+    error_count = int(remote_summary.get("error", 0) or 0)
+    unhealthy_count = len(remote_report.get("unhealthy_services", [])) if isinstance(remote_report.get("unhealthy_services", []), list) else 0
+    root_cause_count = len(root_causes) if isinstance(root_causes, list) else 0
+    needs_attention = bool((not bool(remote_report.get("ok", False))) or warn_count or error_count or unhealthy_count or root_cause_count)
+    first_action = {}
+    actions = action_inbox.get("actions", [])
+    if isinstance(actions, list) and actions and isinstance(actions[0], dict):
+        first_action = actions[0]
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "remote-autopilot",
+        "goal": str(goal or "").strip() or "远程巡检并给出下一步行动",
+        "status": "needs_attention" if needs_attention else "clear",
+        "ok": not needs_attention,
+        "summary": {
+            "remote_warn": warn_count,
+            "remote_error": error_count,
+            "remote_unhealthy_services": unhealthy_count,
+            "remote_root_causes": root_cause_count,
+            "actions": int(action_inbox.get("summary", {}).get("total", 0)) if isinstance(action_inbox.get("summary", {}), dict) else 0,
+        },
+        "remote": remote_report,
+        "action_inbox": action_inbox,
+        "recommended_commands": commands,
+        "next_step": _build_autopilot_next_step(needs_attention=needs_attention, first_action=first_action),
+    }
+
+
+def _build_remote_action_inbox(remote_report: dict[str, object], commands: list[str]) -> dict[str, object]:
+    actions: list[dict[str, object]] = []
+    seen: set[str] = set()
+    target = str(remote_report.get("target", "")).strip()
+    root_causes = remote_report.get("root_causes", [])
+    if isinstance(root_causes, list):
+        for cause in root_causes[:12]:
+            if not isinstance(cause, dict):
+                continue
+            service = str(cause.get("service", "")).strip()
+            category = str(cause.get("category", "remote_swarm_issue")).strip()
+            severity = str(cause.get("severity", "medium")).strip() or "medium"
+            command = f"lazysre remote {target} --service {service} --logs" if target and service else (commands[0] if commands else "")
+            _append_action(
+                actions,
+                seen,
+                {
+                    "title": f"远程处理 {category}: {service or target or 'remote'}",
+                    "source": "remote-root-cause",
+                    "severity": "high" if severity == "high" else "medium",
+                    "risk_level": "low",
+                    "template": "",
+                    "variables": {"target": target, "service": service},
+                    "command": command,
+                    "reason": str(cause.get("advice", "") or cause.get("evidence", ""))[:240],
+                    "dedupe_key": f"remote:{target}:{category}:{service}:{command}",
+                },
+            )
+    if not actions:
+        for command in commands[:8]:
+            _append_action(
+                actions,
+                seen,
+                {
+                    "title": "远程下一步建议",
+                    "source": "remote-recommendation",
+                    "severity": "medium",
+                    "risk_level": "low",
+                    "template": "",
+                    "variables": {"target": target},
+                    "command": command,
+                    "reason": "remote report recommendation",
+                    "dedupe_key": f"remote-command:{command}",
+                },
+            )
+    for idx, action in enumerate(actions, 1):
+        action["id"] = idx
+    severity_counts = {"high": 0, "medium": 0, "low": 0}
+    for action in actions:
+        sev = str(action.get("severity", "low"))
+        if sev not in severity_counts:
+            sev = "low"
+        severity_counts[sev] += 1
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "remote-report",
+        "watch_generated_at_utc": remote_report.get("generated_at_utc", ""),
+        "ok": bool(actions),
+        "summary": {"total": len(actions), **severity_counts},
+        "actions": actions,
+        "message": "" if actions else "No actionable remote findings.",
     }
 
 
