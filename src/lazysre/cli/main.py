@@ -442,6 +442,33 @@ def autopilot(
         )
 
 
+@app.command("remote")
+def remote(
+    target: Annotated[str, typer.Argument(help="SSH target, e.g. root@192.168.10.101")],
+    service: Annotated[str, typer.Option("--service", help="Optional Docker Swarm service filter.")] = "",
+    logs: Annotated[bool, typer.Option("--logs", help="Include remote Swarm service logs.")] = False,
+    tail: Annotated[int, typer.Option("--tail", help="Remote log/task tail lines.")] = 80,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Per SSH command timeout seconds.")] = 8,
+    as_json: Annotated[bool, typer.Option("--json", help="Print remote report as JSON.")] = False,
+    report_md: Annotated[str, typer.Option("--report-md", help="Optional markdown remote report path.")] = "",
+) -> None:
+    report = _collect_remote_docker_report(
+        target=target,
+        service_filter=service,
+        include_logs=logs,
+        tail=tail,
+        timeout_sec=timeout_sec,
+    )
+    if report_md.strip():
+        out_path = Path(report_md).expanduser()
+        _write_text_file(out_path, _render_remote_docker_report_markdown(report))
+        typer.echo(f"Remote report exported: {out_path}")
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_remote_docker_report(report)
+
+
 @app.command("doctor")
 def doctor(
     ctx: typer.Context,
@@ -4102,6 +4129,440 @@ def _render_swarm_health_report(report: dict[str, object]) -> None:
         _console.print(Panel("\n".join(f"- {item}" for item in recommendations), title="Recommendations", border_style="green"))
 
 
+def _collect_remote_docker_report(
+    *,
+    target: str,
+    service_filter: str = "",
+    include_logs: bool = False,
+    tail: int = 80,
+    timeout_sec: int = 8,
+) -> dict[str, object]:
+    safe_target = _normalize_ssh_target(target)
+    per_check_timeout = max(2, min(int(timeout_sec or 8), 20))
+    tail = max(20, min(int(tail or 80), 500))
+    checks: list[dict[str, object]] = []
+    if not safe_target:
+        checks.append(_scan_check("ssh.target", False, "error", str(target), "SSH target 格式不合法，示例：root@192.168.10.101"))
+        return _remote_report_payload(
+            target=str(target),
+            include_logs=include_logs,
+            service_filter=service_filter,
+            checks=checks,
+            services=[],
+            unhealthy=[],
+            nodes=[],
+            bad_nodes=[],
+            task_reports=[],
+            log_reports=[],
+            root_causes=[],
+            recommendations=["请使用形如 root@192.168.10.101 的 SSH target"],
+        )
+
+    ping = _safe_run_ssh_command(safe_target, "printf lazysre-ok", timeout_sec=per_check_timeout)
+    checks.append(
+        _scan_check(
+            "ssh.connect",
+            bool(ping.get("ok")) and "lazysre-ok" in str(ping.get("stdout", "")),
+            "pass" if bool(ping.get("ok")) and "lazysre-ok" in str(ping.get("stdout", "")) else "error",
+            _probe_detail(ping),
+            "" if bool(ping.get("ok")) else "无法 SSH 到目标机器，请检查网络、密钥或 ssh-agent；LazySRE 不会保存密码",
+        )
+    )
+    if not bool(ping.get("ok")):
+        return _remote_report_payload(
+            target=safe_target,
+            include_logs=include_logs,
+            service_filter=service_filter,
+            checks=checks,
+            services=[],
+            unhealthy=[],
+            nodes=[],
+            bad_nodes=[],
+            task_reports=[],
+            log_reports=[],
+            root_causes=[],
+            recommendations=[f"先确认本机可执行：ssh {safe_target} 'docker version'"],
+        )
+
+    version_probe = _safe_run_ssh_command(
+        safe_target,
+        _remote_shell_command(["docker", "version", "--format", "{{.Server.Version}}"]),
+        timeout_sec=per_check_timeout,
+    )
+    docker_reachable = bool(version_probe.get("ok"))
+    checks.append(
+        _scan_check(
+            "remote.docker.version",
+            docker_reachable,
+            "pass" if docker_reachable else "warn",
+            str(version_probe.get("stdout", "")).strip() or _probe_detail(version_probe),
+            "" if docker_reachable else "远程 Docker 不可访问，请检查 docker 是否运行以及当前 SSH 用户权限",
+        )
+    )
+    if not docker_reachable:
+        return _remote_report_payload(
+            target=safe_target,
+            include_logs=include_logs,
+            service_filter=service_filter,
+            checks=checks,
+            services=[],
+            unhealthy=[],
+            nodes=[],
+            bad_nodes=[],
+            task_reports=[],
+            log_reports=[],
+            root_causes=[],
+            recommendations=[f"ssh {safe_target} 'docker version'"],
+        )
+
+    swarm_probe = _safe_run_ssh_command(
+        safe_target,
+        _remote_shell_command(["docker", "info", "--format", "{{.Swarm.LocalNodeState}}"]),
+        timeout_sec=per_check_timeout,
+    )
+    swarm_state = str(swarm_probe.get("stdout", "")).strip().lower() if bool(swarm_probe.get("ok")) else ""
+    swarm_active = swarm_state == "active"
+    checks.append(
+        _scan_check(
+            "remote.docker.swarm",
+            swarm_active,
+            "pass" if swarm_active else "warn",
+            swarm_state or _probe_detail(swarm_probe),
+            "" if swarm_active else "远程 Docker 未处于 active Swarm；如为单机 Docker，可先看 docker ps",
+        )
+    )
+
+    exited_probe = _safe_run_ssh_command(
+        safe_target,
+        _remote_shell_command(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "status=exited",
+                "--format",
+                "{{.Names}}\t{{.Status}}",
+            ]
+        ),
+        timeout_sec=per_check_timeout,
+    )
+    exited_lines = _non_empty_lines(str(exited_probe.get("stdout", "")))
+    checks.append(
+        _scan_check(
+            "remote.docker.exited_containers",
+            bool(exited_probe.get("ok")) and len(exited_lines) == 0,
+            "pass" if bool(exited_probe.get("ok")) and len(exited_lines) == 0 else "warn",
+            "none" if not exited_lines else _preview_lines(exited_lines, limit=5),
+            "" if not exited_lines else "远程存在已退出容器，可用 remote + logs 进一步查看",
+        )
+    )
+
+    if not swarm_active:
+        return _remote_report_payload(
+            target=safe_target,
+            include_logs=include_logs,
+            service_filter=service_filter,
+            checks=checks,
+            services=[],
+            unhealthy=[],
+            nodes=[],
+            bad_nodes=[],
+            task_reports=[],
+            log_reports=[],
+            root_causes=[],
+            recommendations=[f"lazysre remote {safe_target} --json"],
+        )
+
+    nodes_probe = _safe_run_ssh_command(
+        safe_target,
+        _remote_shell_command(
+            ["docker", "node", "ls", "--format", "{{.Hostname}}\t{{.Status}}\t{{.Availability}}\t{{.ManagerStatus}}"]
+        ),
+        timeout_sec=per_check_timeout,
+    )
+    node_rows = _parse_swarm_node_lines(str(nodes_probe.get("stdout", "")))
+    bad_nodes = [
+        row
+        for row in node_rows
+        if str(row.get("status", "")).lower() != "ready"
+        or str(row.get("availability", "")).lower() not in {"active", ""}
+    ]
+    checks.append(
+        _scan_check(
+            "remote.swarm.nodes",
+            bool(nodes_probe.get("ok")) and not bad_nodes,
+            "pass" if bool(nodes_probe.get("ok")) and not bad_nodes else "warn",
+            "all ready" if not bad_nodes else _preview_lines([json.dumps(x, ensure_ascii=False) for x in bad_nodes], limit=6),
+            "" if not bad_nodes else "远程 Swarm 存在非 Ready/Active 节点",
+        )
+    )
+
+    services_probe = _safe_run_ssh_command(
+        safe_target,
+        _remote_shell_command(["docker", "service", "ls", "--format", "{{.Name}}\t{{.Mode}}\t{{.Replicas}}\t{{.Image}}"]),
+        timeout_sec=per_check_timeout,
+    )
+    services = _parse_swarm_service_lines(str(services_probe.get("stdout", "")))
+    if service_filter.strip():
+        needle = service_filter.strip().lower()
+        services = [row for row in services if needle in str(row.get("name", "")).lower()]
+    unhealthy = [row for row in services if bool(row.get("unhealthy"))]
+    checks.append(
+        _scan_check(
+            "remote.swarm.services",
+            bool(services_probe.get("ok")) and not unhealthy,
+            "pass" if bool(services_probe.get("ok")) and not unhealthy else "warn",
+            f"services={len(services)} unhealthy={len(unhealthy)}" if bool(services_probe.get("ok")) else _probe_detail(services_probe),
+            "" if not unhealthy else "远程 Swarm 存在副本未达期望的 service",
+        )
+    )
+
+    selected = [str(row.get("name", "")) for row in (unhealthy or services) if str(row.get("name", "")).strip()]
+    task_reports: list[dict[str, object]] = []
+    log_reports: list[dict[str, object]] = []
+    for name in selected[:8]:
+        ps_probe = _safe_run_ssh_command(
+            safe_target,
+            _remote_shell_command(
+                [
+                    "docker",
+                    "service",
+                    "ps",
+                    name,
+                    "--no-trunc",
+                    "--format",
+                    "{{.Name}}\t{{.CurrentState}}\t{{.Error}}\t{{.Node}}",
+                ]
+            ),
+            timeout_sec=per_check_timeout,
+        )
+        task_reports.append(
+            {
+                "service": name,
+                "ok": bool(ps_probe.get("ok")),
+                "tasks": _parse_swarm_task_lines(str(ps_probe.get("stdout", ""))),
+                "stderr": str(ps_probe.get("stderr", ""))[:500],
+            }
+        )
+        if include_logs:
+            logs_probe = _safe_run_ssh_command(
+                safe_target,
+                _remote_shell_command(["docker", "service", "logs", "--tail", str(tail), name]),
+                timeout_sec=per_check_timeout,
+            )
+            log_reports.append(
+                {
+                    "service": name,
+                    "ok": bool(logs_probe.get("ok")),
+                    "logs": str(logs_probe.get("stdout", ""))[:5000],
+                    "stderr": str(logs_probe.get("stderr", ""))[:1000],
+                }
+            )
+
+    root_causes = _classify_swarm_root_causes(
+        unhealthy=unhealthy,
+        bad_nodes=bad_nodes,
+        task_reports=task_reports,
+        log_reports=log_reports,
+    )
+    recommendations = _build_remote_recommendations(
+        target=safe_target,
+        unhealthy=unhealthy,
+        bad_nodes=bad_nodes,
+        include_logs=include_logs,
+        service_filter=service_filter,
+    )
+    return _remote_report_payload(
+        target=safe_target,
+        include_logs=include_logs,
+        service_filter=service_filter,
+        checks=checks,
+        services=services,
+        unhealthy=unhealthy,
+        nodes=node_rows,
+        bad_nodes=bad_nodes,
+        task_reports=task_reports,
+        log_reports=log_reports,
+        root_causes=root_causes,
+        recommendations=recommendations,
+    )
+
+
+def _remote_report_payload(
+    *,
+    target: str,
+    include_logs: bool,
+    service_filter: str,
+    checks: list[dict[str, object]],
+    services: list[dict[str, object]],
+    unhealthy: list[dict[str, object]],
+    nodes: list[dict[str, str]],
+    bad_nodes: list[dict[str, str]],
+    task_reports: list[dict[str, object]],
+    log_reports: list[dict[str, object]],
+    root_causes: list[dict[str, object]],
+    recommendations: list[str],
+) -> dict[str, object]:
+    summary = _summarize_doctor_checks(checks)
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "remote-ssh",
+        "target": target,
+        "ok": bool(summary.get("error", 0) == 0 and len(unhealthy) == 0 and len(bad_nodes) == 0),
+        "service_filter": service_filter,
+        "include_logs": include_logs,
+        "summary": summary,
+        "checks": checks,
+        "nodes": nodes,
+        "bad_nodes": bad_nodes,
+        "services": services,
+        "unhealthy_services": unhealthy,
+        "tasks": task_reports,
+        "logs": log_reports,
+        "root_causes": root_causes,
+        "recommendations": recommendations,
+    }
+
+
+def _build_remote_recommendations(
+    *,
+    target: str,
+    unhealthy: list[dict[str, object]],
+    bad_nodes: list[dict[str, str]],
+    include_logs: bool,
+    service_filter: str,
+) -> list[str]:
+    items: list[str] = []
+    for row in unhealthy[:5]:
+        name = str(row.get("name", "")).strip()
+        if name:
+            items.append(f"lazysre remote {target} --service {name} --logs")
+            items.append(f"lazysre fix \"远程 {target} 的 {name} 服务异常\"")
+    if bad_nodes:
+        items.append(f"lazysre remote {target} --json")
+    if service_filter.strip() and not include_logs:
+        items.append(f"lazysre remote {target} --service {service_filter.strip()} --logs")
+    if not items:
+        items.append(f"lazysre remote {target} --json")
+    return _dedupe_strings(items)[:8]
+
+
+def _render_remote_docker_report(report: dict[str, object]) -> None:
+    if not (_console and Table):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    summary = report.get("summary", {})
+    summary_text = (
+        f"target={report.get('target', '-')} ok={report.get('ok', False)} "
+        f"pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} error={summary.get('error', 0)} "
+        f"unhealthy_services={len(report.get('unhealthy_services', [])) if isinstance(report.get('unhealthy_services', []), list) else 0}"
+    )
+    if Panel:
+        _console.print(Panel(summary_text, title="Remote Docker/Swarm", border_style="cyan"))
+    table = Table(title="Remote Checks")
+    table.add_column("Check", style="cyan")
+    table.add_column("Severity", style="white", no_wrap=True)
+    table.add_column("Detail", style="white")
+    table.add_column("Hint", style="yellow")
+    for raw in report.get("checks", []):
+        item = raw if isinstance(raw, dict) else {}
+        table.add_row(
+            str(item.get("name", "-")),
+            str(item.get("severity", "-")).upper(),
+            str(item.get("detail", "-"))[:180],
+            str(item.get("hint", ""))[:180],
+        )
+    _console.print(table)
+    if report.get("root_causes") and Panel:
+        lines = []
+        for item in list(report.get("root_causes", []))[:8]:
+            if isinstance(item, dict):
+                lines.append(
+                    f"- {item.get('category', 'unknown')} service={item.get('service', '-')} "
+                    f"severity={item.get('severity', '-')}: {item.get('advice', '')}"
+                )
+        _console.print(Panel("\n".join(lines), title="Remote Root Causes", border_style="red"))
+    recommendations = report.get("recommendations", [])
+    if isinstance(recommendations, list) and recommendations and Panel:
+        _console.print(Panel("\n".join(f"- {item}" for item in recommendations), title="Recommendations", border_style="green"))
+
+
+def _render_remote_docker_report_markdown(report: dict[str, object]) -> str:
+    summary = report.get("summary", {})
+    lines = [
+        "# LazySRE Remote Docker/Swarm Report",
+        "",
+        f"- Generated: {report.get('generated_at_utc', '')}",
+        f"- Target: `{report.get('target', '-')}`",
+        f"- OK: `{report.get('ok', False)}`",
+        f"- Summary: pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} error={summary.get('error', 0)}",
+        "",
+        "## Checks",
+        "",
+    ]
+    for raw in report.get("checks", []):
+        if not isinstance(raw, dict):
+            continue
+        lines.append(f"- `{raw.get('name', '-')}` severity=`{raw.get('severity', '-')}` detail={raw.get('detail', '-')}")
+    lines.append("")
+    root_causes = report.get("root_causes", [])
+    lines.extend(["## Root Causes", ""])
+    if isinstance(root_causes, list) and root_causes:
+        for item in root_causes:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- `{item.get('category', 'unknown')}` service=`{item.get('service', '-')}` "
+                f"severity=`{item.get('severity', '-')}`"
+            )
+            advice = str(item.get("advice", "")).strip()
+            if advice:
+                lines.append(f"  Advice: {advice}")
+    else:
+        lines.append("- No remote root causes classified.")
+    lines.append("")
+    recommendations = report.get("recommendations", [])
+    lines.extend(["## Recommended Commands", ""])
+    if isinstance(recommendations, list) and recommendations:
+        lines.extend(["```bash", *[str(item) for item in recommendations], "```", ""])
+    else:
+        lines.append("- No direct commands suggested.")
+    return "\n".join(lines)
+
+
+def _normalize_ssh_target(target: str) -> str:
+    value = str(target or "").strip()
+    if not value:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+@[A-Za-z0-9._:-]+", value):
+        return ""
+    return value
+
+
+def _remote_shell_command(args: list[str]) -> str:
+    return " ".join(shlex.quote(str(item)) for item in args)
+
+
+def _safe_run_ssh_command(target: str, remote_command: str, *, timeout_sec: int) -> dict[str, object]:
+    safe_target = _normalize_ssh_target(target)
+    if not safe_target:
+        return {"ok": False, "stdout": "", "stderr": "invalid ssh target", "exit_code": 2}
+    timeout = max(2, min(int(timeout_sec or 8), 30))
+    return _safe_run_command(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={timeout}",
+            safe_target,
+            remote_command,
+        ],
+        timeout_sec=timeout + 2,
+    )
+
+
 def _run_watch_snapshots(
     *,
     interval_sec: int,
@@ -4792,6 +5253,55 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
         report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
         if _console:
             _render_environment_discovery(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return True
+
+    if subcommand == "remote":
+        target = _extract_ssh_target_from_text(" ".join(tokens[1:]))
+        if not target:
+            typer.echo("remote action 缺少 SSH target。")
+            return False
+        service = ""
+        include_logs = False
+        tail = 120
+        idx = 1
+        while idx < len(tokens):
+            token = tokens[idx]
+            if token == "--logs":
+                include_logs = True
+                idx += 1
+                continue
+            if token == "--service":
+                idx += 1
+                if idx < len(tokens):
+                    service = tokens[idx]
+                idx += 1
+                continue
+            if token.startswith("--service="):
+                service = token.split("=", 1)[1]
+                idx += 1
+                continue
+            if token == "--tail":
+                idx += 1
+                if idx < len(tokens):
+                    tail = max(1, min(_safe_int(tokens[idx]), 1000))
+                idx += 1
+                continue
+            if token.startswith("--tail="):
+                tail = max(1, min(_safe_int(token.split("=", 1)[1]), 1000))
+                idx += 1
+                continue
+            idx += 1
+        report = _collect_remote_docker_report(
+            target=target,
+            service_filter=service,
+            include_logs=include_logs,
+            tail=tail,
+            timeout_sec=8,
+        )
+        if _console:
+            _render_remote_docker_report(report)
         else:
             typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return True
@@ -6455,6 +6965,7 @@ def _render_chat_short_help() -> None:
         "- /watch [--count N]: 持续巡检并输出异常摘要",
         "- /actions [id]: 把最近一次巡检结果整理成编号行动清单，可直接执行某个建议",
         "- /autopilot [目标]: 自动扫描 -> 巡检 -> 行动清单，可加 --fix 生成修复计划",
+        "- /remote <user@host> [--logs]: 通过 SSH 只读诊断远程 Docker/Swarm",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
@@ -6569,6 +7080,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "watch",
         "actions",
         "autopilot",
+        "remote",
         "setup",
         "status",
         "doctor",
@@ -6754,6 +7266,25 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                     provider=str(options["provider"]),
                     max_steps=int(options["max_steps"]),
                 )
+            continue
+        if text.lower().startswith("/remote"):
+            tail = text[len("/remote") :].strip()
+            target = _extract_ssh_target_from_text(tail)
+            if not target:
+                typer.echo("用法：/remote root@192.168.10.101 [--logs] [--service name]")
+                continue
+            service_text = tail.replace(target, " ")
+            report = _collect_remote_docker_report(
+                target=target,
+                service_filter=_extract_swarm_service_name(service_text),
+                include_logs="--logs" in tail.lower() or "日志" in tail,
+                tail=120,
+                timeout_sec=8,
+            )
+            if _console:
+                _render_remote_docker_report(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
             continue
         if text.lower().startswith("/mode "):
             tail = text[len("/mode ") :].strip().lower()
@@ -7342,6 +7873,24 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             reset_session=False,
             session_file=str(options["session_file"]),
         )
+        return True
+    if _looks_like_remote_diagnose_request(text):
+        target = _extract_ssh_target_from_text(text)
+        if not target:
+            typer.echo("请提供 SSH target，例如：远程诊断 root@192.168.10.101")
+            return True
+        service_text = text.replace(target, " ")
+        report = _collect_remote_docker_report(
+            target=target,
+            service_filter=_extract_swarm_service_name(service_text),
+            include_logs=any(k in lowered for k in ("日志", "logs")),
+            tail=120,
+            timeout_sec=8,
+        )
+        if _console:
+            _render_remote_docker_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return True
     if _looks_like_autopilot_request(text):
         report = _run_autopilot_cycle(
@@ -9261,6 +9810,45 @@ def _looks_like_swarm_diagnose_request(text: str) -> bool:
     return any(k in lowered for k in keywords)
 
 
+def _looks_like_remote_diagnose_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    if not _extract_ssh_target_from_text(text):
+        return False
+    keywords = (
+        "远程",
+        "ssh",
+        "服务器",
+        "remote",
+        "host",
+    )
+    diagnose_words = (
+        "诊断",
+        "检查",
+        "巡检",
+        "排查",
+        "看看",
+        "scan",
+        "diagnose",
+        "check",
+    )
+    return any(k in lowered for k in keywords) and any(k in lowered for k in diagnose_words)
+
+
+def _extract_ssh_target_from_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    match = re.search(r"\b([A-Za-z0-9._-]+@[A-Za-z0-9._:-]+)\b", raw)
+    if match:
+        return _normalize_ssh_target(match.group(1))
+    match = re.search(r"\bssh\s+([A-Za-z0-9._-]+@[A-Za-z0-9._:-]+)\b", raw, flags=re.IGNORECASE)
+    if match:
+        return _normalize_ssh_target(match.group(1))
+    return ""
+
+
 def _looks_like_watch_request(text: str) -> bool:
     lowered = text.lower().strip()
     if not lowered:
@@ -9929,6 +10517,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "watch",
         "actions",
         "autopilot",
+        "remote",
         "doctor",
         "install-doctor",
         "setup",
@@ -9991,6 +10580,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "watch",
         "actions",
         "autopilot",
+        "remote",
         "doctor",
         "install-doctor",
         "setup",

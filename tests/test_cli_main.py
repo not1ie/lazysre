@@ -18,6 +18,9 @@ from lazysre.cli.main import (
     _collect_runtime_status,
     _collect_environment_discovery,
     _collect_swarm_health_report,
+    _collect_remote_docker_report,
+    _remote_shell_command,
+    _normalize_ssh_target,
     _collect_watch_snapshot,
     _run_autopilot_cycle,
     _build_autopilot_report,
@@ -65,6 +68,7 @@ from lazysre.cli.main import (
     _looks_like_reset_request,
     _looks_like_scan_request,
     _looks_like_swarm_diagnose_request,
+    _looks_like_remote_diagnose_request,
     _looks_like_watch_request,
     _looks_like_actions_request,
     _looks_like_action_run_request,
@@ -86,6 +90,7 @@ from lazysre.cli.main import (
     _looks_like_scale_action_request,
     _looks_like_status_request,
     _extract_swarm_service_name,
+    _extract_ssh_target_from_text,
     _looks_like_latest_watch_reference,
     _looks_like_template_library_request,
     _looks_like_with_impact_request,
@@ -234,6 +239,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv15 = ["lsre", "autopilot", "--json"]
     _rewrite_argv_for_default_run(argv15)
     assert argv15 == ["lsre", "autopilot", "--json"]
+    argv16 = ["lsre", "remote", "root@192.168.10.101", "--json"]
+    _rewrite_argv_for_default_run(argv16)
+    assert argv16 == ["lsre", "remote", "root@192.168.10.101", "--json"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -340,6 +348,8 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_status_request("帮我看下当前状态")
     assert _looks_like_scan_request("自动检测当前环境并列出问题")
     assert _looks_like_swarm_diagnose_request("看看服务器上的服务有没有异常")
+    assert _looks_like_remote_diagnose_request("远程诊断 root@192.168.10.101 的 docker swarm")
+    assert _extract_ssh_target_from_text("请 ssh root@192.168.10.101 看看") == "root@192.168.10.101"
     assert _looks_like_watch_request("开始巡检一下")
     assert _looks_like_actions_request("巡检之后下一步做什么")
     assert _looks_like_actions_request("给我推荐动作")
@@ -564,6 +574,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["watch"]) is False
     assert _should_launch_assistant(["actions"]) is False
     assert _should_launch_assistant(["autopilot"]) is False
+    assert _should_launch_assistant(["remote"]) is False
     assert _should_launch_assistant(["doctor"]) is False
     assert _should_launch_assistant(["install-doctor"]) is False
     assert _should_launch_assistant(["setup"]) is False
@@ -1199,6 +1210,55 @@ def test_collect_swarm_health_report_detects_unhealthy_service(monkeypatch: pyte
     assert "No such image" in report["tasks"][0]["tasks"][0]["error"]
     assert report["logs"][0]["service"] == "api"
     assert report["root_causes"][0]["category"] == "swarm_image_pull_failed"
+
+
+def test_collect_remote_docker_report_detects_swarm_issue(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def fake_safe_run(command: list[str], *, timeout_sec: int) -> dict[str, object]:
+        assert command[0] == "ssh"
+        remote_command = str(command[-1])
+        calls.append(remote_command)
+        if remote_command == "printf lazysre-ok":
+            return {"ok": True, "stdout": "lazysre-ok", "stderr": "", "exit_code": 0}
+        if "docker version" in remote_command:
+            return {"ok": True, "stdout": "25.0.0", "stderr": "", "exit_code": 0}
+        if "docker info" in remote_command:
+            return {"ok": True, "stdout": "active", "stderr": "", "exit_code": 0}
+        if "docker ps -a" in remote_command:
+            return {"ok": True, "stdout": "", "stderr": "", "exit_code": 0}
+        if "docker node ls" in remote_command:
+            return {"ok": True, "stdout": "node-1\tReady\tActive\tLeader", "stderr": "", "exit_code": 0}
+        if "docker service ls" in remote_command:
+            return {"ok": True, "stdout": "api\treplicated\t0/1\tapi:latest", "stderr": "", "exit_code": 0}
+        if "docker service ps" in remote_command:
+            return {"ok": True, "stdout": "api.1\tRejected 1 second ago\tNo such image: api:latest\tnode-1", "stderr": "", "exit_code": 0}
+        if "docker service logs" in remote_command:
+            return {"ok": True, "stdout": "pull failed", "stderr": "", "exit_code": 0}
+        return {"ok": False, "stdout": "", "stderr": "unexpected", "exit_code": 1}
+
+    monkeypatch.setattr(cli_main, "_safe_run_command", fake_safe_run)
+
+    report = _collect_remote_docker_report(
+        target="root@192.168.10.101",
+        include_logs=True,
+        timeout_sec=3,
+    )
+
+    assert report["source"] == "remote-ssh"
+    assert report["target"] == "root@192.168.10.101"
+    assert report["ok"] is False
+    assert report["unhealthy_services"][0]["name"] == "api"
+    assert report["root_causes"][0]["category"] == "swarm_image_pull_failed"
+    assert "lazysre remote root@192.168.10.101 --service api --logs" in report["recommendations"]
+    assert any("docker service logs" in item for item in calls)
+
+
+def test_remote_helpers_validate_target_and_quote_command() -> None:
+    assert _normalize_ssh_target("root@192.168.10.101") == "root@192.168.10.101"
+    assert _normalize_ssh_target("root;rm@host") == ""
+    command = _remote_shell_command(["docker", "service", "ps", "api service"])
+    assert command == "docker service ps 'api service'"
 
 
 def test_collect_watch_snapshot_rolls_up_scan_and_swarm_alerts(monkeypatch: pytest.MonkeyPatch) -> None:

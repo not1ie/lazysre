@@ -27,6 +27,8 @@ lazysre install-doctor
 lazysre scan
 # Docker Swarm 健康检查（服务副本、任务失败证据、可选日志）
 lazysre swarm --logs
+# 远程服务器只读诊断（目标机无需安装 LazySRE，只需可 SSH）
+lazysre remote root@192.168.10.101 --logs
 # 持续巡检（默认会把异常摘要写入长期记忆，可用 --no-remember 关闭）
 lazysre watch --count 1
 # 把最近一次巡检转换成编号行动清单
@@ -104,6 +106,7 @@ lazysre --provider kimi chat
 - AI 调度：支持 Function Calling，让模型自动选择工具调用顺序
 - 观察者工具集：内置 K8s / Logs / Metrics 观测能力
 - Docker Swarm 观察者：内置 service/node/task/logs 健康检查能力
+- 远程 SSH 观察者：无需在目标机安装 LazySRE，也能只读诊断 Docker/Swarm
 - 持续巡检：`watch` 可定期扫描环境并输出异常摘要/JSONL
 - 行动收件箱：`actions` 将最近巡检结果转换成编号建议、模板命令与风险提示
 - 自动驾驶：`autopilot` 串起扫描、巡检、行动清单和修复计划
@@ -125,7 +128,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /scan /swarm /watch /actions /autopilot /doctor [/doctor fix] [/doctor strict]
+# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /scan /swarm /remote /watch /actions /autopilot /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
@@ -159,6 +162,11 @@ lsre scan --json
 lsre swarm
 lsre swarm --logs
 lsre swarm --service lazysre_lazysre --logs
+# 远程 Docker/Swarm 只读诊断（通过 SSH 执行 docker 观察命令）
+lsre remote root@192.168.10.101
+lsre remote root@192.168.10.101 --logs
+lsre remote root@192.168.10.101 --service lazysre_lazysre --logs
+lsre remote root@192.168.10.101 --report-md .data/remote-101.md
 # 持续巡检、JSONL 留痕与异常记忆
 lsre watch --count 1
 lsre watch --count 10 --interval-sec 60 --output .data/watch.jsonl
@@ -250,6 +258,7 @@ lsre memory search "payment latency" --limit 5
 - “帮我看下当前状态”
 - “自动检测当前环境并列出问题”
 - “看看服务器上的服务有没有异常”
+- “远程诊断 root@192.168.10.101 的 docker swarm”
 - “为什么 lazysre_lazysre 服务副本不足”
 - “开始巡检一下”
 - “下一步做什么 / 给我推荐动作 / 生成行动清单”
