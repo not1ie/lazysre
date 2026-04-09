@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 
 from lazysre.providers.base import LLMProvider
+from lazysre.providers.registry import resolve_model_name
 
 
 class OpenAIProvider(LLMProvider):
@@ -12,8 +13,9 @@ class OpenAIProvider(LLMProvider):
         self._api_key = api_key
 
     async def complete(self, system_prompt: str, user_prompt: str, model: str) -> str:
+        resolved_model = resolve_model_name("openai", model)
         payload = {
-            "model": model,
+            "model": resolved_model,
             "input": [
                 {
                     "role": "system",
@@ -52,4 +54,3 @@ def _extract_output_text(payload: dict[str, Any]) -> str:
             if content.get("type") == "output_text" and content.get("text"):
                 chunks.append(content["text"])
     return "\n".join(chunks).strip()
-

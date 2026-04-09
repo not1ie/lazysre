@@ -9,6 +9,8 @@ import pytest
 from lazysre.cli.main import (
     _archive_report_for_git,
     _backup_target_profile,
+    _build_cli_llm,
+    _build_provider_setup_checks,
     _build_doctor_gate,
     _build_incident_report_payload,
     _compute_doctor_autofix,
@@ -73,6 +75,8 @@ from lazysre.cli.main import (
     _rewrite_argv_for_default_run,
     _summarize_doctor_checks,
     _push_report_to_git,
+    _resolve_default_provider,
+    _resolve_provider_api_key,
     _resolve_runbook_vars,
     _target_runbook_context_vars,
     _prepare_runbook_instruction,
@@ -84,9 +88,12 @@ from lazysre.cli.main import (
     _safe_run_command,
     _should_launch_assistant,
 )
+from lazysre.cli.llm import AnthropicMessagesLLM, GeminiFunctionCallingLLM
 from lazysre.cli.fix_mode import FixPlan
 from lazysre.cli.runbook import find_runbook
+from lazysre.cli.secrets import SecretStore
 from lazysre.cli.target import TargetEnvironment
+from lazysre.config import settings
 
 
 def test_rewrite_argv_default_run_simple_instruction() -> None:
@@ -186,6 +193,78 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv10 = ["lsre", "undo"]
     _rewrite_argv_for_default_run(argv10)
     assert argv10 == ["lsre", "undo"]
+
+
+def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
+    store = SecretStore(tmp_path / "secrets.json")
+    store.set_api_key("anthropic", "sk-ant-1234567890")
+    store.set_api_key("gemini", "gem-key-1234567890")
+
+    assert store.get_api_key("anthropic") == "sk-ant-1234567890"
+    assert store.get_api_key("gemini") == "gem-key-1234567890"
+    assert store.masked_api_key("anthropic").startswith("sk-a")
+    assert store.clear_api_key("gemini") is True
+    assert store.get_api_key("gemini") == ""
+
+
+def test_resolve_default_provider_prefers_available_real_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets_path = tmp_path / "secrets.json"
+    store = SecretStore(secrets_path)
+    store.set_api_key("gemini", "gem-key-123")
+
+    monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+    assert _resolve_default_provider(secrets_file=secrets_path) == "gemini"
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "ant-key-123", raising=False)
+    assert _resolve_default_provider(secrets_file=secrets_path) == "anthropic"
+
+
+def test_build_cli_llm_supports_anthropic_and_gemini(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets_path = tmp_path / "secrets.json"
+    store = SecretStore(secrets_path)
+    store.set_api_key("anthropic", "ant-key-123")
+    store.set_api_key("gemini", "gem-key-123")
+
+    monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+
+    provider1, model1, llm1 = _build_cli_llm(
+        provider="anthropic",
+        model="gpt-5.4-mini",
+        secrets_file=secrets_path,
+    )
+    provider2, model2, llm2 = _build_cli_llm(
+        provider="gemini",
+        model="gpt-5.4-mini",
+        secrets_file=secrets_path,
+    )
+
+    assert provider1 == "anthropic"
+    assert model1.startswith("claude-")
+    assert isinstance(llm1, AnthropicMessagesLLM)
+    assert provider2 == "gemini"
+    assert model2.startswith("gemini-")
+    assert isinstance(llm2, GeminiFunctionCallingLLM)
+
+
+def test_build_provider_setup_checks_reports_multiple_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets_path = tmp_path / "secrets.json"
+    store = SecretStore(secrets_path)
+    store.set_api_key("gemini", "gem-key-123")
+
+    monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "ant-key-456", raising=False)
+    monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+
+    checks = _build_provider_setup_checks(secrets_file=secrets_path)
+    assert checks["anthropic"]["ok"] is True
+    assert "env" in str(checks["anthropic"]["detail"])
+    assert checks["gemini"]["ok"] is True
+    assert "secrets" in str(checks["gemini"]["detail"])
+    assert checks["openai"]["ok"] is False
 
 
 def test_detect_fix_and_apply_intent() -> None:

@@ -45,8 +45,7 @@ from lazysre.platform.models import (
 )
 from lazysre.platform.store import FilePlatformStore
 from lazysre.providers.base import LLMProvider
-from lazysre.providers.mock import MockProvider
-from lazysre.providers.openai_provider import OpenAIProvider
+from lazysre.providers.factory import build_provider_from_settings
 
 
 class PlatformService:
@@ -64,9 +63,7 @@ class PlatformService:
         self._recover_inflight_runs()
 
     def _build_provider(self) -> LLMProvider:
-        if settings.model_mode.lower() == "openai" and settings.openai_api_key:
-            return OpenAIProvider(settings.openai_api_key)
-        return MockProvider()
+        return build_provider_from_settings()
 
     async def create_agent(self, req: AgentCreateRequest) -> AgentDefinition:
         agent = AgentDefinition(

@@ -28,7 +28,12 @@ from lazysre.cli.fix_mode import (
     evaluate_apply_guardrail,
     extract_fix_plan,
 )
-from lazysre.cli.llm import MockFunctionCallingLLM, OpenAIResponsesLLM
+from lazysre.cli.llm import (
+    AnthropicMessagesLLM,
+    GeminiFunctionCallingLLM,
+    MockFunctionCallingLLM,
+    OpenAIResponsesLLM,
+)
 from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.session import SessionStore
@@ -62,6 +67,12 @@ from lazysre.cli.tools.marketplace import (
     verify_pack_signature,
 )
 from lazysre.config import settings
+from lazysre.providers.registry import (
+    PROVIDER_SPECS,
+    provider_mode_error_text,
+    provider_mode_help_text,
+    resolve_model_name,
+)
 
 try:
     from rich.console import Console
@@ -108,7 +119,7 @@ def root(
     tool_pack: Annotated[list[str], typer.Option("--tool-pack", help="Tool pack spec. e.g. builtin or module:pkg.mod[:factory].")] = ["builtin"],
     remote_gateway: Annotated[list[str], typer.Option("--remote-gateway", help="Remote gateway <name>=<url>[#token]. can be repeated.")] = [],
     model: Annotated[str, typer.Option(help="Model name for LLM dispatcher.")] = settings.model_name,
-    provider: Annotated[str, typer.Option(help="LLM provider: auto|mock|openai")] = "auto",
+    provider: Annotated[str, typer.Option(help=f"LLM provider: {provider_mode_help_text()}")] = "auto",
     max_steps: Annotated[int, typer.Option(help="Max function-calling iterations.")] = 6,
 ) -> None:
     ctx.obj = {
@@ -329,31 +340,39 @@ def install_doctor(
 
 @app.command("login")
 def login(
-    api_key: Annotated[str, typer.Option("--api-key", help="OpenAI API Key. If empty, prompt securely.")] = "",
+    provider: Annotated[str, typer.Option("--provider", help=f"Provider: {provider_mode_help_text()}")] = "openai",
+    api_key: Annotated[str, typer.Option("--api-key", help="Provider API Key. If empty, prompt securely.")] = "",
     secrets_file: Annotated[str, typer.Option("--secrets-file", help="Secrets JSON file path.")] = "",
 ) -> None:
+    mode = str(provider or "openai").strip().lower()
+    if mode not in PROVIDER_SPECS:
+        raise typer.BadParameter(provider_mode_error_text())
     store = SecretStore(Path(secrets_file).expanduser() if secrets_file.strip() else None)
     key = api_key.strip()
     if not key:
-        key = typer.prompt("请输入 OpenAI API Key", hide_input=True).strip()
+        key = typer.prompt(f"请输入 {PROVIDER_SPECS[mode].label} API Key", hide_input=True).strip()
     if not key:
         raise typer.BadParameter("API Key 不能为空")
-    store.set_openai_api_key(key)
-    masked = store.masked_openai_api_key() or "***"
-    typer.echo(f"OpenAI API Key 已保存: {masked} ({store.path})")
+    store.set_api_key(mode, key)
+    masked = store.masked_api_key(mode) or "***"
+    typer.echo(f"{PROVIDER_SPECS[mode].label} API Key 已保存: {masked} ({store.path})")
     typer.echo("现在可直接运行：lazysre")
 
 
 @app.command("logout")
 def logout(
+    provider: Annotated[str, typer.Option("--provider", help=f"Provider: {provider_mode_help_text()}")] = "openai",
     secrets_file: Annotated[str, typer.Option("--secrets-file", help="Secrets JSON file path.")] = "",
 ) -> None:
+    mode = str(provider or "openai").strip().lower()
+    if mode not in PROVIDER_SPECS:
+        raise typer.BadParameter(provider_mode_error_text())
     store = SecretStore(Path(secrets_file).expanduser() if secrets_file.strip() else None)
-    removed = store.clear_openai_api_key()
+    removed = store.clear_api_key(mode)
     if removed:
-        typer.echo("已清除本地 OpenAI API Key。")
+        typer.echo(f"已清除本地 {PROVIDER_SPECS[mode].label} API Key。")
         return
-    typer.echo("本地未找到可清除的 OpenAI API Key。")
+    typer.echo(f"本地未找到可清除的 {PROVIDER_SPECS[mode].label} API Key。")
 
 
 @app.command("init")
@@ -388,6 +407,7 @@ def init(
         timeout_sec=timeout_sec,
         execute_probe=execute_probe,
         audit_log=Path(str(options["audit_log"])),
+        provider=str(options["provider"]),
         secrets_file=Path(secrets_file).expanduser() if secrets_file.strip() else None,
     )
     if _console:
@@ -399,7 +419,7 @@ def init(
 @app.command("quickstart")
 def quickstart(
     ctx: typer.Context,
-    api_key: Annotated[str, typer.Option("--api-key", help="OpenAI API Key. Empty means prompt when needed.")] = "",
+    api_key: Annotated[str, typer.Option("--api-key", help="Provider API Key. Empty means prompt when needed.")] = "",
     profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
     timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 6,
     execute_probe: Annotated[bool, typer.Option("--execute-probe/--dry-run-probe", help="Execute real probe checks.")] = True,
@@ -437,6 +457,7 @@ def quickstart(
         audit_log=Path(str(options["audit_log"])),
         api_key=api_key,
         prompt_for_api_key=prompt_for_api_key,
+        provider=str(options["provider"]),
         secrets_file=Path(secrets_file).expanduser() if secrets_file.strip() else None,
     )
     if as_json or (not _console):
@@ -502,6 +523,7 @@ def setup(
         apply_defaults=apply_defaults,
         audit_log=Path(str(options["audit_log"])),
         write_marker=write_marker,
+        provider=str(options["provider"]),
     )
     if as_json or (not _console):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
@@ -608,7 +630,7 @@ def template_run(
     approval_mode: Annotated[str | None, typer.Option(help="Override policy: strict|balanced|permissive")] = None,
     audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
     model: Annotated[str | None, typer.Option(help="Override model.")] = None,
-    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+    provider: Annotated[str | None, typer.Option(help=f"Override provider: {provider_mode_help_text()}")] = None,
 ) -> None:
     options = _merged_options(
         ctx,
@@ -656,7 +678,7 @@ def approve_plan(
     yes: Annotated[bool, typer.Option("--yes", help="Skip per-step confirmation for selected steps.")] = False,
     with_impact: Annotated[bool, typer.Option("--with-impact", help="Generate impact statement for each step.")] = False,
     model: Annotated[str | None, typer.Option(help="Override model.")] = None,
-    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+    provider: Annotated[str | None, typer.Option(help=f"Override provider: {provider_mode_help_text()}")] = None,
 ) -> None:
     options = _merged_options(
         ctx,
@@ -699,7 +721,7 @@ def undo_last_plan(
     audit_log: Annotated[str | None, typer.Option(help="Override audit jsonl path.")] = None,
     max_steps: Annotated[int, typer.Option("--max-steps", help="Max rollback steps to run.")] = 6,
     model: Annotated[str | None, typer.Option(help="Override model.")] = None,
-    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+    provider: Annotated[str | None, typer.Option(help=f"Override provider: {provider_mode_help_text()}")] = None,
 ) -> None:
     options = _merged_options(
         ctx,
@@ -747,7 +769,7 @@ def chat(
     tool_pack: Annotated[list[str] | None, typer.Option("--tool-pack", help="Override tool packs.")] = None,
     remote_gateway: Annotated[list[str] | None, typer.Option("--remote-gateway", help="Override remote gateways.")] = None,
     model: Annotated[str | None, typer.Option(help="Override model.")] = None,
-    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+    provider: Annotated[str | None, typer.Option(help=f"Override provider: {provider_mode_help_text()}")] = None,
     max_steps: Annotated[int | None, typer.Option(help="Override max function-calling iterations.")] = None,
 ) -> None:
     options = _merged_options(
@@ -796,7 +818,7 @@ def fix_instruction(
     tool_pack: Annotated[list[str] | None, typer.Option("--tool-pack", help="Override tool packs.")] = None,
     remote_gateway: Annotated[list[str] | None, typer.Option("--remote-gateway", help="Override remote gateways.")] = None,
     model: Annotated[str | None, typer.Option(help="Override model.")] = None,
-    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+    provider: Annotated[str | None, typer.Option(help=f"Override provider: {provider_mode_help_text()}")] = None,
     max_steps: Annotated[int | None, typer.Option(help="Override max function-calling iterations.")] = None,
 ) -> None:
     options = _merged_options(
@@ -1228,20 +1250,12 @@ async def _dispatch(
     memory_context: str = "",
 ):
     mode = (provider or "auto").strip().lower()
-    if mode not in {"auto", "mock", "openai"}:
-        raise typer.BadParameter("provider must be one of auto/mock/openai")
+    if mode not in {"auto", "mock", "openai", "anthropic", "gemini"}:
+        raise typer.BadParameter(provider_mode_error_text())
     ap_mode = (approval_mode or "balanced").strip().lower()
     if ap_mode not in {"strict", "balanced", "permissive"}:
         raise typer.BadParameter("approval_mode must be one of strict/balanced/permissive")
-    openai_key = _resolve_openai_api_key()
-    if mode == "openai" or (mode == "auto" and openai_key):
-        if not openai_key:
-            raise typer.BadParameter(
-                "缺少 OpenAI API Key。请执行：lsre login（或设置 OPENAI_API_KEY）",
-            )
-        llm = OpenAIResponsesLLM(openai_key)
-    else:
-        llm = MockFunctionCallingLLM()
+    _, resolved_model, llm = _build_cli_llm(provider=mode, model=model)
 
     dispatcher = Dispatcher(
         llm=llm,
@@ -1261,7 +1275,7 @@ async def _dispatch(
             approval_callback=_build_approval_callback(enabled=interactive_approval and execute),
             audit_logger=AuditLogger(Path(audit_log)),
         ),
-        model=model,
+        model=resolved_model,
         max_steps=max(1, min(max_steps, 12)),
         text_stream=text_stream,
         system_prompt=_build_system_prompt(
@@ -1791,7 +1805,7 @@ def runbook_run(
     lock_file: Annotated[str | None, typer.Option(help="Override tool pack lock file path.")] = None,
     session_file: Annotated[str | None, typer.Option(help="Override session file path.")] = None,
     model: Annotated[str | None, typer.Option(help="Override model.")] = None,
-    provider: Annotated[str | None, typer.Option(help="Override provider: auto|mock|openai")] = None,
+    provider: Annotated[str | None, typer.Option(help=f"Override provider: {provider_mode_help_text()}")] = None,
     max_steps: Annotated[int | None, typer.Option(help="Override max function-calling iterations.")] = None,
 ) -> None:
     template = find_runbook(name, store=RunbookStore(Path(runbook_file)))
@@ -3251,6 +3265,7 @@ def _run_first_run_setup(
     apply_defaults: bool,
     audit_log: Path,
     write_marker: bool,
+    provider: str = "auto",
     secrets_file: Path | None = None,
 ) -> dict[str, object]:
     store = TargetEnvStore(profile_file)
@@ -3266,7 +3281,14 @@ def _run_first_run_setup(
             )
 
     install_report = _collect_install_doctor_report()
-    openai_check = _build_openai_setup_check(secrets_file=secrets_file)
+    provider_checks = _build_provider_setup_checks(secrets_file=secrets_file)
+    selected_provider = provider if str(provider or "").strip() else "auto"
+    active_provider = (
+        str(selected_provider).strip().lower()
+        if str(selected_provider).strip().lower() in PROVIDER_SPECS
+        else _resolve_default_provider(secrets_file=secrets_file)
+    )
+    active_provider_check = provider_checks.get(active_provider, {})
     probe_report = asyncio.run(
         probe_target_environment(
             target,
@@ -3280,14 +3302,15 @@ def _run_first_run_setup(
         )
     )
     probe_summary = dict(probe_report.get("summary", {})) if isinstance(probe_report, dict) else {}
-    openai_ok = bool(openai_check.get("ok"))
+    provider_ok = bool(active_provider_check.get("ok"))
     install_summary = dict(install_report.get("summary", {})) if isinstance(install_report, dict) else {}
     install_errors = int(install_summary.get("error", 0))
     probe_ok = bool(probe_summary.get("all_ok"))
-    ready = bool(openai_ok and install_errors == 0 and probe_ok)
+    ready = bool(provider_ok and install_errors == 0 and probe_ok)
 
     next_actions = _build_setup_next_actions(
-        openai_ok=openai_ok,
+        provider_ok=provider_ok,
+        active_provider=active_provider,
         install_report=install_report,
         probe_report=probe_report,
     )
@@ -3298,7 +3321,8 @@ def _run_first_run_setup(
         "apply_defaults": apply_defaults,
         "actions": setup_actions,
         "ready": ready,
-        "openai": openai_check,
+        "active_provider": active_provider,
+        "providers": provider_checks,
         "install": install_report,
         "probe": probe_report,
         "next_actions": next_actions,
@@ -3319,20 +3343,22 @@ def _run_quickstart(
     audit_log: Path,
     api_key: str,
     prompt_for_api_key: bool,
+    provider: str,
     secrets_file: Path | None,
 ) -> dict[str, object]:
     quick_actions: list[str] = []
     secret_store = SecretStore(secrets_file)
+    login_provider = _resolve_setup_provider(provider, secrets_file=secrets_file)
     key = str(api_key or "").strip()
     if key:
-        secret_store.set_openai_api_key(key)
-        quick_actions.append("openai_api_key saved from --api-key")
-    elif (not _resolve_openai_api_key(secrets_file=secrets_file)) and prompt_for_api_key and _stdin_interactive():
-        if typer.confirm("检测到未配置 OpenAI API Key，是否现在配置？", default=True):
-            typed = typer.prompt("OpenAI API Key", hide_input=True).strip()
+        secret_store.set_api_key(login_provider, key)
+        quick_actions.append(f"{login_provider}_api_key saved from --api-key")
+    elif (not _resolve_provider_api_key(login_provider, secrets_file=secrets_file)) and prompt_for_api_key and _stdin_interactive():
+        if typer.confirm(f"检测到未配置 {PROVIDER_SPECS[login_provider].label} API Key，是否现在配置？", default=True):
+            typed = typer.prompt(f"{PROVIDER_SPECS[login_provider].label} API Key", hide_input=True).strip()
             if typed:
-                secret_store.set_openai_api_key(typed)
-                quick_actions.append("openai_api_key saved from prompt")
+                secret_store.set_api_key(login_provider, typed)
+                quick_actions.append(f"{login_provider}_api_key saved from prompt")
 
     report = _run_first_run_setup(
         profile_file=profile_file,
@@ -3341,6 +3367,7 @@ def _run_quickstart(
         apply_defaults=True,
         audit_log=audit_log,
         write_marker=True,
+        provider=provider,
         secrets_file=secrets_file,
     )
     if autofix:
@@ -3351,6 +3378,7 @@ def _run_quickstart(
             write_backup=write_backup,
             audit_log=audit_log,
             prompt_for_api_key=prompt_for_api_key,
+            provider=provider,
             secrets_file=secrets_file,
         )
         report = _run_first_run_setup(
@@ -3360,6 +3388,7 @@ def _run_quickstart(
             apply_defaults=True,
             audit_log=audit_log,
             write_marker=True,
+            provider=provider,
             secrets_file=secrets_file,
         )
         report["autofix"] = auto_payload
@@ -3378,17 +3407,19 @@ def _run_doctor_autofix_flow(
     write_backup: bool,
     audit_log: Path,
     prompt_for_api_key: bool,
+    provider: str,
     secrets_file: Path | None,
 ) -> dict[str, object]:
     target_store = TargetEnvStore(profile_file)
     target = target_store.load()
     target_autofix = _apply_doctor_autofix(target_store, target, write_backup=write_backup)
     api_key_saved = False
-    if (not _resolve_openai_api_key(secrets_file=secrets_file)) and prompt_for_api_key and _stdin_interactive():
-        if typer.confirm("检测到未配置 OpenAI API Key，是否现在配置？", default=True):
-            typed = typer.prompt("OpenAI API Key", hide_input=True).strip()
+    login_provider = _resolve_setup_provider(provider, secrets_file=secrets_file)
+    if (not _resolve_provider_api_key(login_provider, secrets_file=secrets_file)) and prompt_for_api_key and _stdin_interactive():
+        if typer.confirm(f"检测到未配置 {PROVIDER_SPECS[login_provider].label} API Key，是否现在配置？", default=True):
+            typed = typer.prompt(f"{PROVIDER_SPECS[login_provider].label} API Key", hide_input=True).strip()
             if typed:
-                SecretStore(secrets_file).set_openai_api_key(typed)
+                SecretStore(secrets_file).set_api_key(login_provider, typed)
                 api_key_saved = True
     setup_report = _run_first_run_setup(
         profile_file=profile_file,
@@ -3397,11 +3428,13 @@ def _run_doctor_autofix_flow(
         apply_defaults=True,
         audit_log=audit_log,
         write_marker=True,
+        provider=provider,
         secrets_file=secrets_file,
     )
     return {
         "target_autofix": target_autofix,
-        "openai_api_key_saved": api_key_saved,
+        "provider_api_key_saved": api_key_saved,
+        "provider": login_provider,
         "post_setup_ready": bool(setup_report.get("ready")),
         "post_setup_next_actions": list(setup_report.get("next_actions", []))[:8]
         if isinstance(setup_report.get("next_actions"), list)
@@ -3415,6 +3448,7 @@ def _interactive_init_wizard(
     timeout_sec: int,
     execute_probe: bool,
     audit_log: Path,
+    provider: str,
     secrets_file: Path | None,
 ) -> dict[str, object]:
     typer.echo("LazySRE 初始化向导（约 30 秒）")
@@ -3422,15 +3456,16 @@ def _interactive_init_wizard(
     target = store.load()
     secret_store = SecretStore(secrets_file)
 
-    existing_key = _resolve_openai_api_key(secrets_file=secrets_file)
+    login_provider = _resolve_setup_provider(provider, secrets_file=secrets_file)
+    existing_key = _resolve_provider_api_key(login_provider, secrets_file=secrets_file)
     if existing_key:
-        masked = secret_store.masked_openai_api_key() or "***"
-        typer.echo(f"已检测到 OpenAI Key: {masked}")
+        masked = secret_store.masked_api_key(login_provider) or "***"
+        typer.echo(f"已检测到 {PROVIDER_SPECS[login_provider].label} Key: {masked}")
     else:
-        if typer.confirm("是否现在配置 OpenAI API Key？", default=True):
-            api_key = typer.prompt("OpenAI API Key", hide_input=True).strip()
+        if typer.confirm(f"是否现在配置 {PROVIDER_SPECS[login_provider].label} API Key？", default=True):
+            api_key = typer.prompt(f"{PROVIDER_SPECS[login_provider].label} API Key", hide_input=True).strip()
             if api_key:
-                secret_store.set_openai_api_key(api_key)
+                secret_store.set_api_key(login_provider, api_key)
                 typer.echo("API Key 已保存。")
 
     prom_default = str(target.prometheus_url or settings.target_prometheus_url or "").strip()
@@ -3460,6 +3495,7 @@ def _interactive_init_wizard(
         apply_defaults=False,
         audit_log=audit_log,
         write_marker=True,
+        provider=provider,
         secrets_file=secrets_file,
     )
     return report
@@ -3485,30 +3521,50 @@ def _compute_setup_default_updates(target) -> dict[str, object]:
     return updates
 
 
-def _build_openai_setup_check(*, secrets_file: Path | None = None) -> dict[str, object]:
-    raw = _resolve_openai_api_key(secrets_file=secrets_file)
-    masked = ""
-    if raw:
-        masked = f"{raw[:4]}...{raw[-4:]}" if len(raw) > 12 else "***"
-    source = "env" if str(settings.openai_api_key or "").strip() else ("secrets" if raw else "unset")
-    return {
-        "name": "runtime.openai_api_key",
-        "ok": bool(raw),
-        "severity": "pass" if raw else "error",
-        "detail": f"{masked or '(unset)'} ({source})",
-        "hint": "" if raw else "执行 lsre login 保存 API Key（或设置 OPENAI_API_KEY）后可启用真实 LLM",
-    }
+def _resolve_setup_provider(provider: str, *, secrets_file: Path | None = None) -> str:
+    normalized = str(provider or "auto").strip().lower()
+    if normalized in PROVIDER_SPECS:
+        return normalized
+    return _resolve_default_provider(secrets_file=secrets_file)
+
+
+def _build_provider_setup_checks(*, secrets_file: Path | None = None) -> dict[str, dict[str, object]]:
+    checks: dict[str, dict[str, object]] = {}
+    for provider, spec in PROVIDER_SPECS.items():
+        raw = _resolve_provider_api_key(provider, secrets_file=secrets_file)
+        masked = ""
+        if raw:
+            masked = f"{raw[:4]}...{raw[-4:]}" if len(raw) > 12 else "***"
+        env_present = False
+        if provider == "openai":
+            env_present = bool(str(settings.openai_api_key or "").strip())
+        elif provider == "anthropic":
+            env_present = bool(str(settings.anthropic_api_key or "").strip())
+        elif provider == "gemini":
+            env_present = bool(str(settings.gemini_api_key or "").strip())
+        source = "env" if env_present else ("secrets" if raw else "unset")
+        checks[provider] = {
+            "name": f"runtime.{spec.secret_key}",
+            "provider": provider,
+            "label": spec.label,
+            "ok": bool(raw),
+            "severity": "pass" if raw else "error",
+            "detail": f"{masked or '(unset)'} ({source})",
+            "hint": "" if raw else f"执行 lsre login --provider {provider} 保存 API Key（或设置 {' / '.join(spec.env_names)}）",
+        }
+    return checks
 
 
 def _build_setup_next_actions(
     *,
-    openai_ok: bool,
+    provider_ok: bool,
+    active_provider: str,
     install_report: dict[str, object],
     probe_report: dict[str, object],
 ) -> list[str]:
     actions: list[str] = []
-    if not openai_ok:
-        actions.append("lsre login")
+    if not provider_ok:
+        actions.append(f"lsre login --provider {active_provider}")
     checks = install_report.get("checks", [])
     if isinstance(checks, list):
         for item in checks:
@@ -3615,6 +3671,7 @@ def _maybe_auto_bootstrap_on_first_chat(options: dict[str, object]) -> None:
         timeout_sec=6,
         execute_probe=True,
         audit_log=Path(str(options["audit_log"])),
+        provider=str(options["provider"]),
         secrets_file=None,
     )
     if _console:
@@ -3639,6 +3696,7 @@ def _maybe_offer_one_click_env_fix(options: dict[str, object]) -> None:
         apply_defaults=False,
         audit_log=Path(str(options["audit_log"])),
         write_marker=False,
+        provider=str(options["provider"]),
         secrets_file=None,
     )
     if bool(quick.get("ready")):
@@ -3646,11 +3704,68 @@ def _maybe_offer_one_click_env_fix(options: dict[str, object]) -> None:
     typer.echo("检测到环境未完全就绪。可直接输入“修复环境”或 /quickstart 一键自动修复。")
 
 
+def _resolve_provider_api_key(provider: str, *, secrets_file: Path | None = None) -> str:
+    normalized = str(provider or "").strip().lower()
+    if normalized == "openai":
+        env_key = str(settings.openai_api_key or "").strip()
+        if env_key:
+            return env_key
+    elif normalized == "anthropic":
+        env_key = str(settings.anthropic_api_key or "").strip()
+        if env_key:
+            return env_key
+    elif normalized == "gemini":
+        env_key = str(settings.gemini_api_key or "").strip()
+        if env_key:
+            return env_key
+    elif normalized == "mock":
+        return ""
+
+    if normalized not in PROVIDER_SPECS:
+        return ""
+    return SecretStore(secrets_file).get_api_key(normalized)
+
+
 def _resolve_openai_api_key(*, secrets_file: Path | None = None) -> str:
-    env_key = str(settings.openai_api_key or "").strip()
-    if env_key:
-        return env_key
-    return SecretStore(secrets_file).get_openai_api_key()
+    return _resolve_provider_api_key("openai", secrets_file=secrets_file)
+
+
+def _resolve_default_provider(*, secrets_file: Path | None = None) -> str:
+    for candidate in ("openai", "anthropic", "gemini"):
+        if _resolve_provider_api_key(candidate, secrets_file=secrets_file):
+            return candidate
+    return "mock"
+
+
+def _build_cli_llm(
+    *,
+    provider: str,
+    model: str,
+    secrets_file: Path | None = None,
+):
+    mode = (provider or "auto").strip().lower()
+    if mode == "auto":
+        mode = _resolve_default_provider(secrets_file=secrets_file)
+
+    if mode == "mock":
+        return mode, resolve_model_name("openai", model), MockFunctionCallingLLM()
+
+    api_key = _resolve_provider_api_key(mode, secrets_file=secrets_file)
+    if not api_key:
+        spec = PROVIDER_SPECS[mode]
+        raise typer.BadParameter(
+            f"缺少 {spec.label} API Key。请执行：lsre login --provider {mode} "
+            f"（或设置 {' / '.join(spec.env_names)}）",
+        )
+
+    resolved_model = resolve_model_name(mode, model)
+    if mode == "openai":
+        return mode, resolved_model, OpenAIResponsesLLM(api_key)
+    if mode == "anthropic":
+        return mode, resolved_model, AnthropicMessagesLLM(api_key)
+    if mode == "gemini":
+        return mode, resolved_model, GeminiFunctionCallingLLM(api_key)
+    raise typer.BadParameter(provider_mode_error_text())
 
 
 def _stdin_interactive() -> bool:
@@ -3674,18 +3789,22 @@ def _render_setup_report(report: dict[str, object]) -> None:
     summary.add_row("Generated", str(report.get("generated_at_utc", "-")))
     _console.print(summary)
 
-    openai = report.get("openai", {})
-    if isinstance(openai, dict):
-        openai_table = Table(title="OpenAI")
-        openai_table.add_column("Check", style="cyan")
-        openai_table.add_column("Status", style="white")
-        openai_table.add_column("Detail", style="white")
-        openai_table.add_row(
-            str(openai.get("name", "runtime.openai_api_key")),
-            "PASS" if bool(openai.get("ok")) else "FAIL",
-            str(openai.get("detail", "")),
-        )
-        _console.print(openai_table)
+    providers = report.get("providers", {})
+    if isinstance(providers, dict) and providers:
+        provider_table = Table(title="LLM Providers")
+        provider_table.add_column("Provider", style="cyan")
+        provider_table.add_column("Status", style="white")
+        provider_table.add_column("Detail", style="white")
+        for provider in ("openai", "anthropic", "gemini"):
+            row = providers.get(provider)
+            if not isinstance(row, dict):
+                continue
+            provider_table.add_row(
+                str(row.get("label", provider)),
+                "PASS" if bool(row.get("ok")) else "FAIL",
+                str(row.get("detail", "")),
+            )
+        _console.print(provider_table)
 
     install = report.get("install", {})
     if isinstance(install, dict):
@@ -4267,8 +4386,8 @@ def _render_chat_short_help() -> None:
         "- /undo: 回滚最近一次修复计划",
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
         "- /quickstart: 一键自动修复环境并完成快速就绪",
-        "- /login: 仅保存 OpenAI API Key",
-        "- /setup [--dry-run-probe]: 首次启动向导（安装检查+目标探测+OpenAI Key）",
+        "- /login [--provider openai|anthropic|gemini]: 保存对应 Provider API Key",
+        "- /setup [--dry-run-probe]: 首次启动向导（安装检查+目标探测+LLM Key）",
         "- /status: 查看当前会话、目标配置、最近修复计划",
         "- /status probe: 追加目标探测摘要（dry-run）",
         "- /doctor: 运行环境预检（依赖/配置/连通性）",
@@ -4460,7 +4579,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             _render_mode_hint(runtime_execute)
             continue
         if text.lower().startswith("/login"):
-            login(api_key="", secrets_file="")
+            login(provider=str(options["provider"]), api_key="", secrets_file="")
             continue
         if text.lower().startswith("/init"):
             report = _interactive_init_wizard(
@@ -4468,6 +4587,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 timeout_sec=6,
                 execute_probe=True,
                 audit_log=Path(str(options["audit_log"])),
+                provider=str(options["provider"]),
                 secrets_file=None,
             )
             if _console:
@@ -4485,6 +4605,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 audit_log=Path(str(options["audit_log"])),
                 api_key="",
                 prompt_for_api_key=True,
+                provider=str(options["provider"]),
                 secrets_file=None,
             )
             if _console:
@@ -4501,6 +4622,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 apply_defaults=True,
                 audit_log=Path(str(options["audit_log"])),
                 write_marker=True,
+                provider=str(options["provider"]),
             )
             if _console:
                 _render_setup_report(report)
@@ -4911,6 +5033,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 timeout_sec=6,
                 execute_probe=True,
                 audit_log=Path(str(options["audit_log"])),
+                provider=str(options["provider"]),
                 secrets_file=None,
             )
             if _console:
@@ -5034,6 +5157,7 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             audit_log=Path(str(options["audit_log"])),
             api_key="",
             prompt_for_api_key=True,
+            provider=str(options["provider"]),
             secrets_file=None,
         )
         if _console:
@@ -5047,6 +5171,7 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             timeout_sec=6,
             execute_probe=True,
             audit_log=Path(str(options["audit_log"])),
+            provider=str(options["provider"]),
             secrets_file=None,
         )
         if _console:
@@ -7209,16 +7334,16 @@ def _generate_impact_statement(
         "Output one sentence only."
     )
     mode = (provider or "auto").strip().lower()
-    if mode not in {"openai"} or (not settings.openai_api_key):
+    if mode not in {"auto", "openai", "anthropic", "gemini"}:
         # deterministic fallback for local/mock mode
         scope = str(report.get("impact_scope", "service"))
         radius = str(report.get("blast_radius", "single target"))
         return f"该操作将影响 {scope}，潜在影响范围为 {radius}，请确认业务窗口与回滚条件。"
     try:
-        llm = OpenAIResponsesLLM(settings.openai_api_key)
+        _, resolved_model, llm = _build_cli_llm(provider=mode, model=model)
         turn = asyncio.run(
             llm.respond(
-                model=model,
+                model=resolved_model,
                 tools=[],
                 system_prompt="You are an SRE risk analyst.",
                 user_input=prompt,

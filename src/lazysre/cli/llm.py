@@ -4,10 +4,12 @@ import json
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
 from lazysre.cli.types import LLMTurn, ToolCall, ToolOutput, ToolSpec
+from lazysre.providers.registry import resolve_model_name
 
 
 class FunctionCallingLLM(ABC):
@@ -41,7 +43,8 @@ class OpenAIResponsesLLM(FunctionCallingLLM):
         tool_outputs: list[ToolOutput] | None = None,
         text_stream: Callable[[str], None] | None = None,
     ) -> LLMTurn:
-        payload: dict[str, Any] = {"model": model}
+        resolved_model = resolve_model_name("openai", model)
+        payload: dict[str, Any] = {"model": resolved_model}
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -96,6 +99,152 @@ class OpenAIResponsesLLM(FunctionCallingLLM):
             resp.raise_for_status()
             data = resp.json()
         return _parse_openai_turn(data)
+
+
+class AnthropicMessagesLLM(FunctionCallingLLM):
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+        self._messages: list[dict[str, Any]] = []
+
+    async def respond(
+        self,
+        *,
+        model: str,
+        tools: list[ToolSpec],
+        system_prompt: str,
+        user_input: str | None = None,
+        previous_response_id: str | None = None,
+        tool_outputs: list[ToolOutput] | None = None,
+        text_stream: Callable[[str], None] | None = None,
+    ) -> LLMTurn:
+        messages = list(self._messages)
+        resolved_model = resolve_model_name("anthropic", model)
+        if previous_response_id:
+            tool_blocks = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": item.call_id,
+                    "content": item.output,
+                }
+                for item in (tool_outputs or [])
+            ]
+            if tool_blocks:
+                messages.append({"role": "user", "content": tool_blocks})
+        else:
+            messages.append({"role": "user", "content": user_input or ""})
+
+        payload: dict[str, Any] = {
+            "model": resolved_model,
+            "system": system_prompt,
+            "max_tokens": 800,
+            "messages": messages,
+        }
+        if tools:
+            payload["tools"] = [
+                {
+                    "name": item.name,
+                    "description": item.description,
+                    "input_schema": item.parameters,
+                }
+                for item in tools
+            ]
+
+        headers = {
+            "x-api-key": self._api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                json=payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        self._messages = messages + [{"role": "assistant", "content": data.get("content", [])}]
+        turn = _parse_anthropic_turn(data)
+        if text_stream and turn.text:
+            _emit_stream_from_text(turn.text, text_stream)
+        return turn
+
+
+class GeminiFunctionCallingLLM(FunctionCallingLLM):
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+        self._contents: list[dict[str, Any]] = []
+        self._pending_tool_names: dict[str, str] = {}
+
+    async def respond(
+        self,
+        *,
+        model: str,
+        tools: list[ToolSpec],
+        system_prompt: str,
+        user_input: str | None = None,
+        previous_response_id: str | None = None,
+        tool_outputs: list[ToolOutput] | None = None,
+        text_stream: Callable[[str], None] | None = None,
+    ) -> LLMTurn:
+        contents = list(self._contents)
+        resolved_model = resolve_model_name("gemini", model)
+        if previous_response_id:
+            tool_response_parts = []
+            for item in (tool_outputs or []):
+                tool_name = self._pending_tool_names.get(item.call_id, "")
+                if not tool_name:
+                    continue
+                tool_response_parts.append(
+                    {
+                        "functionResponse": {
+                            "name": tool_name,
+                            "response": _normalize_gemini_tool_response(item.output),
+                        }
+                    }
+                )
+            if tool_response_parts:
+                contents.append({"role": "user", "parts": tool_response_parts})
+        else:
+            contents.append({"role": "user", "parts": [{"text": user_input or ""}]})
+
+        payload: dict[str, Any] = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": contents,
+        }
+        if tools:
+            payload["tools"] = [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": item.name,
+                            "description": item.description,
+                            "parameters": item.parameters,
+                        }
+                        for item in tools
+                    ]
+                }
+            ]
+            payload["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{resolved_model}:generateContent",
+                params={"key": self._api_key},
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        candidate_content = _extract_gemini_candidate_content(data)
+        if candidate_content:
+            contents.append(candidate_content)
+        self._contents = contents
+        turn = _parse_gemini_turn(data)
+        self._pending_tool_names = {item.call_id: item.name for item in turn.tool_calls}
+        if text_stream and turn.text:
+            _emit_stream_from_text(turn.text, text_stream)
+        return turn
 
 
 class MockFunctionCallingLLM(FunctionCallingLLM):
@@ -287,6 +436,57 @@ def _parse_openai_turn(payload: dict[str, Any]) -> LLMTurn:
     return LLMTurn(response_id=response_id, text=text, tool_calls=calls)
 
 
+def _parse_anthropic_turn(payload: dict[str, Any]) -> LLMTurn:
+    text_parts: list[str] = []
+    calls: list[ToolCall] = []
+    for item in payload.get("content", []):
+        item_type = str(item.get("type", "")).strip()
+        if item_type == "text" and item.get("text"):
+            text_parts.append(str(item["text"]))
+            continue
+        if item_type != "tool_use":
+            continue
+        call_id = str(item.get("id", "")).strip()
+        name = str(item.get("name", "")).strip()
+        args = item.get("input", {})
+        if not isinstance(args, dict):
+            args = {}
+        if call_id and name:
+            calls.append(ToolCall(call_id=call_id, name=name, arguments=args))
+    return LLMTurn(
+        response_id=str(payload.get("id", "")) or _new_response_id("anthropic"),
+        text="\n".join(text_parts).strip(),
+        tool_calls=calls,
+    )
+
+
+def _parse_gemini_turn(payload: dict[str, Any]) -> LLMTurn:
+    text_parts: list[str] = []
+    calls: list[ToolCall] = []
+    for candidate in payload.get("candidates", []):
+        content = candidate.get("content", {})
+        for part in content.get("parts", []):
+            if part.get("text"):
+                text_parts.append(str(part["text"]))
+            function_call = part.get("functionCall")
+            if not isinstance(function_call, dict):
+                continue
+            name = str(function_call.get("name", "")).strip()
+            call_id = str(function_call.get("id", "")).strip() or _new_response_id(f"gemini-{name or 'tool'}")
+            args = function_call.get("args", {})
+            if not isinstance(args, dict):
+                args = {}
+            if name:
+                calls.append(ToolCall(call_id=call_id, name=name, arguments=args))
+        if text_parts or calls:
+            break
+    return LLMTurn(
+        response_id=_new_response_id("gemini-turn"),
+        text="\n".join(text_parts).strip(),
+        tool_calls=calls,
+    )
+
+
 def _extract_output_text(payload: dict[str, Any]) -> str:
     direct = payload.get("output_text")
     if isinstance(direct, str) and direct.strip():
@@ -309,6 +509,35 @@ def _safe_json_loads(raw: Any) -> Any:
         return json.loads(raw)
     except Exception:
         return {}
+
+
+def _extract_gemini_candidate_content(payload: dict[str, Any]) -> dict[str, Any] | None:
+    for candidate in payload.get("candidates", []):
+        content = candidate.get("content")
+        if isinstance(content, dict):
+            role = str(content.get("role", "")).strip() or "model"
+            parts = content.get("parts", [])
+            if isinstance(parts, list) and parts:
+                return {"role": role, "parts": parts}
+    return None
+
+
+def _normalize_gemini_tool_response(output: str) -> dict[str, Any]:
+    parsed = _safe_json_loads(output)
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list):
+        return {"items": parsed}
+    return {"result": output}
+
+
+def _new_response_id(prefix: str) -> str:
+    return f"{prefix}-{uuid4().hex[:10]}"
+
+
+def _emit_stream_from_text(text: str, text_stream: Callable[[str], None]) -> None:
+    for token in _chunk_text(text):
+        text_stream(token)
 
 
 async def _stream_openai_turn(
