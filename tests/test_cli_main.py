@@ -88,7 +88,11 @@ from lazysre.cli.main import (
     _safe_run_command,
     _should_launch_assistant,
 )
-from lazysre.cli.llm import AnthropicMessagesLLM, GeminiFunctionCallingLLM
+from lazysre.cli.llm import (
+    AnthropicMessagesLLM,
+    GeminiFunctionCallingLLM,
+    OpenAICompatibleFunctionCallingLLM,
+)
 from lazysre.cli.fix_mode import FixPlan
 from lazysre.cli.runbook import find_runbook
 from lazysre.cli.secrets import SecretStore
@@ -215,6 +219,9 @@ def test_resolve_default_provider_prefers_available_real_key(tmp_path: Path, mon
     monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
     monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
     monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "deepseek_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "qwen_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "kimi_api_key", "", raising=False)
     assert _resolve_default_provider(secrets_file=secrets_path) == "gemini"
 
     monkeypatch.setattr(settings, "anthropic_api_key", "ant-key-123", raising=False)
@@ -226,10 +233,14 @@ def test_build_cli_llm_supports_anthropic_and_gemini(tmp_path: Path, monkeypatch
     store = SecretStore(secrets_path)
     store.set_api_key("anthropic", "ant-key-123")
     store.set_api_key("gemini", "gem-key-123")
+    store.set_api_key("deepseek", "ds-key-123")
 
     monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
     monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
     monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "deepseek_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "qwen_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "kimi_api_key", "", raising=False)
 
     provider1, model1, llm1 = _build_cli_llm(
         provider="anthropic",
@@ -249,21 +260,35 @@ def test_build_cli_llm_supports_anthropic_and_gemini(tmp_path: Path, monkeypatch
     assert model2.startswith("gemini-")
     assert isinstance(llm2, GeminiFunctionCallingLLM)
 
+    provider3, model3, llm3 = _build_cli_llm(
+        provider="deepseek",
+        model="gpt-5.4-mini",
+        secrets_file=secrets_path,
+    )
+    assert provider3 == "deepseek"
+    assert model3 == "deepseek-chat"
+    assert isinstance(llm3, OpenAICompatibleFunctionCallingLLM)
+
 
 def test_build_provider_setup_checks_reports_multiple_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     secrets_path = tmp_path / "secrets.json"
     store = SecretStore(secrets_path)
     store.set_api_key("gemini", "gem-key-123")
+    store.set_api_key("kimi", "kimi-key-123")
 
     monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
     monkeypatch.setattr(settings, "anthropic_api_key", "ant-key-456", raising=False)
     monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "deepseek_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "qwen_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "kimi_api_key", "", raising=False)
 
     checks = _build_provider_setup_checks(secrets_file=secrets_path)
     assert checks["anthropic"]["ok"] is True
     assert "env" in str(checks["anthropic"]["detail"])
     assert checks["gemini"]["ok"] is True
     assert "secrets" in str(checks["gemini"]["detail"])
+    assert checks["kimi"]["ok"] is True
     assert checks["openai"]["ok"] is False
 
 

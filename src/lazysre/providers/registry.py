@@ -10,6 +10,8 @@ class ProviderSpec:
     secret_key: str
     default_model: str
     env_names: tuple[str, ...]
+    base_url: str | None = None
+    compatible: bool = False
 
 
 PROVIDER_SPECS: dict[str, ProviderSpec] = {
@@ -34,6 +36,33 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
         default_model="gemini-2.5-flash",
         env_names=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     ),
+    "deepseek": ProviderSpec(
+        name="deepseek",
+        label="DeepSeek",
+        secret_key="deepseek_api_key",
+        default_model="deepseek-chat",
+        env_names=("DEEPSEEK_API_KEY",),
+        base_url="https://api.deepseek.com",
+        compatible=True,
+    ),
+    "qwen": ProviderSpec(
+        name="qwen",
+        label="Qwen",
+        secret_key="qwen_api_key",
+        default_model="qwen-plus",
+        env_names=("DASHSCOPE_API_KEY", "QWEN_API_KEY"),
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        compatible=True,
+    ),
+    "kimi": ProviderSpec(
+        name="kimi",
+        label="Kimi",
+        secret_key="kimi_api_key",
+        default_model="kimi-k2.5",
+        env_names=("MOONSHOT_API_KEY", "KIMI_API_KEY"),
+        base_url="https://api.moonshot.ai/v1",
+        compatible=True,
+    ),
 }
 
 SUPPORTED_PROVIDER_NAMES: tuple[str, ...] = ("mock", *tuple(PROVIDER_SPECS.keys()))
@@ -45,7 +74,7 @@ def get_provider_spec(name: str) -> ProviderSpec:
 
 
 def provider_mode_help_text() -> str:
-    return "auto|mock|openai|anthropic|gemini"
+    return "auto|mock|openai|anthropic|gemini|deepseek|qwen|kimi"
 
 
 def provider_mode_error_text() -> str:

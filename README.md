@@ -23,14 +23,19 @@ lsre
 python -m lazysre
 # 安装环境自检
 lazysre install-doctor
-# 首次启动向导（安装检查+OpenAI Key+目标连通性）
+# 首次启动向导（安装检查+LLM Key+目标连通性）
 lazysre setup
 # 交互式初始化（更像 Gemini/Claude：一步步填完即可）
 lazysre init
 # 一键快速就绪（推荐，自动修复常见问题）
 lazysre quickstart
-# 本地保存 OpenAI Key（后续无需每次 export）
-lazysre login
+# 本地保存模型 Key（后续无需每次 export）
+lazysre login --provider openai
+lazysre login --provider anthropic
+lazysre login --provider gemini
+lazysre login --provider deepseek
+lazysre login --provider qwen
+lazysre login --provider kimi
 ```
 
 说明：`npm install -g lazysre` 安装的是跨平台启动器；首次运行会自动检查并安装 Python 版 LazySRE 内核。
@@ -38,7 +43,29 @@ lazysre login
 - `LAZYSRE_PIP_INDEX_URL`：指定 pip 镜像源
 - `LAZYSRE_PIP_EXTRA_INDEX_URL`：额外镜像源
 - `LAZYSRE_PIP_TRUSTED_HOST`：可信 host（逗号分隔）
+- `LAZYSRE_PIP_SOURCE`：指定安装源（支持本地目录、tgz、git URL）
 - `LAZYSRE_NO_AUTO_INSTALL=1`：禁止启动器自动安装 Python 内核
+
+国内服务器说明：`scripts/install_user.sh` 默认使用阿里云 PyPI 镜像安装 Python 依赖；如果服务器不能访问 GitHub，可先在本地打包上传源码，再执行 `LAZYSRE_PIP_SOURCE=/opt/lazysre-src scripts/install_user.sh`。
+
+## 支持的模型 Provider
+
+```bash
+# 自动选择已配置的真实 Provider，否则回退 mock
+lazysre --provider auto chat
+
+# 原生 Provider
+lazysre --provider openai chat
+lazysre --provider anthropic chat
+lazysre --provider gemini chat
+
+# OpenAI-compatible Provider
+lazysre --provider deepseek chat
+lazysre --provider qwen chat
+lazysre --provider kimi chat
+```
+
+可用环境变量：`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY`、`GOOGLE_API_KEY`、`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`QWEN_API_KEY`、`MOONSHOT_API_KEY`、`KIMI_API_KEY`。
 
 ## npm 发布（维护者）
 
@@ -114,9 +141,10 @@ lsre doctor --auto-fix --write-backup
 lsre doctor --strict
 # 安装/发布环境自检（python/node/npm/gh）
 lsre install-doctor
-# 本地登录（保存 OpenAI Key 到 ~/.lazysre/secrets.json）
-lsre login
-lsre logout
+# 本地登录（保存模型 Key 到 ~/.lazysre/secrets.json）
+lsre login --provider openai
+lsre login --provider deepseek
+lsre logout --provider deepseek
 # 交互式初始化（推荐第一次使用）
 lsre init
 # 一键快速就绪（自动补齐配置 + 自动修复 + 连通性检查）

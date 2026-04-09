@@ -26,6 +26,15 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     )
+    deepseek_api_key: str = Field(default="", validation_alias="DEEPSEEK_API_KEY")
+    qwen_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("DASHSCOPE_API_KEY", "QWEN_API_KEY"),
+    )
+    kimi_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("MOONSHOT_API_KEY", "KIMI_API_KEY"),
+    )
 
 
 settings = Settings()

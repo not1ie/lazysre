@@ -32,6 +32,7 @@ from lazysre.cli.llm import (
     AnthropicMessagesLLM,
     GeminiFunctionCallingLLM,
     MockFunctionCallingLLM,
+    OpenAICompatibleFunctionCallingLLM,
     OpenAIResponsesLLM,
 )
 from lazysre.cli.permissions import ToolPermissionContext
@@ -69,6 +70,7 @@ from lazysre.cli.tools.marketplace import (
 from lazysre.config import settings
 from lazysre.providers.registry import (
     PROVIDER_SPECS,
+    get_provider_spec,
     provider_mode_error_text,
     provider_mode_help_text,
     resolve_model_name,
@@ -1250,7 +1252,7 @@ async def _dispatch(
     memory_context: str = "",
 ):
     mode = (provider or "auto").strip().lower()
-    if mode not in {"auto", "mock", "openai", "anthropic", "gemini"}:
+    if mode not in {"auto", "mock", *PROVIDER_SPECS.keys()}:
         raise typer.BadParameter(provider_mode_error_text())
     ap_mode = (approval_mode or "balanced").strip().lower()
     if ap_mode not in {"strict", "balanced", "permissive"}:
@@ -3542,6 +3544,12 @@ def _build_provider_setup_checks(*, secrets_file: Path | None = None) -> dict[st
             env_present = bool(str(settings.anthropic_api_key or "").strip())
         elif provider == "gemini":
             env_present = bool(str(settings.gemini_api_key or "").strip())
+        elif provider == "deepseek":
+            env_present = bool(str(settings.deepseek_api_key or "").strip())
+        elif provider == "qwen":
+            env_present = bool(str(settings.qwen_api_key or "").strip())
+        elif provider == "kimi":
+            env_present = bool(str(settings.kimi_api_key or "").strip())
         source = "env" if env_present else ("secrets" if raw else "unset")
         checks[provider] = {
             "name": f"runtime.{spec.secret_key}",
@@ -3718,6 +3726,18 @@ def _resolve_provider_api_key(provider: str, *, secrets_file: Path | None = None
         env_key = str(settings.gemini_api_key or "").strip()
         if env_key:
             return env_key
+    elif normalized == "deepseek":
+        env_key = str(settings.deepseek_api_key or "").strip()
+        if env_key:
+            return env_key
+    elif normalized == "qwen":
+        env_key = str(settings.qwen_api_key or "").strip()
+        if env_key:
+            return env_key
+    elif normalized == "kimi":
+        env_key = str(settings.kimi_api_key or "").strip()
+        if env_key:
+            return env_key
     elif normalized == "mock":
         return ""
 
@@ -3731,7 +3751,7 @@ def _resolve_openai_api_key(*, secrets_file: Path | None = None) -> str:
 
 
 def _resolve_default_provider(*, secrets_file: Path | None = None) -> str:
-    for candidate in ("openai", "anthropic", "gemini"):
+    for candidate in PROVIDER_SPECS:
         if _resolve_provider_api_key(candidate, secrets_file=secrets_file):
             return candidate
     return "mock"
@@ -3765,6 +3785,17 @@ def _build_cli_llm(
         return mode, resolved_model, AnthropicMessagesLLM(api_key)
     if mode == "gemini":
         return mode, resolved_model, GeminiFunctionCallingLLM(api_key)
+    spec = get_provider_spec(mode)
+    if spec.compatible:
+        return (
+            mode,
+            resolved_model,
+            OpenAICompatibleFunctionCallingLLM(
+                api_key=api_key,
+                provider=mode,
+                base_url=spec.base_url or "",
+            ),
+        )
     raise typer.BadParameter(provider_mode_error_text())
 
 
@@ -3795,7 +3826,7 @@ def _render_setup_report(report: dict[str, object]) -> None:
         provider_table.add_column("Provider", style="cyan")
         provider_table.add_column("Status", style="white")
         provider_table.add_column("Detail", style="white")
-        for provider in ("openai", "anthropic", "gemini"):
+        for provider in PROVIDER_SPECS:
             row = providers.get(provider)
             if not isinstance(row, dict):
                 continue
@@ -4386,7 +4417,7 @@ def _render_chat_short_help() -> None:
         "- /undo: 回滚最近一次修复计划",
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
         "- /quickstart: 一键自动修复环境并完成快速就绪",
-        "- /login [--provider openai|anthropic|gemini]: 保存对应 Provider API Key",
+        f"- /login [--provider {provider_mode_help_text()}]: 保存对应 Provider API Key",
         "- /setup [--dry-run-probe]: 首次启动向导（安装检查+目标探测+LLM Key）",
         "- /status: 查看当前会话、目标配置、最近修复计划",
         "- /status probe: 追加目标探测摘要（dry-run）",
@@ -7334,7 +7365,7 @@ def _generate_impact_statement(
         "Output one sentence only."
     )
     mode = (provider or "auto").strip().lower()
-    if mode not in {"auto", "openai", "anthropic", "gemini"}:
+    if mode not in {"auto", *PROVIDER_SPECS.keys()}:
         # deterministic fallback for local/mock mode
         scope = str(report.get("impact_scope", "service"))
         radius = str(report.get("blast_radius", "single target"))

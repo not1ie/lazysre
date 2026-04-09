@@ -247,6 +247,90 @@ class GeminiFunctionCallingLLM(FunctionCallingLLM):
         return turn
 
 
+class OpenAICompatibleFunctionCallingLLM(FunctionCallingLLM):
+    def __init__(self, *, api_key: str, provider: str, base_url: str) -> None:
+        self._api_key = api_key
+        self._provider = provider
+        self._base_url = base_url.rstrip("/")
+        self._messages: list[dict[str, Any]] = []
+        self._pending_tool_calls: dict[str, str] = {}
+
+    async def respond(
+        self,
+        *,
+        model: str,
+        tools: list[ToolSpec],
+        system_prompt: str,
+        user_input: str | None = None,
+        previous_response_id: str | None = None,
+        tool_outputs: list[ToolOutput] | None = None,
+        text_stream: Callable[[str], None] | None = None,
+    ) -> LLMTurn:
+        resolved_model = resolve_model_name(self._provider, model)
+        messages = list(self._messages)
+        if previous_response_id:
+            for item in (tool_outputs or []):
+                tool_name = self._pending_tool_calls.get(item.call_id, "")
+                if not tool_name:
+                    continue
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": item.call_id,
+                        "name": tool_name,
+                        "content": item.output,
+                    }
+                )
+        else:
+            messages.extend(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_input or ""},
+                ]
+            )
+
+        payload: dict[str, Any] = {
+            "model": resolved_model,
+            "messages": messages,
+            "temperature": 0.2,
+        }
+        if tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": item.name,
+                        "description": item.description,
+                        "parameters": item.parameters,
+                    },
+                }
+                for item in tools
+            ]
+            payload["tool_choice"] = "auto"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                f"{self._base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        turn = _parse_openai_compatible_turn(data, provider=self._provider)
+        assistant_message = _extract_openai_compatible_assistant_message(data)
+        if assistant_message:
+            messages.append(assistant_message)
+        self._messages = messages
+        self._pending_tool_calls = {item.call_id: item.name for item in turn.tool_calls}
+        if text_stream and turn.text:
+            _emit_stream_from_text(turn.text, text_stream)
+        return turn
+
+
 class MockFunctionCallingLLM(FunctionCallingLLM):
     async def respond(
         self,
@@ -487,6 +571,32 @@ def _parse_gemini_turn(payload: dict[str, Any]) -> LLMTurn:
     )
 
 
+def _parse_openai_compatible_turn(payload: dict[str, Any], *, provider: str) -> LLMTurn:
+    choices = payload.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return LLMTurn(response_id=_new_response_id(f"{provider}-turn"), text="", tool_calls=[])
+
+    message = choices[0].get("message", {})
+    text = _extract_compatible_message_text(message)
+    calls: list[ToolCall] = []
+    for item in message.get("tool_calls", []):
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function", {})
+        name = str(function.get("name", "")).strip()
+        call_id = str(item.get("id", "")).strip() or _new_response_id(f"{provider}-{name or 'tool'}")
+        args = _safe_json_loads(function.get("arguments", "{}"))
+        if not isinstance(args, dict):
+            args = {}
+        if name:
+            calls.append(ToolCall(call_id=call_id, name=name, arguments=args))
+    return LLMTurn(
+        response_id=str(payload.get("id", "")) or _new_response_id(f"{provider}-turn"),
+        text=text,
+        tool_calls=calls,
+    )
+
+
 def _extract_output_text(payload: dict[str, Any]) -> str:
     direct = payload.get("output_text")
     if isinstance(direct, str) and direct.strip():
@@ -520,6 +630,34 @@ def _extract_gemini_candidate_content(payload: dict[str, Any]) -> dict[str, Any]
             if isinstance(parts, list) and parts:
                 return {"role": role, "parts": parts}
     return None
+
+
+def _extract_openai_compatible_assistant_message(payload: dict[str, Any]) -> dict[str, Any] | None:
+    choices = payload.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return None
+    message = choices[0].get("message", {})
+    if not isinstance(message, dict):
+        return None
+    assistant: dict[str, Any] = {"role": "assistant"}
+    if "content" in message:
+        assistant["content"] = message.get("content")
+    if isinstance(message.get("tool_calls"), list):
+        assistant["tool_calls"] = message["tool_calls"]
+    return assistant
+
+
+def _extract_compatible_message_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("text"):
+                chunks.append(str(item["text"]))
+        return "\n".join(chunks).strip()
+    return ""
 
 
 def _normalize_gemini_tool_response(output: str) -> dict[str, Any]:
