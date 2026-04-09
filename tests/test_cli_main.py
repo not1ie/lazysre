@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import lazysre.cli.main as cli_main
 from lazysre.cli.main import (
     _archive_report_for_git,
     _backup_target_profile,
@@ -15,6 +16,7 @@ from lazysre.cli.main import (
     _build_incident_report_payload,
     _compute_doctor_autofix,
     _collect_runtime_status,
+    _collect_environment_discovery,
     _default_report_output_path,
     _doctor_is_healthy,
     _extract_template_var_items_from_text,
@@ -50,6 +52,7 @@ from lazysre.cli.main import (
     _looks_like_low_risk_apply_request,
     _looks_like_quickstart_request,
     _looks_like_reset_request,
+    _looks_like_scan_request,
     _looks_like_report_request,
     _looks_like_target_show_request,
     _looks_like_target_update_request,
@@ -176,27 +179,30 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv3 = ["lsre", "install-doctor", "--json"]
     _rewrite_argv_for_default_run(argv3)
     assert argv3 == ["lsre", "install-doctor", "--json"]
-    argv4 = ["lsre", "setup", "--json"]
+    argv4 = ["lsre", "scan", "--json"]
     _rewrite_argv_for_default_run(argv4)
-    assert argv4 == ["lsre", "setup", "--json"]
-    argv5 = ["lsre", "template", "list"]
+    assert argv4 == ["lsre", "scan", "--json"]
+    argv5 = ["lsre", "setup", "--json"]
     _rewrite_argv_for_default_run(argv5)
-    assert argv5 == ["lsre", "template", "list"]
-    argv6 = ["lsre", "init"]
+    assert argv5 == ["lsre", "setup", "--json"]
+    argv6 = ["lsre", "template", "list"]
     _rewrite_argv_for_default_run(argv6)
-    assert argv6 == ["lsre", "init"]
-    argv7 = ["lsre", "login", "--api-key", "sk-xxx"]
+    assert argv6 == ["lsre", "template", "list"]
+    argv7 = ["lsre", "init"]
     _rewrite_argv_for_default_run(argv7)
-    assert argv7 == ["lsre", "login", "--api-key", "sk-xxx"]
-    argv8 = ["lsre", "quickstart", "--json"]
+    assert argv7 == ["lsre", "init"]
+    argv8 = ["lsre", "login", "--api-key", "sk-xxx"]
     _rewrite_argv_for_default_run(argv8)
-    assert argv8 == ["lsre", "quickstart", "--json"]
-    argv9 = ["lsre", "reset"]
+    assert argv8 == ["lsre", "login", "--api-key", "sk-xxx"]
+    argv9 = ["lsre", "quickstart", "--json"]
     _rewrite_argv_for_default_run(argv9)
-    assert argv9 == ["lsre", "reset"]
-    argv10 = ["lsre", "undo"]
+    assert argv9 == ["lsre", "quickstart", "--json"]
+    argv10 = ["lsre", "reset"]
     _rewrite_argv_for_default_run(argv10)
-    assert argv10 == ["lsre", "undo"]
+    assert argv10 == ["lsre", "reset"]
+    argv11 = ["lsre", "undo"]
+    _rewrite_argv_for_default_run(argv11)
+    assert argv11 == ["lsre", "undo"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -301,6 +307,7 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_init_request("请帮我初始化 lazysre")
     assert _looks_like_init_request("我要配置 OpenAI Key")
     assert _looks_like_status_request("帮我看下当前状态")
+    assert _looks_like_scan_request("自动检测当前环境并列出问题")
     assert _looks_like_doctor_request("做一次环境体检")
     assert _looks_like_install_doctor_request("做一下安装检查")
     assert _looks_like_report_request("导出复盘报告")
@@ -511,6 +518,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["login"]) is False
     assert _should_launch_assistant(["logout"]) is False
     assert _should_launch_assistant(["status"]) is False
+    assert _should_launch_assistant(["scan"]) is False
     assert _should_launch_assistant(["doctor"]) is False
     assert _should_launch_assistant(["install-doctor"]) is False
     assert _should_launch_assistant(["setup"]) is False
@@ -1045,3 +1053,63 @@ def test_collect_install_doctor_report_shape() -> None:
     names = {str(x.get("name", "")) for x in checks if isinstance(x, dict)}
     assert "runtime.python_version" in names
     assert "runtime.lazysre_import" in names
+
+
+def test_collect_environment_discovery_scans_without_k8s_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_which(name: str) -> str:
+        if name in {"docker", "kubectl", "curl"}:
+            return f"/usr/bin/{name}"
+        return ""
+
+    def fake_safe_run(command: list[str], *, timeout_sec: int) -> dict[str, object]:
+        tool = Path(command[0]).name
+        args = command[1:]
+        if tool == "docker" and args[:2] == ["version", "--format"]:
+            return {"ok": True, "stdout": "25.0.0", "stderr": "", "exit_code": 0}
+        if tool == "docker" and args[:1] == ["info"]:
+            return {"ok": True, "stdout": "active", "stderr": "", "exit_code": 0}
+        if tool == "docker" and args[:2] == ["ps", "-a"]:
+            return {"ok": True, "stdout": "old-api\tExited (1) 2 hours ago", "stderr": "", "exit_code": 0}
+        if tool == "docker" and args[:2] == ["service", "ls"]:
+            return {"ok": True, "stdout": "lazysre\t1/1\timage:latest", "stderr": "", "exit_code": 0}
+        if tool == "kubectl" and args[:2] == ["config", "current-context"]:
+            return {"ok": True, "stdout": "prod", "stderr": "", "exit_code": 0}
+        if tool == "kubectl" and args[:2] == ["get", "nodes"]:
+            return {"ok": True, "stdout": "node/node-1", "stderr": "", "exit_code": 0}
+        if tool == "kubectl" and args[:2] == ["get", "pods"]:
+            return {
+                "ok": True,
+                "stdout": "default web 1/1 Running 0 1d\nprod bad 0/1 CrashLoopBackOff 7 5m",
+                "stderr": "",
+                "exit_code": 0,
+            }
+        if tool == "kubectl" and args[:2] == ["get", "events"]:
+            return {"ok": True, "stdout": "prod 1m Warning BackOff pod/bad", "stderr": "", "exit_code": 0}
+        if tool == "curl":
+            return {"ok": True, "stdout": "Prometheus Server is Ready.", "stderr": "", "exit_code": 0}
+        return {"ok": False, "stdout": "", "stderr": "unexpected", "exit_code": 1}
+
+    monkeypatch.setattr(cli_main.shutil, "which", fake_which)
+    monkeypatch.setattr(cli_main, "_safe_run_command", fake_safe_run)
+    monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "deepseek_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "qwen_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "kimi_api_key", "", raising=False)
+    monkeypatch.setenv("TARGET_PROMETHEUS_URL", "http://prometheus:9090")
+
+    report = _collect_environment_discovery(timeout_sec=3, secrets_file=tmp_path / "secrets.json")
+
+    assert report["mode"] == "read-only/no-secret"
+    assert "docker-swarm" in report["usable_targets"]
+    assert "kubernetes" in report["usable_targets"]
+    assert "prometheus" in report["usable_targets"]
+    names = {str(x.get("name", "")) for x in report["checks"] if isinstance(x, dict)}
+    assert "docker.exited_containers" in names
+    assert "k8s.problem_pods" in names
+    assert "llm.provider_key" in names
+    assert any(str(x.get("name")) == "k8s.problem_pods" for x in report["issues"] if isinstance(x, dict))

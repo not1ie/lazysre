@@ -13,6 +13,23 @@ PIP_TRUSTED_HOST_VALUE="${LAZYSRE_PIP_TRUSTED_HOST:-${PIP_TRUSTED_HOST:-mirrors.
 echo "[lazysre] source: ${SOURCE}"
 echo "[lazysre] pip index: ${PIP_INDEX_URL_VALUE:-default}"
 
+run_post_install_scan() {
+  if [[ "${LAZYSRE_POST_INSTALL_SCAN:-1}" != "1" ]]; then
+    echo "[lazysre] post-install scan skipped (LAZYSRE_POST_INSTALL_SCAN=0)."
+    return
+  fi
+  echo "[lazysre] running zero-config environment scan..."
+  if command -v lazysre >/dev/null 2>&1; then
+    lazysre scan || true
+    return
+  fi
+  if [[ -x "${INSTALL_ROOT}/venv/bin/lazysre" ]]; then
+    "${INSTALL_ROOT}/venv/bin/lazysre" scan || true
+    return
+  fi
+  echo "[lazysre] scan skipped: lazysre is installed but not yet on PATH."
+}
+
 PIP_ARGS=()
 if [[ -n "${PIP_INDEX_URL_VALUE}" ]]; then
   PIP_ARGS+=("-i" "${PIP_INDEX_URL_VALUE}")
@@ -37,6 +54,7 @@ if command -v pipx >/dev/null 2>&1; then
   else
     pipx install --force "${SOURCE}"
   fi
+  run_post_install_scan
   echo "[lazysre] done. run: lazysre"
   exit 0
 fi
@@ -55,4 +73,5 @@ if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then
   echo "[lazysre] add this to your shell profile (~/.zshrc or ~/.bashrc):"
   echo "export PATH=\"${BIN_DIR}:\$PATH\""
 fi
+run_post_install_scan
 echo "[lazysre] done. run: lazysre"

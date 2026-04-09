@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from difflib import get_close_matches
 import json
+import os
 import re
 import shlex
 import shutil
@@ -254,6 +255,18 @@ def status(
     _render_status_snapshot(snapshot)
 
 
+@app.command("scan")
+def scan(
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Per-check timeout seconds.")] = 5,
+    as_json: Annotated[bool, typer.Option("--json", help="Print environment scan as JSON.")] = False,
+) -> None:
+    report = _collect_environment_discovery(timeout_sec=timeout_sec, secrets_file=None)
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_environment_discovery(report)
+
+
 @app.command("doctor")
 def doctor(
     ctx: typer.Context,
@@ -302,6 +315,7 @@ def doctor(
             write_backup=write_backup,
             audit_log=Path(str(options["audit_log"])),
             prompt_for_api_key=True,
+            provider=str(options["provider"]),
             secrets_file=None,
         )
         target = target_store.load()
@@ -3023,6 +3037,458 @@ def _collect_runtime_status(
     return snapshot
 
 
+def _collect_environment_discovery(
+    *,
+    timeout_sec: int = 5,
+    secrets_file: Path | None = None,
+) -> dict[str, object]:
+    per_check_timeout = max(1, min(int(timeout_sec or 5), 8))
+    checks: list[dict[str, object]] = []
+    discoveries: dict[str, object] = {}
+
+    checks.append(_doctor_python_check())
+
+    docker_path = shutil.which("docker") or ""
+    checks.append(_scan_binary_check("docker", docker_path, optional=True))
+    if docker_path:
+        docker_payload = _scan_docker_environment(docker_path, timeout_sec=per_check_timeout)
+        discoveries["docker"] = docker_payload.get("discovery", {})
+        checks.extend(list(docker_payload.get("checks", [])))
+    else:
+        discoveries["docker"] = {"available": False}
+
+    kubectl_path = shutil.which("kubectl") or ""
+    checks.append(_scan_binary_check("kubectl", kubectl_path, optional=True))
+    if kubectl_path:
+        k8s_payload = _scan_kubernetes_environment(kubectl_path, timeout_sec=per_check_timeout)
+        discoveries["kubernetes"] = k8s_payload.get("discovery", {})
+        checks.extend(list(k8s_payload.get("checks", [])))
+    else:
+        discoveries["kubernetes"] = {"available": False}
+
+    prometheus_payload = _scan_prometheus_environment(timeout_sec=per_check_timeout)
+    discoveries["prometheus"] = prometheus_payload.get("discovery", {})
+    checks.extend(list(prometheus_payload.get("checks", [])))
+
+    provider_payload = _scan_provider_environment(secrets_file=secrets_file)
+    discoveries["providers"] = provider_payload.get("discovery", {})
+    checks.extend(list(provider_payload.get("checks", [])))
+
+    issues = [
+        {
+            "name": str(item.get("name", "")),
+            "severity": str(item.get("severity", "")),
+            "detail": str(item.get("detail", "")),
+            "hint": str(item.get("hint", "")),
+        }
+        for item in checks
+        if str(item.get("severity", "")).lower() != "pass"
+    ]
+    summary = _summarize_doctor_checks(checks)
+    usable_targets = []
+    docker_discovery = discoveries.get("docker", {})
+    if isinstance(docker_discovery, dict) and bool(docker_discovery.get("reachable")):
+        usable_targets.append("docker")
+    if isinstance(docker_discovery, dict) and bool(docker_discovery.get("swarm_active")):
+        usable_targets.append("docker-swarm")
+    k8s_discovery = discoveries.get("kubernetes", {})
+    if isinstance(k8s_discovery, dict) and bool(k8s_discovery.get("reachable")):
+        usable_targets.append("kubernetes")
+    prometheus_discovery = discoveries.get("prometheus", {})
+    if isinstance(prometheus_discovery, dict) and bool(prometheus_discovery.get("reachable")):
+        usable_targets.append("prometheus")
+
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": "read-only/no-secret",
+        "timeout_sec": per_check_timeout,
+        "summary": summary,
+        "usable_targets": usable_targets,
+        "discoveries": discoveries,
+        "checks": checks,
+        "issues": issues,
+        "next_actions": _build_environment_scan_next_actions(checks, usable_targets),
+    }
+
+
+def _scan_binary_check(name: str, path: str, *, optional: bool) -> dict[str, object]:
+    ok = bool(path)
+    return {
+        "name": f"binary.{name}",
+        "ok": ok,
+        "severity": "pass" if ok else ("warn" if optional else "error"),
+        "detail": path or "(not found)",
+        "hint": "" if ok else f"如需纳管 {name}，请安装 {name} 并确保在 PATH 中可用",
+    }
+
+
+def _scan_docker_environment(docker_path: str, *, timeout_sec: int) -> dict[str, object]:
+    checks: list[dict[str, object]] = []
+    discovery: dict[str, object] = {"available": True, "reachable": False, "swarm_active": False}
+
+    version_probe = _safe_run_command([docker_path, "version", "--format", "{{.Server.Version}}"], timeout_sec=timeout_sec)
+    if bool(version_probe.get("ok")):
+        version = str(version_probe.get("stdout", "")).strip()
+        discovery["reachable"] = True
+        discovery["server_version"] = version
+        checks.append(_scan_check("docker.version", True, "pass", version or "reachable"))
+    else:
+        detail = _probe_detail(version_probe)
+        checks.append(
+            _scan_check(
+                "docker.version",
+                False,
+                "warn",
+                detail,
+                "Docker 已安装但当前用户无法访问 daemon，请检查 docker 是否运行以及 socket 权限",
+            )
+        )
+        return {"discovery": discovery, "checks": checks}
+
+    swarm_probe = _safe_run_command(
+        [docker_path, "info", "--format", "{{.Swarm.LocalNodeState}}"],
+        timeout_sec=timeout_sec,
+    )
+    swarm_state = str(swarm_probe.get("stdout", "")).strip().lower() if bool(swarm_probe.get("ok")) else ""
+    discovery["swarm_state"] = swarm_state or "unknown"
+    discovery["swarm_active"] = swarm_state == "active"
+    checks.append(
+        _scan_check(
+            "docker.swarm",
+            swarm_state == "active",
+            "pass" if swarm_state == "active" else "warn",
+            swarm_state or _probe_detail(swarm_probe),
+            "" if swarm_state == "active" else "未检测到 active Swarm；如果只是单机 Docker 可忽略",
+        )
+    )
+
+    exited_probe = _safe_run_command(
+        [
+            docker_path,
+            "ps",
+            "-a",
+            "--filter",
+            "status=exited",
+            "--format",
+            "{{.Names}}\t{{.Status}}",
+        ],
+        timeout_sec=timeout_sec,
+    )
+    exited_lines = _non_empty_lines(str(exited_probe.get("stdout", "")))
+    discovery["exited_containers"] = len(exited_lines)
+    checks.append(
+        _scan_check(
+            "docker.exited_containers",
+            bool(exited_probe.get("ok")) and len(exited_lines) == 0,
+            "pass" if bool(exited_probe.get("ok")) and len(exited_lines) == 0 else "warn",
+            "none" if not exited_lines else _preview_lines(exited_lines, limit=5),
+            "" if not exited_lines else "发现已退出容器，可用 docker logs <container> 查看原因",
+        )
+    )
+
+    if discovery["swarm_active"]:
+        service_probe = _safe_run_command(
+            [
+                docker_path,
+                "service",
+                "ls",
+                "--format",
+                "{{.Name}}\t{{.Replicas}}\t{{.Image}}",
+            ],
+            timeout_sec=timeout_sec,
+        )
+        service_lines = _non_empty_lines(str(service_probe.get("stdout", "")))
+        discovery["swarm_services"] = len(service_lines)
+        checks.append(
+            _scan_check(
+                "docker.swarm_services",
+                bool(service_probe.get("ok")),
+                "pass" if bool(service_probe.get("ok")) else "warn",
+                "none" if not service_lines else _preview_lines(service_lines, limit=6),
+                "" if bool(service_probe.get("ok")) else "无法列出 Swarm service，请确认当前节点/权限",
+            )
+        )
+    return {"discovery": discovery, "checks": checks}
+
+
+def _scan_kubernetes_environment(kubectl_path: str, *, timeout_sec: int) -> dict[str, object]:
+    checks: list[dict[str, object]] = []
+    discovery: dict[str, object] = {"available": True, "reachable": False}
+
+    context_probe = _safe_run_command([kubectl_path, "config", "current-context"], timeout_sec=timeout_sec)
+    context_name = str(context_probe.get("stdout", "")).strip() if bool(context_probe.get("ok")) else ""
+    discovery["context"] = context_name
+    checks.append(
+        _scan_check(
+            "k8s.current_context",
+            bool(context_name),
+            "pass" if context_name else "warn",
+            context_name or _probe_detail(context_probe),
+            "" if context_name else "未发现 kubeconfig context；无需手填 token，配置 kubeconfig 后 LazySRE 会自动读取",
+        )
+    )
+    if not context_name:
+        return {"discovery": discovery, "checks": checks}
+
+    nodes_probe = _safe_run_command(
+        [kubectl_path, "get", "nodes", "--request-timeout=5s", "-o", "name"],
+        timeout_sec=timeout_sec,
+    )
+    node_lines = _non_empty_lines(str(nodes_probe.get("stdout", "")))
+    discovery["reachable"] = bool(nodes_probe.get("ok"))
+    discovery["nodes"] = len(node_lines)
+    checks.append(
+        _scan_check(
+            "k8s.nodes",
+            bool(nodes_probe.get("ok")),
+            "pass" if bool(nodes_probe.get("ok")) else "warn",
+            f"nodes={len(node_lines)}" if bool(nodes_probe.get("ok")) else _probe_detail(nodes_probe),
+            "" if bool(nodes_probe.get("ok")) else "kubectl 无法访问集群，请检查 kubeconfig、网络或 RBAC 权限",
+        )
+    )
+
+    pods_probe = _safe_run_command(
+        [kubectl_path, "get", "pods", "-A", "--no-headers", "--request-timeout=5s"],
+        timeout_sec=timeout_sec,
+    )
+    pod_lines = _non_empty_lines(str(pods_probe.get("stdout", "")))
+    problem_pods = _extract_problem_pod_lines(pod_lines)
+    discovery["pods"] = len(pod_lines)
+    discovery["problem_pods"] = len(problem_pods)
+    if bool(pods_probe.get("ok")):
+        checks.append(
+            _scan_check(
+                "k8s.problem_pods",
+                len(problem_pods) == 0,
+                "pass" if len(problem_pods) == 0 else "warn",
+                "none" if not problem_pods else _preview_lines(problem_pods, limit=6),
+                "" if not problem_pods else "发现异常 Pod，可直接说：帮我排查这些异常 Pod",
+            )
+        )
+    else:
+        checks.append(
+            _scan_check(
+                "k8s.problem_pods",
+                False,
+                "warn",
+                _probe_detail(pods_probe),
+                "无法列出 Pod，请检查 RBAC 是否允许 list pods",
+            )
+        )
+
+    events_probe = _safe_run_command(
+        [
+            kubectl_path,
+            "get",
+            "events",
+            "-A",
+            "--field-selector",
+            "type=Warning",
+            "--sort-by=.lastTimestamp",
+            "--no-headers",
+            "--request-timeout=5s",
+        ],
+        timeout_sec=timeout_sec,
+    )
+    event_lines = _non_empty_lines(str(events_probe.get("stdout", "")))
+    recent_warnings = event_lines[-6:]
+    discovery["warning_events"] = len(event_lines)
+    if bool(events_probe.get("ok")):
+        checks.append(
+            _scan_check(
+                "k8s.warning_events",
+                len(recent_warnings) == 0,
+                "pass" if len(recent_warnings) == 0 else "warn",
+                "none" if not recent_warnings else _preview_lines(recent_warnings, limit=6),
+                "" if not recent_warnings else "发现 Warning Events，可直接说：分析最近的 K8s Warning Events",
+            )
+        )
+    else:
+        checks.append(
+            _scan_check(
+                "k8s.warning_events",
+                False,
+                "warn",
+                _probe_detail(events_probe),
+                "无法读取 Events；不影响 Docker/Swarm 体检，K8s 诊断需要相应 RBAC",
+            )
+        )
+    return {"discovery": discovery, "checks": checks}
+
+
+def _scan_prometheus_environment(*, timeout_sec: int) -> dict[str, object]:
+    checks: list[dict[str, object]] = []
+    discovery: dict[str, object] = {"reachable": False, "url": ""}
+    curl_path = shutil.which("curl") or ""
+    checks.append(_scan_binary_check("curl", curl_path, optional=True))
+    if not curl_path:
+        return {"discovery": discovery, "checks": checks}
+    candidates = _prometheus_candidate_urls()
+    discovery["candidates"] = candidates
+    last_detail = ""
+    for url in candidates:
+        endpoint = f"{url.rstrip('/')}/-/ready"
+        probe = _safe_run_command(
+            [curl_path, "-fsS", "--max-time", str(max(1, min(timeout_sec, 3))), endpoint],
+            timeout_sec=max(2, min(timeout_sec + 1, 5)),
+        )
+        if bool(probe.get("ok")):
+            discovery["reachable"] = True
+            discovery["url"] = url
+            checks.append(_scan_check("prometheus.ready", True, "pass", url))
+            return {"discovery": discovery, "checks": checks}
+        last_detail = _probe_detail(probe)
+    checks.append(
+        _scan_check(
+            "prometheus.ready",
+            False,
+            "warn",
+            last_detail or f"not reachable: {', '.join(candidates)}",
+            "如有 Prometheus，可设置 TARGET_PROMETHEUS_URL 或执行 lsre target set --prometheus-url <url>",
+        )
+    )
+    return {"discovery": discovery, "checks": checks}
+
+
+def _scan_provider_environment(*, secrets_file: Path | None) -> dict[str, object]:
+    checks: list[dict[str, object]] = []
+    provider_checks = _build_provider_setup_checks(secrets_file=secrets_file)
+    configured = [
+        str(row.get("provider", name))
+        for name, row in provider_checks.items()
+        if isinstance(row, dict) and bool(row.get("ok"))
+    ]
+    checks.append(
+        _scan_check(
+            "llm.provider_key",
+            bool(configured),
+            "pass" if configured else "warn",
+            ", ".join(configured) if configured else "(unset)",
+            "" if configured else "环境扫描不需要 Key；需要真实 AI 诊断时执行 lsre login --provider openai（或 anthropic/gemini/deepseek/qwen/kimi）",
+        )
+    )
+    return {
+        "discovery": {
+            "configured": configured,
+            "available_providers": list(PROVIDER_SPECS.keys()),
+        },
+        "checks": checks,
+    }
+
+
+def _scan_check(
+    name: str,
+    ok: bool,
+    severity: str,
+    detail: str,
+    hint: str = "",
+) -> dict[str, object]:
+    return {
+        "name": name,
+        "ok": ok,
+        "severity": severity,
+        "detail": str(detail or "")[:500],
+        "hint": hint,
+    }
+
+
+def _probe_detail(probe: dict[str, object]) -> str:
+    text = str(probe.get("stdout", "") or probe.get("stderr", "") or "").strip()
+    if not text:
+        text = f"exit_code={probe.get('exit_code', '-')}"
+    return text[:500]
+
+
+def _non_empty_lines(text: str) -> list[str]:
+    return [line.strip() for line in str(text or "").splitlines() if line.strip()]
+
+
+def _preview_lines(lines: list[str], *, limit: int) -> str:
+    preview = lines[: max(1, limit)]
+    suffix = "" if len(lines) <= limit else f"\n... +{len(lines) - limit} more"
+    return "\n".join(preview) + suffix
+
+
+def _extract_problem_pod_lines(lines: list[str]) -> list[str]:
+    problems: list[str] = []
+    healthy_statuses = {"running", "completed", "succeeded"}
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        namespace, name, ready, status = parts[:4]
+        restarts = parts[4] if len(parts) > 4 else "0"
+        restart_count = 0
+        match = re.match(r"(\d+)", restarts)
+        if match:
+            restart_count = int(match.group(1))
+        if status.lower() not in healthy_statuses or restart_count > 0:
+            problems.append(f"{namespace}/{name} status={status} ready={ready} restarts={restarts}")
+    return problems
+
+
+def _prometheus_candidate_urls() -> list[str]:
+    candidates: list[str] = []
+    for raw in (
+        os.environ.get("TARGET_PROMETHEUS_URL", ""),
+        os.environ.get("PROMETHEUS_URL", ""),
+        settings.target_prometheus_url,
+        "http://127.0.0.1:9090",
+        "http://localhost:9090",
+    ):
+        url = str(raw or "").strip().rstrip("/")
+        if url and url not in candidates:
+            candidates.append(url)
+    return candidates
+
+
+def _build_environment_scan_next_actions(checks: list[dict[str, object]], usable_targets: list[str]) -> list[str]:
+    actions: list[str] = []
+    if usable_targets:
+        actions.append(f"可直接开始自然语言诊断：lazysre \"检查 {'/'.join(usable_targets)} 当前问题\"")
+    else:
+        actions.append("未发现可直接访问的运维目标；建议先确认 docker daemon 或 kubectl kubeconfig 是否可用")
+    for item in checks:
+        if str(item.get("severity", "")).lower() == "pass":
+            continue
+        hint = str(item.get("hint", "")).strip()
+        if hint and hint not in actions:
+            actions.append(hint)
+    return actions[:8]
+
+
+def _render_environment_discovery(report: dict[str, object]) -> None:
+    if not (_console and Table):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    summary = report.get("summary", {})
+    targets = report.get("usable_targets", [])
+    target_text = ", ".join(str(x) for x in targets) if isinstance(targets, list) and targets else "none"
+    summary_text = (
+        f"mode={report.get('mode', 'read-only')} usable_targets={target_text} "
+        f"pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} error={summary.get('error', 0)}"
+    )
+    if Panel:
+        _console.print(Panel(summary_text, title="Environment Scan", border_style="cyan"))
+    table = Table(title="Auto Discovery Checks")
+    table.add_column("Check", style="cyan")
+    table.add_column("Severity", style="white", no_wrap=True)
+    table.add_column("Detail", style="white")
+    table.add_column("Hint", style="yellow")
+    for raw in report.get("checks", []):
+        item = raw if isinstance(raw, dict) else {}
+        table.add_row(
+            str(item.get("name", "-")),
+            str(item.get("severity", "-")).upper(),
+            str(item.get("detail", "-"))[:180],
+            str(item.get("hint", ""))[:180],
+        )
+    _console.print(table)
+    actions = report.get("next_actions", [])
+    if isinstance(actions, list) and actions and Panel:
+        _console.print(Panel("\n".join(f"- {item}" for item in actions), title="Next Actions", border_style="green"))
+
+
 def _default_memory_db_path() -> Path:
     return Path.home() / ".lazysre" / "history_db"
 
@@ -3615,7 +4081,7 @@ def _show_first_run_setup_hint_once() -> None:
     marker = Path(settings.data_dir) / "lsre-onboarding.json"
     if marker.exists():
         return
-    typer.echo("首次使用建议运行 /quickstart 一键就绪（或 /init 交互引导）。")
+    typer.echo("首次使用可先运行 /scan 自动体检；需要补齐配置时再用 /quickstart 或 /init。")
 
 
 def _chat_state_file() -> Path:
@@ -4406,6 +4872,7 @@ def _render_chat_short_help() -> None:
     lines = [
         "LazySRE Chat 快捷命令",
         "- /help: 查看帮助",
+        "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
@@ -4469,6 +4936,7 @@ def _normalize_natural_language_text(text: str) -> str:
         (r"\brunbok\b", "runbook"),
         (r"\baprove\b", "approve"),
         (r"\bmemroy\b", "memory"),
+        (r"\bsacn\b", "scan"),
     ]
     for pattern, replacement in replacements:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
@@ -4497,6 +4965,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "runbok": "runbook",
         "aprove": "approve",
         "memroy": "memory",
+        "sacn": "scan",
         "hepl": "help",
     }
     known = [
@@ -4509,6 +4978,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "login",
         "init",
         "quickstart",
+        "scan",
         "setup",
         "status",
         "doctor",
@@ -4546,7 +5016,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     typer.echo("LazySRE 已启动，直接说需求即可（输入 exit/quit 退出）。")
     typer.echo("示例：1) 帮我排查 payment 延迟 2) 一键修复 CrashLoopBackOff")
     typer.echo("不需要记命令，直接用自然语言说你想做什么。")
-    typer.echo("快速上手：检查状态 / 修复环境 / 看审批队列 / 保存当前为 prod 并切换")
+    typer.echo("快速上手：扫描环境 / 检查状态 / 修复环境 / 看审批队列 / 保存当前为 prod 并切换")
     _maybe_auto_bootstrap_on_first_chat(options)
     _maybe_offer_one_click_env_fix(options)
     runtime_execute = _load_chat_runtime_state(bool(options["execute"]))
@@ -4589,6 +5059,13 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower() in {"/context", "/ctx"}:
             _render_context_snapshot(options, execute_mode=runtime_execute)
+            continue
+        if text.lower().startswith("/scan"):
+            report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
+            if _console:
+                _render_environment_discovery(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
             continue
         if text.lower().startswith("/mode "):
             tail = text[len("/mode ") :].strip().lower()
@@ -5177,6 +5654,13 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             reset_session=False,
             session_file=str(options["session_file"]),
         )
+        return True
+    if _looks_like_scan_request(text):
+        report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
+        if _console:
+            _render_environment_discovery(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return True
     if _looks_like_quickstart_request(text):
         report = _run_quickstart(
@@ -6956,6 +7440,25 @@ def _looks_like_status_request(text: str) -> bool:
     return any(k in lowered for k in keywords)
 
 
+def _looks_like_scan_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "扫描环境",
+        "自动扫描",
+        "自动检测环境",
+        "检测当前环境",
+        "看看当前环境",
+        "发现当前环境",
+        "列出当前环境问题",
+        "scan environment",
+        "env scan",
+        "environment scan",
+    )
+    return any(k in lowered for k in keywords)
+
+
 def _looks_like_quickstart_request(text: str) -> bool:
     lowered = text.lower().strip()
     if not lowered:
@@ -7429,6 +7932,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "fix",
         "approve",
         "status",
+        "scan",
         "doctor",
         "install-doctor",
         "setup",
@@ -7486,6 +7990,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "fix",
         "approve",
         "status",
+        "scan",
         "doctor",
         "install-doctor",
         "setup",
