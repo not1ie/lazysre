@@ -133,6 +133,8 @@ from lazysre.cli.main import (
     _infer_verification_commands,
     _looks_like_remediate_request,
     _render_closed_loop_report_markdown,
+    _run_closed_loop_execution,
+    _safe_run_ssh_command,
     _safe_run_command,
     _should_launch_assistant,
 )
@@ -732,6 +734,102 @@ def test_closed_loop_report_markdown_includes_commands() -> None:
     assert "Closed-loop Remediation Report" in markdown
     assert "docker service update --force api" in markdown
     assert "docker service rollback api" in markdown
+
+
+def test_closed_loop_report_markdown_includes_remote_target() -> None:
+    markdown = _render_closed_loop_report_markdown(
+        {
+            "generated_at_utc": "2026-04-09T00:00:00Z",
+            "objective": "repair remote api",
+            "mode": "execute",
+            "remote_target": "root@192.168.10.101",
+            "ok": True,
+            "next_step": "watch",
+            "observation": {},
+            "plan": {},
+            "execution": {},
+        }
+    )
+
+    assert "Remote Target: `root@192.168.10.101`" in markdown
+
+
+def test_remote_closed_loop_execution_uses_ssh_for_all_stages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_ssh(target: str, remote_command: str, *, timeout_sec: int) -> dict[str, object]:
+        calls.append((target, remote_command))
+        return {"ok": True, "stdout": "ok", "stderr": "", "exit_code": 0}
+
+    monkeypatch.setattr(cli_main, "_safe_run_ssh_command", fake_ssh)
+    monkeypatch.setattr(cli_main, "_generate_impact_statement", lambda **_: "impact")
+    monkeypatch.setattr(cli_main.typer, "confirm", lambda *_, **__: True)
+
+    result = _run_closed_loop_execution(
+        diagnose_commands=["docker service ps api --no-trunc"],
+        plan=FixPlan(
+            apply_commands=["docker service update --force api"],
+            rollback_commands=["docker service rollback api"],
+        ),
+        verify_commands=["docker service ps api --no-trunc"],
+        apply=True,
+        verify=True,
+        rollback_on_failure=False,
+        max_apply_steps=3,
+        execute=True,
+        approval_mode="balanced",
+        audit_log=str(tmp_path / "audit.jsonl"),
+        allow_high_risk=True,
+        auto_approve_low_risk=True,
+        model="mock",
+        provider="mock",
+        remote_target="root@192.168.10.101",
+    )
+
+    assert result["ok"] is True
+    assert result["diagnose"]["executed"] == 1
+    assert result["apply"]["executed"] == 1
+    assert result["verify"]["executed"] == 1
+    assert calls == [
+        ("root@192.168.10.101", "docker service ps api --no-trunc"),
+        ("root@192.168.10.101", "docker service update --force api"),
+        ("root@192.168.10.101", "docker service ps api --no-trunc"),
+    ]
+
+
+def test_safe_run_ssh_command_ignores_user_config_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run(command: list[str], *, timeout_sec: int) -> dict[str, object]:
+        seen.append(command)
+        return {"ok": True, "stdout": "ok", "stderr": "", "exit_code": 0}
+
+    monkeypatch.delenv("LAZYSRE_SSH_CONFIG", raising=False)
+    monkeypatch.setattr(cli_main, "_safe_run_command", fake_run)
+
+    result = _safe_run_ssh_command("root@192.168.10.101", "docker version", timeout_sec=3)
+
+    assert result["ok"] is True
+    assert seen
+    assert seen[0][0:3] == ["ssh", "-F", "/dev/null"]
+
+
+def test_safe_run_ssh_command_can_use_default_user_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run(command: list[str], *, timeout_sec: int) -> dict[str, object]:
+        seen.append(command)
+        return {"ok": True, "stdout": "ok", "stderr": "", "exit_code": 0}
+
+    monkeypatch.setenv("LAZYSRE_SSH_CONFIG", "default")
+    monkeypatch.setattr(cli_main, "_safe_run_command", fake_run)
+
+    _safe_run_ssh_command("root@192.168.10.101", "docker version", timeout_sec=3)
+
+    assert seen
+    assert "-F" not in seen[0]
 
 
 def test_infer_verification_commands_for_k8s_and_swarm() -> None:

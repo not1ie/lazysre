@@ -65,6 +65,7 @@ from lazysre.cli.remediation_templates import (
 from lazysre.cli.target import TargetEnvStore, probe_target_environment
 from lazysre.cli.target_profiles import ClusterProfileStore
 from lazysre.cli.tools import build_default_registry
+from lazysre.cli.types import ExecResult
 from lazysre.cli.tools.marketplace import (
     LockedPack,
     ToolPackLockStore,
@@ -545,14 +546,25 @@ def remediate(
         model=str(options["model"]),
         provider=str(options["provider"]),
     )
+    exported_reports: dict[str, str] = {}
+    json_out_path: Path | None = None
+    markdown_out_path: Path | None = None
     if report_json.strip():
-        out_path = Path(report_json).expanduser()
-        _write_json_file(out_path, report)
-        typer.echo(f"Remediation JSON report exported: {out_path}")
+        json_out_path = Path(report_json).expanduser()
+        exported_reports["json"] = str(json_out_path)
     if report_md.strip():
-        out_path = Path(report_md).expanduser()
-        _write_text_file(out_path, _render_closed_loop_report_markdown(report))
-        typer.echo(f"Remediation markdown report exported: {out_path}")
+        markdown_out_path = Path(report_md).expanduser()
+        exported_reports["markdown"] = str(markdown_out_path)
+    if exported_reports:
+        report["exported_reports"] = exported_reports
+    if json_out_path:
+        _write_json_file(json_out_path, report)
+        if not as_json:
+            typer.echo(f"Remediation JSON report exported: {json_out_path}")
+    if markdown_out_path:
+        _write_text_file(markdown_out_path, _render_closed_loop_report_markdown(report))
+        if not as_json:
+            typer.echo(f"Remediation markdown report exported: {markdown_out_path}")
     if as_json or (not _console):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return
@@ -5169,9 +5181,19 @@ def _safe_run_ssh_command(target: str, remote_command: str, *, timeout_sec: int)
     if not safe_target:
         return {"ok": False, "stdout": "", "stderr": "invalid ssh target", "exit_code": 2}
     timeout = max(2, min(int(timeout_sec or 8), 30))
+    ssh_config = os.environ.get("LAZYSRE_SSH_CONFIG", "").strip()
+    config_args: list[str] = []
+    if ssh_config.lower() in {"default", "system", "user"}:
+        config_args = []
+    elif ssh_config:
+        config_args = ["-F", ssh_config]
+    else:
+        # Avoid broken user SSH config from making explicit root@ip targets unusable.
+        config_args = ["-F", "/dev/null"]
     return _safe_run_command(
         [
             "ssh",
+            *config_args,
             "-o",
             "BatchMode=yes",
             "-o",
@@ -9365,15 +9387,16 @@ def _run_closed_loop_remediation(
     model: str,
     provider: str,
 ) -> dict[str, object]:
+    resolved_remote_target = _resolve_ssh_target_arg(remote_target) if str(remote_target or "").strip() else ""
     observation = (
         _run_remote_autopilot_cycle(
             goal=objective,
-            target=_resolve_ssh_target_arg(remote_target),
+            target=resolved_remote_target,
             service_filter=service_filter,
             include_logs=include_logs,
             timeout_sec=6,
         )
-        if remote_target.strip()
+        if resolved_remote_target
         else _run_autopilot_cycle(
             goal=objective,
             include_swarm=True,
@@ -9408,12 +9431,14 @@ def _run_closed_loop_remediation(
         auto_approve_low_risk=auto_approve_low_risk,
         model=model,
         provider=provider,
+        remote_target=resolved_remote_target,
     )
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": "closed-loop-remediation",
         "objective": objective,
         "mode": "execute" if execute else "dry-run",
+        "remote_target": resolved_remote_target,
         "apply_requested": apply,
         "observation": {
             "source": observation.get("source", ""),
@@ -9499,25 +9524,41 @@ def _run_closed_loop_execution(
     auto_approve_low_risk: bool,
     model: str,
     provider: str,
+    remote_target: str = "",
 ) -> dict[str, object]:
     diagnose_result = _execute_read_only_commands(
         diagnose_commands,
         stage="diagnose",
         approval_mode=approval_mode,
         audit_log=audit_log,
+        remote_target=remote_target,
     )
     if apply and plan.apply_commands:
-        apply_result = _execute_fix_plan_steps(
-            plan=plan,
-            max_apply_steps=max_apply_steps,
-            execute=execute,
-            approval_mode=approval_mode,
-            audit_log=audit_log,
-            allow_high_risk=allow_high_risk,
-            auto_approve_low_risk=auto_approve_low_risk,
-            model=model,
-            provider=provider,
-        )
+        if remote_target:
+            apply_result = _execute_remote_fix_plan_steps(
+                target=remote_target,
+                plan=plan,
+                max_apply_steps=max_apply_steps,
+                execute=execute,
+                approval_mode=approval_mode,
+                audit_log=audit_log,
+                allow_high_risk=allow_high_risk,
+                auto_approve_low_risk=auto_approve_low_risk,
+                model=model,
+                provider=provider,
+            )
+        else:
+            apply_result = _execute_fix_plan_steps(
+                plan=plan,
+                max_apply_steps=max_apply_steps,
+                execute=execute,
+                approval_mode=approval_mode,
+                audit_log=audit_log,
+                allow_high_risk=allow_high_risk,
+                auto_approve_low_risk=auto_approve_low_risk,
+                model=model,
+                provider=provider,
+            )
     else:
         apply_result = {
             "executed": 0,
@@ -9532,6 +9573,7 @@ def _run_closed_loop_execution(
             stage="verify",
             approval_mode=approval_mode,
             audit_log=audit_log,
+            remote_target=remote_target,
         )
         if verify
         else {"executed": 0, "succeeded": 0, "failed": 0, "skipped": 0, "items": []}
@@ -9543,18 +9585,34 @@ def _run_closed_loop_execution(
     )
     rollback_result: dict[str, object] = {"executed": 0, "succeeded": 0, "failed": 0, "skipped": 0, "items": []}
     if rollback_on_failure and execute and failed and plan.rollback_commands:
-        rollback_result = _execute_fix_plan_steps(
-            plan=FixPlan(apply_commands=plan.rollback_commands, rollback_commands=[]),
-            max_apply_steps=len(plan.rollback_commands),
-            execute=True,
-            approval_mode=approval_mode,
-            audit_log=audit_log,
-            allow_high_risk=True,
-            auto_approve_low_risk=True,
-            model=model,
-            provider=provider,
-            skip_confirm=True,
-        )
+        rollback_plan = FixPlan(apply_commands=plan.rollback_commands, rollback_commands=[])
+        if remote_target:
+            rollback_result = _execute_remote_fix_plan_steps(
+                target=remote_target,
+                plan=rollback_plan,
+                max_apply_steps=len(plan.rollback_commands),
+                execute=True,
+                approval_mode=approval_mode,
+                audit_log=audit_log,
+                allow_high_risk=True,
+                auto_approve_low_risk=True,
+                model=model,
+                provider=provider,
+                skip_confirm=True,
+            )
+        else:
+            rollback_result = _execute_fix_plan_steps(
+                plan=rollback_plan,
+                max_apply_steps=len(plan.rollback_commands),
+                execute=True,
+                approval_mode=approval_mode,
+                audit_log=audit_log,
+                allow_high_risk=True,
+                auto_approve_low_risk=True,
+                model=model,
+                provider=provider,
+                skip_confirm=True,
+            )
     return {
         "ok": failed == 0,
         "diagnose": diagnose_result,
@@ -9570,6 +9628,7 @@ def _execute_read_only_commands(
     stage: str,
     approval_mode: str,
     audit_log: str,
+    remote_target: str = "",
 ) -> dict[str, object]:
     executor = SafeExecutor(
         dry_run=False,
@@ -9579,6 +9638,7 @@ def _execute_read_only_commands(
     )
     items: list[dict[str, object]] = []
     executed = succeeded = failed = skipped = 0
+    safe_remote_target = _normalize_ssh_target(remote_target)
     for command_text in _dedupe_strings(commands)[:12]:
         try:
             command = shlex.split(command_text)
@@ -9598,7 +9658,40 @@ def _execute_read_only_commands(
                 }
             )
             continue
-        result = asyncio.run(executor.run(command))
+        if safe_remote_target:
+            raw = _safe_run_ssh_command(safe_remote_target, _remote_shell_command(command), timeout_sec=20)
+            result = ExecResult(
+                ok=bool(raw.get("ok", False)),
+                command=["ssh", safe_remote_target, command_text],
+                stdout=str(raw.get("stdout", "")),
+                stderr=str(raw.get("stderr", "")),
+                exit_code=int(raw.get("exit_code", 0) or 0),
+                dry_run=False,
+                risk_level=decision.risk_level,
+                policy_reasons=decision.reasons,
+                risk_report=build_risk_report(command, decision),
+                requires_approval=decision.requires_approval,
+                approved=True,
+            )
+            AuditLogger(Path(audit_log)).write(
+                {
+                    "command": result.command,
+                    "remote_target": safe_remote_target,
+                    "remote_command": command,
+                    "ok": result.ok,
+                    "exit_code": result.exit_code,
+                    "dry_run": result.dry_run,
+                    "risk_level": result.risk_level,
+                    "requires_approval": result.requires_approval,
+                    "approved": result.approved,
+                    "policy_reasons": result.policy_reasons,
+                    "risk_report": result.risk_report,
+                    "stderr": result.stderr[:500],
+                    "stdout_preview": result.stdout[:300],
+                }
+            )
+        else:
+            result = asyncio.run(executor.run(command))
         executed += 1
         succeeded += 1 if result.ok else 0
         failed += 0 if result.ok else 1
@@ -9612,6 +9705,141 @@ def _execute_read_only_commands(
             }
         )
     return {"executed": executed, "succeeded": succeeded, "failed": failed, "skipped": skipped, "items": items}
+
+
+def _execute_remote_fix_plan_steps(
+    *,
+    target: str,
+    plan: FixPlan,
+    max_apply_steps: int,
+    execute: bool,
+    approval_mode: str,
+    audit_log: str,
+    allow_high_risk: bool,
+    auto_approve_low_risk: bool,
+    model: str,
+    provider: str,
+    skip_confirm: bool = False,
+) -> dict[str, int]:
+    safe_target = _normalize_ssh_target(target)
+    if not safe_target:
+        typer.echo("远程执行目标无效，已跳过。")
+        return {"executed": 0, "succeeded": 0, "failed": 1, "skipped_high_risk": 0}
+    selected = plan.apply_commands[:max_apply_steps]
+    total = len(selected)
+    skipped_high_risk = 0
+    executed = 0
+    succeeded = 0
+    failed = 0
+    audit = AuditLogger(Path(audit_log))
+    for idx, command_text in enumerate(selected, 1):
+        try:
+            command = shlex.split(command_text)
+        except ValueError as exc:
+            typer.echo(f"[remote step {idx}/{total}] 无法解析命令，跳过: {command_text} ({exc})")
+            continue
+        if not command:
+            continue
+        if command[0] not in {"docker", "kubectl", "curl", "tail"}:
+            failed += 1
+            typer.echo(f"[remote step {idx}/{total}] blocked command: {command[0]}")
+            continue
+        decision = assess_command(command, approval_mode=approval_mode)
+        report = build_risk_report(command, decision)
+        impact_statement = _generate_impact_statement(
+            command_text=f"ssh {safe_target} {shlex.quote(command_text)}",
+            report={**report, "impact_scope": f"remote:{safe_target}"},
+            model=model,
+            provider=provider,
+        )
+        _render_step_risk(
+            idx,
+            total,
+            f"ssh {safe_target} {shlex.quote(command_text)}",
+            report,
+            impact_statement=impact_statement,
+        )
+        risk_level = str(report.get("risk_level", "low")).strip().lower()
+        allow_execute, need_confirm = evaluate_apply_guardrail(
+            risk_level=risk_level,
+            allow_high_risk=allow_high_risk,
+            auto_approve_low_risk=auto_approve_low_risk,
+        )
+        if not execute:
+            need_confirm = False
+        if risk_level == "low":
+            need_confirm = False
+        if not allow_execute:
+            skipped_high_risk += 1
+            typer.echo(f"[remote step {idx}/{total}] 已跳过高风险步骤（如需执行请加 --allow-high-risk）")
+            continue
+        if (not skip_confirm) and need_confirm and (
+            not typer.confirm(f"[remote step {idx}/{total}] 是否在 {safe_target} 执行该步骤？", default=False)
+        ):
+            continue
+        if not execute:
+            result_exec = ExecResult(
+                ok=True,
+                command=["ssh", safe_target, command_text],
+                stdout=f"[dry-run] ssh {safe_target} {command_text}",
+                exit_code=0,
+                dry_run=True,
+                risk_level=decision.risk_level,
+                policy_reasons=decision.reasons,
+                risk_report=report,
+                requires_approval=decision.requires_approval,
+                approved=True,
+            )
+        else:
+            raw = _safe_run_ssh_command(safe_target, _remote_shell_command(command), timeout_sec=30)
+            result_exec = ExecResult(
+                ok=bool(raw.get("ok", False)),
+                command=["ssh", safe_target, command_text],
+                stdout=str(raw.get("stdout", "")),
+                stderr=str(raw.get("stderr", "")),
+                exit_code=int(raw.get("exit_code", 0) or 0),
+                dry_run=False,
+                risk_level=decision.risk_level,
+                policy_reasons=decision.reasons,
+                risk_report=report,
+                requires_approval=decision.requires_approval,
+                approved=True,
+            )
+        audit.write(
+            {
+                "command": result_exec.command,
+                "remote_target": safe_target,
+                "remote_command": command,
+                "ok": result_exec.ok,
+                "exit_code": result_exec.exit_code,
+                "dry_run": result_exec.dry_run,
+                "risk_level": result_exec.risk_level,
+                "requires_approval": result_exec.requires_approval,
+                "approved": result_exec.approved,
+                "policy_reasons": result_exec.policy_reasons,
+                "risk_report": result_exec.risk_report,
+                "stderr": result_exec.stderr[:500],
+                "stdout_preview": result_exec.stdout[:300],
+            }
+        )
+        executed += 1
+        if result_exec.ok:
+            succeeded += 1
+        else:
+            failed += 1
+        _render_step_result(idx, total, result_exec)
+        if (not result_exec.ok) and (not skip_confirm) and (
+            not typer.confirm("远程步骤失败，是否继续后续步骤？", default=False)
+        ):
+            break
+    if skipped_high_risk:
+        typer.echo(f"共跳过 {skipped_high_risk} 个远程高风险步骤。")
+    return {
+        "executed": executed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "skipped_high_risk": skipped_high_risk,
+    }
 
 
 def _infer_verification_commands(plan: FixPlan, *, diagnose_commands: list[str] | None = None) -> list[str]:
@@ -9683,6 +9911,7 @@ def _render_closed_loop_report_markdown(report: dict[str, object]) -> str:
         f"- Generated: {report.get('generated_at_utc', '')}",
         f"- Objective: {report.get('objective', '')}",
         f"- Mode: `{report.get('mode', '-')}`",
+        f"- Remote Target: `{report.get('remote_target', '') or '-'}`",
         f"- OK: `{report.get('ok', False)}`",
         f"- Next Step: {report.get('next_step', '')}",
         "",

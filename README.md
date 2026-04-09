@@ -81,6 +81,7 @@ lazysre login --provider kimi
 - `LAZYSRE_NO_AUTO_INSTALL=1`：禁止启动器自动安装 Python 内核
 - `LAZYSRE_POST_INSTALL_BRIEF=0`：一键脚本安装后不自动生成启动总览
 - `LAZYSRE_POST_INSTALL_SCAN=0`：兼容旧变量，同样会跳过安装后总览
+- `LAZYSRE_SSH_CONFIG`：远程诊断 SSH 配置文件；默认使用 `/dev/null` 隔离坏配置，设为 `default` 可恢复读取用户 SSH config
 
 国内服务器说明：`scripts/install_user.sh` 默认使用阿里云 PyPI 镜像安装 Python 依赖；如果服务器不能访问 GitHub，可先在本地打包上传源码，再执行 `LAZYSRE_PIP_SOURCE=/opt/lazysre-src scripts/install_user.sh`。
 
