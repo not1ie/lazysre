@@ -59,8 +59,8 @@ function ensurePip(pythonCmd) {
   return bootstrap.status === 0;
 }
 
-function pipInstallArgs(source) {
-  const args = ["-m", "pip", "install", "--user", "--upgrade"];
+function pipNetworkArgs() {
+  const args = [];
   const indexUrl = (process.env.LAZYSRE_PIP_INDEX_URL || "").trim();
   const extraIndex = (process.env.LAZYSRE_PIP_EXTRA_INDEX_URL || "").trim();
   const trustedHosts = (process.env.LAZYSRE_PIP_TRUSTED_HOST || "")
@@ -76,14 +76,80 @@ function pipInstallArgs(source) {
   for (const host of trustedHosts) {
     args.push("--trusted-host", host);
   }
-  args.push(source);
   return args;
+}
+
+function pipInstallArgs(source, mode) {
+  const args = ["-m", "pip", "install"];
+  if (mode === "user") {
+    args.push("--user");
+  } else if (mode === "user-break-system") {
+    args.push("--break-system-packages", "--user");
+  }
+  args.push("--upgrade", ...pipNetworkArgs(), source);
+  return args;
+}
+
+function isPep668Error(text) {
+  return /externally-managed-environment|externally managed|PEP 668/i.test(text || "");
+}
+
+function normalizeOutput(result) {
+  return `${result.stdout || ""}\n${result.stderr || ""}`;
+}
+
+function launcherVenvDir() {
+  const envDir = (process.env.LAZYSRE_LAUNCHER_VENV || "").trim();
+  if (envDir) {
+    return envDir;
+  }
+  return path.join(os.homedir(), ".lazysre", "launcher-venv");
+}
+
+function launcherVenvPythonPath() {
+  const dir = launcherVenvDir();
+  if (process.platform === "win32") {
+    return path.join(dir, "Scripts", "python.exe");
+  }
+  return path.join(dir, "bin", "python");
+}
+
+function launcherVenvPythonCmd() {
+  return launcherVenvPythonPath();
+}
+
+function ensureLauncherVenv(basePythonCmd) {
+  const pythonPath = launcherVenvPythonPath();
+  if (!fs.existsSync(pythonPath)) {
+    const create = run(basePythonCmd, ["-m", "venv", launcherVenvDir()], { stdio: "inherit" });
+    if (create.status !== 0) {
+      throw new Error(`failed to create launcher venv at ${launcherVenvDir()}`);
+    }
+  }
+  const venvPython = launcherVenvPythonCmd();
+  if (!ensurePip(venvPython)) {
+    throw new Error(`pip unavailable inside launcher venv at ${launcherVenvDir()}`);
+  }
+  return venvPython;
 }
 
 function ensureLazySRE(pythonCmd) {
   const importCheck = run(pythonCmd, ["-c", "import lazysre"], { stdio: "pipe" });
   if (importCheck.status === 0) {
-    return { installedNow: false, source: "" };
+    return { installedNow: false, source: "", runtimePython: pythonCmd, installMethod: "system" };
+  }
+
+  const existingVenvPy = launcherVenvPythonCmd();
+  if (fs.existsSync(launcherVenvPythonPath())) {
+    const venvImport = run(existingVenvPy, ["-c", "import lazysre"], { stdio: "pipe" });
+    if (venvImport.status === 0) {
+      return {
+        installedNow: false,
+        source: "launcher-venv",
+        runtimePython: existingVenvPy,
+        installMethod: "launcher-venv"
+      };
+    }
   }
 
   if (process.env.LAZYSRE_NO_AUTO_INSTALL === "1") {
@@ -100,24 +166,64 @@ function ensureLazySRE(pythonCmd) {
 
   let installed = false;
   let usedSource = "";
+  let installMethod = "";
+  let runtimePython = pythonCmd;
   let lastErr = "";
   for (const source of preferred) {
-    const install = run(
-      pythonCmd,
-      pipInstallArgs(source),
-      { stdio: "inherit" }
-    );
-    if (install.status === 0) {
+    const userInstall = run(pythonCmd, pipInstallArgs(source, "user"), { stdio: "pipe" });
+    if (userInstall.status === 0) {
       installed = true;
       usedSource = source;
+      installMethod = "pip-user";
       break;
     }
-    lastErr = `pip install failed for source=${source} (exit=${install.status})`;
+    const output = normalizeOutput(userInstall);
+    process.stderr.write(output);
+    if (isPep668Error(output)) {
+      const breakInstall = run(pythonCmd, pipInstallArgs(source, "user-break-system"), { stdio: "pipe" });
+      if (breakInstall.status === 0) {
+        installed = true;
+        usedSource = source;
+        installMethod = "pip-user-break-system";
+        break;
+      }
+      process.stderr.write(normalizeOutput(breakInstall));
+      lastErr = `pip install failed for source=${source} in PEP668 mode (exit=${breakInstall.status})`;
+      continue;
+    }
+    lastErr = `pip install failed for source=${source} (exit=${userInstall.status})`;
   }
+
   if (!installed) {
-    throw new Error(lastErr || "unable to install lazysre via pip");
+    let venvPython = "";
+    try {
+      venvPython = ensureLauncherVenv(pythonCmd);
+      for (const source of preferred) {
+        const venvInstall = run(venvPython, pipInstallArgs(source, "venv"), { stdio: "pipe" });
+        if (venvInstall.status === 0) {
+          installed = true;
+          usedSource = source;
+          installMethod = "launcher-venv";
+          runtimePython = venvPython;
+          break;
+        }
+        process.stderr.write(normalizeOutput(venvInstall));
+        lastErr = `venv pip install failed for source=${source} (exit=${venvInstall.status})`;
+      }
+    } catch (err) {
+      lastErr = String(err && err.message ? err.message : err);
+    }
   }
-  return { installedNow: true, source: usedSource };
+
+  if (!installed) {
+    throw new Error(lastErr || "unable to install lazysre via pip/venv");
+  }
+  return {
+    installedNow: true,
+    source: usedSource,
+    runtimePython,
+    installMethod
+  };
 }
 
 function markerFilePath() {
@@ -142,6 +248,7 @@ function emitFirstRunHint(source) {
 
 function printInstallFailureGuide(err, pythonCmd) {
   const msg = String(err && err.message ? err.message : err);
+  const venvDir = launcherVenvDir();
   const lines = [
     "[LazySRE] Failed to prepare Python core runtime.",
     `  reason: ${msg}`,
@@ -149,8 +256,9 @@ function printInstallFailureGuide(err, pythonCmd) {
     "",
     "Try one of these:",
     `  1) ${pythonCmd} -m pip install --user --upgrade lazysre`,
-    `  2) ${pythonCmd} -m pip install --user --upgrade https://github.com/not1ie/lazysre/archive/refs/heads/main.zip`,
-    "  3) if behind proxy/mirror, set env LAZYSRE_PIP_INDEX_URL and retry.",
+    `  2) ${pythonCmd} -m pip install --break-system-packages --user --upgrade lazysre`,
+    `  3) ${pythonCmd} -m venv "${venvDir}" && "${launcherVenvPythonPath()}" -m pip install --upgrade lazysre`,
+    "  4) if behind proxy/mirror, set env LAZYSRE_PIP_INDEX_URL and retry.",
     "",
     "Then run: lazysre --help"
   ];
@@ -167,20 +275,20 @@ function main() {
   try {
     const state = ensureLazySRE(pythonCmd);
     if (state.installedNow) {
-      emitFirstRunHint(state.source);
+      emitFirstRunHint(`${state.source} (${state.installMethod})`);
     }
+    const runtimePython = state.runtimePython || pythonCmd;
+    const args = process.argv.slice(2);
+    const result = run(
+      runtimePython,
+      ["-m", "lazysre", ...args],
+      { stdio: "inherit" }
+    );
+    process.exit(result.status == null ? 1 : result.status);
   } catch (err) {
     printInstallFailureGuide(err, pythonCmd);
     process.exit(1);
   }
-
-  const args = process.argv.slice(2);
-  const result = run(
-    pythonCmd,
-    ["-m", "lazysre", ...args],
-    { stdio: "inherit" }
-  );
-  process.exit(result.status == null ? 1 : result.status);
 }
 
 main();
