@@ -481,6 +481,34 @@ def remote(
     _render_remote_docker_report(report)
 
 
+@app.command("connect")
+def connect(
+    target: Annotated[str, typer.Argument(help="SSH target, e.g. root@192.168.10.101. Omit to use target.ssh_target.")] = "",
+    save_target: Annotated[bool, typer.Option("--save/--no-save", help="Remember the SSH target when SSH connectivity succeeds.")] = True,
+    logs: Annotated[bool, typer.Option("--logs", help="Include remote Swarm service logs during the connection check.")] = False,
+    tail: Annotated[int, typer.Option("--tail", help="Remote log/task tail lines.")] = 40,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Per SSH command timeout seconds.")] = 8,
+    as_json: Annotated[bool, typer.Option("--json", help="Print connection report as JSON.")] = False,
+) -> None:
+    report = _run_remote_connect_flow(
+        target=target,
+        save_target=save_target,
+        include_logs=logs,
+        tail=tail,
+        timeout_sec=timeout_sec,
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_remote_docker_report(report)
+    save_payload = report.get("target_save", {})
+    if isinstance(save_payload, dict):
+        if bool(save_payload.get("saved")):
+            typer.echo(f"默认远程目标已保存: {save_payload.get('target', '')}")
+        elif save_target:
+            typer.echo(f"未保存默认远程目标: {save_payload.get('reason', 'unknown')}")
+
+
 @app.command("doctor")
 def doctor(
     ctx: typer.Context,
@@ -4405,6 +4433,69 @@ def _collect_remote_docker_report(
     )
 
 
+def _remote_report_check_ok(report: dict[str, object], name: str) -> bool:
+    checks = report.get("checks", [])
+    if not isinstance(checks, list):
+        return False
+    for raw in checks:
+        item = raw if isinstance(raw, dict) else {}
+        if str(item.get("name", "")).strip() == name:
+            return bool(item.get("ok"))
+    return False
+
+
+def _remember_ssh_target_from_report(
+    report: dict[str, object],
+    *,
+    profile_file: Path,
+) -> dict[str, object]:
+    target = _normalize_ssh_target(str(report.get("target", "") or ""))
+    if not target:
+        return {"saved": False, "target": "", "reason": "invalid ssh target"}
+    if not _remote_report_check_ok(report, "ssh.connect"):
+        return {"saved": False, "target": target, "reason": "ssh connectivity check failed"}
+    store = TargetEnvStore(profile_file)
+    current = store.load()
+    already_saved = current.ssh_target.strip() == target
+    if not already_saved:
+        store.update(ssh_target=target)
+    return {
+        "saved": True,
+        "target": target,
+        "reason": "already saved" if already_saved else "ssh connectivity verified",
+    }
+
+
+def _run_remote_connect_flow(
+    *,
+    target: str,
+    save_target: bool,
+    include_logs: bool,
+    tail: int,
+    timeout_sec: int,
+) -> dict[str, object]:
+    resolved_target = _resolve_ssh_target_arg(target)
+    report = _collect_remote_docker_report(
+        target=resolved_target,
+        service_filter="",
+        include_logs=include_logs,
+        tail=tail,
+        timeout_sec=timeout_sec,
+    )
+    if save_target:
+        report["target_save"] = _remember_ssh_target_from_report(
+            report,
+            profile_file=Path(settings.target_profile_file),
+        )
+    else:
+        report["target_save"] = {
+            "saved": False,
+            "target": _normalize_ssh_target(str(report.get("target", "") or "")),
+            "reason": "save disabled",
+        }
+    return report
+
+
 def _remote_report_payload(
     *,
     target: str,
@@ -7124,6 +7215,7 @@ def _render_chat_short_help() -> None:
         "- /watch [--count N]: 持续巡检并输出异常摘要",
         "- /actions [id]: 把最近一次巡检结果整理成编号行动清单，可直接执行某个建议",
         "- /autopilot [目标]: 自动扫描 -> 巡检 -> 行动清单，可加 --fix 生成修复计划",
+        "- /connect [user@host]: 远程连接体检；SSH 连通后自动保存为默认远程目标",
         "- /remote [user@host] [--logs]: 通过 SSH 只读诊断远程 Docker/Swarm；已保存 ssh_target 时可省略主机",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
@@ -7191,6 +7283,7 @@ def _normalize_natural_language_text(text: str) -> str:
         (r"\bsacn\b", "scan"),
         (r"\bactons\b", "actions"),
         (r"\bauto[-_\s]?pilot\b", "autopilot"),
+        (r"\bconect\b", "connect"),
     ]
     for pattern, replacement in replacements:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
@@ -7222,6 +7315,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "sacn": "scan",
         "actons": "actions",
         "auto-pilot": "autopilot",
+        "conect": "connect",
         "hepl": "help",
     }
     known = [
@@ -7239,6 +7333,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "watch",
         "actions",
         "autopilot",
+        "connect",
         "remote",
         "setup",
         "status",
@@ -7428,9 +7523,9 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower().startswith("/remote"):
             tail = text[len("/remote") :].strip()
-            target = _extract_ssh_target_from_text(tail)
+            target = _resolve_ssh_target_arg(_extract_ssh_target_from_text(tail))
             if not target:
-                typer.echo("用法：/remote root@192.168.10.101 [--logs] [--service name]")
+                typer.echo("用法：/remote [root@192.168.10.101] [--logs] [--service name]；或先 /connect root@host")
                 continue
             service_text = tail.replace(target, " ")
             report = _collect_remote_docker_report(
@@ -7444,6 +7539,26 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 _render_remote_docker_report(report)
             else:
                 typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/connect"):
+            tail = text[len("/connect") :].strip()
+            report = _run_remote_connect_flow(
+                target=_extract_ssh_target_from_text(tail),
+                save_target=True,
+                include_logs="--logs" in tail.lower() or "日志" in tail,
+                tail=80,
+                timeout_sec=8,
+            )
+            if _console:
+                _render_remote_docker_report(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+            save_payload = report.get("target_save", {})
+            if isinstance(save_payload, dict):
+                if bool(save_payload.get("saved")):
+                    typer.echo(f"默认远程目标已保存: {save_payload.get('target', '')}")
+                else:
+                    typer.echo(f"未保存默认远程目标: {save_payload.get('reason', 'unknown')}")
             continue
         if text.lower().startswith("/mode "):
             tail = text[len("/mode ") :].strip().lower()
@@ -8032,6 +8147,26 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             reset_session=False,
             session_file=str(options["session_file"]),
         )
+        return True
+    if _looks_like_remote_connect_request(text):
+        target = _extract_ssh_target_from_text(text)
+        report = _run_remote_connect_flow(
+            target=target,
+            save_target=bool(target),
+            include_logs=any(k in lowered for k in ("日志", "logs")),
+            tail=80,
+            timeout_sec=8,
+        )
+        if _console:
+            _render_remote_docker_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        save_payload = report.get("target_save", {})
+        if isinstance(save_payload, dict) and target:
+            if bool(save_payload.get("saved")):
+                typer.echo(f"默认远程目标已保存: {save_payload.get('target', '')}")
+            else:
+                typer.echo(f"未保存默认远程目标: {save_payload.get('reason', 'unknown')}")
         return True
     if _looks_like_remote_diagnose_request(text):
         target = _resolve_ssh_target_arg(_extract_ssh_target_from_text(text))
@@ -10024,6 +10159,31 @@ def _looks_like_remote_diagnose_request(text: str) -> bool:
     return bool(_extract_ssh_target_from_text(text) or _resolve_ssh_target_arg(""))
 
 
+def _looks_like_remote_connect_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    has_target = bool(_extract_ssh_target_from_text(text))
+    keywords = (
+        "连接远程",
+        "远程连接",
+        "连接服务器",
+        "测试ssh",
+        "ssh连通",
+        "ssh 连通",
+        "连一下服务器",
+        "ssh check",
+    )
+    if any(k in lowered for k in keywords):
+        return True
+    if "连接" in lowered and has_target:
+        return True
+    if "connect" in lowered:
+        context_words = ("ssh", "remote", "server", "host", "服务器", "远程")
+        return has_target or any(k in lowered for k in context_words)
+    return False
+
+
 def _extract_ssh_target_from_text(text: str) -> str:
     raw = str(text or "").strip()
     if not raw:
@@ -10705,6 +10865,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "watch",
         "actions",
         "autopilot",
+        "connect",
         "remote",
         "doctor",
         "install-doctor",
@@ -10768,6 +10929,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "watch",
         "actions",
         "autopilot",
+        "connect",
         "remote",
         "doctor",
         "install-doctor",

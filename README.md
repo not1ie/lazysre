@@ -29,6 +29,8 @@ lazysre scan
 lazysre swarm --logs
 # 远程服务器只读诊断（目标机无需安装 LazySRE，只需可 SSH）
 lazysre remote root@192.168.10.101 --logs
+# 首次连接体检：SSH 连通后自动保存默认远程目标
+lazysre connect root@192.168.10.101
 # 保存默认远程目标后，后续可以直接 lazysre remote
 lazysre target set --ssh-target root@192.168.10.101
 lazysre remote --logs
@@ -133,7 +135,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /scan /swarm /remote /watch /actions /autopilot /doctor [/doctor fix] [/doctor strict]
+# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /scan /swarm /connect /remote /watch /actions /autopilot /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
@@ -169,6 +171,8 @@ lsre swarm
 lsre swarm --logs
 lsre swarm --service lazysre_lazysre --logs
 # 远程 Docker/Swarm 只读诊断（通过 SSH 执行 docker 观察命令）
+lsre connect root@192.168.10.101
+lsre connect
 lsre remote root@192.168.10.101
 lsre remote root@192.168.10.101 --logs
 lsre remote root@192.168.10.101 --service lazysre_lazysre --logs

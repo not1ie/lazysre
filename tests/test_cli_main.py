@@ -22,6 +22,8 @@ from lazysre.cli.main import (
     _remote_shell_command,
     _normalize_ssh_target,
     _resolve_ssh_target_arg,
+    _remote_report_check_ok,
+    _run_remote_connect_flow,
     _collect_watch_snapshot,
     _run_autopilot_cycle,
     _run_remote_autopilot_cycle,
@@ -72,6 +74,7 @@ from lazysre.cli.main import (
     _looks_like_scan_request,
     _looks_like_swarm_diagnose_request,
     _looks_like_remote_diagnose_request,
+    _looks_like_remote_connect_request,
     _looks_like_watch_request,
     _looks_like_actions_request,
     _looks_like_action_run_request,
@@ -126,7 +129,7 @@ from lazysre.cli.llm import (
 from lazysre.cli.fix_mode import FixPlan
 from lazysre.cli.runbook import find_runbook
 from lazysre.cli.secrets import SecretStore
-from lazysre.cli.target import TargetEnvironment
+from lazysre.cli.target import TargetEnvironment, TargetEnvStore
 from lazysre.config import settings
 
 
@@ -245,6 +248,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv16 = ["lsre", "remote", "root@192.168.10.101", "--json"]
     _rewrite_argv_for_default_run(argv16)
     assert argv16 == ["lsre", "remote", "root@192.168.10.101", "--json"]
+    argv17 = ["lsre", "connect", "root@192.168.10.101"]
+    _rewrite_argv_for_default_run(argv17)
+    assert argv17 == ["lsre", "connect", "root@192.168.10.101"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -352,6 +358,9 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_scan_request("自动检测当前环境并列出问题")
     assert _looks_like_swarm_diagnose_request("看看服务器上的服务有没有异常")
     assert _looks_like_remote_diagnose_request("远程诊断 root@192.168.10.101 的 docker swarm")
+    assert _looks_like_remote_connect_request("连接服务器 root@192.168.10.101")
+    assert _looks_like_remote_connect_request("connect root@192.168.10.101")
+    assert _looks_like_remote_connect_request("connect prometheus") is False
     assert _extract_ssh_target_from_text("请 ssh root@192.168.10.101 看看") == "root@192.168.10.101"
     assert _looks_like_target_update_request("把远程服务器设成 root@192.168.10.101")
     assert _looks_like_watch_request("开始巡检一下")
@@ -396,7 +405,9 @@ def test_detect_fix_and_apply_intent() -> None:
 def test_normalize_chat_input_text() -> None:
     assert _normalize_slash_command_text("/quikstart") == "/quickstart"
     assert _normalize_slash_command_text("/stauts probe") == "/status probe"
+    assert _normalize_slash_command_text("/conect root@192.168.10.101") == "/connect root@192.168.10.101"
     assert _normalize_natural_language_text("请看模版库") == "请看模板库"
+    assert _normalize_natural_language_text("conect root@192.168.10.101") == "connect root@192.168.10.101"
     assert _normalize_chat_input_text("/templete list") == "/template list"
     assert _normalize_chat_input_text("quikstart 一下") == "quickstart 一下"
 
@@ -580,6 +591,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["watch"]) is False
     assert _should_launch_assistant(["actions"]) is False
     assert _should_launch_assistant(["autopilot"]) is False
+    assert _should_launch_assistant(["connect"]) is False
     assert _should_launch_assistant(["remote"]) is False
     assert _should_launch_assistant(["doctor"]) is False
     assert _should_launch_assistant(["install-doctor"]) is False
@@ -1311,6 +1323,49 @@ def test_collect_remote_docker_report_detects_swarm_issue(monkeypatch: pytest.Mo
     assert report["root_causes"][0]["category"] == "swarm_image_pull_failed"
     assert "lazysre remote root@192.168.10.101 --service api --logs" in report["recommendations"]
     assert any("docker service logs" in item for item in calls)
+
+
+def test_run_remote_connect_flow_saves_target_after_ssh_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target_file = tmp_path / "target.json"
+    old_profile = settings.target_profile_file
+
+    def fake_remote(**kwargs: object) -> dict[str, object]:
+        return {
+            "target": kwargs.get("target", ""),
+            "ok": True,
+            "summary": {"pass": 2, "warn": 0, "error": 0},
+            "checks": [
+                {"name": "ssh.connect", "ok": True, "severity": "pass"},
+                {"name": "remote.docker.version", "ok": True, "severity": "pass"},
+            ],
+            "nodes": [],
+            "bad_nodes": [],
+            "services": [],
+            "unhealthy_services": [],
+            "tasks": [],
+            "logs": [],
+            "root_causes": [],
+            "recommendations": [],
+        }
+
+    try:
+        settings.target_profile_file = str(target_file)
+        monkeypatch.setattr(cli_main, "_collect_remote_docker_report", fake_remote)
+        report = _run_remote_connect_flow(
+            target="root@192.168.10.101",
+            save_target=True,
+            include_logs=False,
+            tail=40,
+            timeout_sec=3,
+        )
+        assert _remote_report_check_ok(report, "ssh.connect") is True
+        assert report["target_save"]["saved"] is True
+        assert TargetEnvStore(target_file).load().ssh_target == "root@192.168.10.101"
+    finally:
+        settings.target_profile_file = old_profile
 
 
 def test_remote_helpers_validate_target_and_quote_command() -> None:
