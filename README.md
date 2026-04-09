@@ -23,6 +23,8 @@ lsre
 python -m lazysre
 # 安装环境自检
 lazysre install-doctor
+# 一条命令获取本机/远程总览简报
+lazysre brief
 # 零配置环境扫描（安装后也会自动跑一次，不需要 K8s token）
 lazysre scan
 # 输出包含 AI Briefing：可纳管目标、关键问题和推荐下一步
@@ -137,7 +139,7 @@ lsre
 lsre chat
 lsre "检查 k8s pod 状态"
 # chat 快捷命令
-# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /scan /swarm /connect /remote /watch /actions /autopilot /doctor [/doctor fix] [/doctor strict]
+# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
@@ -165,6 +167,9 @@ lsre target probe --json
 # 运行时状态总览
 lsre status
 lsre status --probe --json
+# 一条命令汇总本机 scan 和默认远程目标
+lsre brief
+lsre brief --json
 # 零配置自动发现：Docker/Swarm/K8s/Prometheus/Provider Key（只读，无需 K8s token）
 lsre scan
 lsre scan --json

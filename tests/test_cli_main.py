@@ -18,6 +18,8 @@ from lazysre.cli.main import (
     _collect_runtime_status,
     _collect_environment_discovery,
     _build_environment_scan_briefing,
+    _build_overview_briefing,
+    _build_overview_recommended_commands,
     _collect_swarm_health_report,
     _collect_remote_docker_report,
     _remote_shell_command,
@@ -82,6 +84,7 @@ from lazysre.cli.main import (
     _looks_like_action_run_request,
     _looks_like_autopilot_request,
     _looks_like_report_request,
+    _looks_like_brief_request,
     _looks_like_target_show_request,
     _looks_like_target_update_request,
     _looks_like_target_profile_current_request,
@@ -253,6 +256,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv17 = ["lsre", "connect", "root@192.168.10.101"]
     _rewrite_argv_for_default_run(argv17)
     assert argv17 == ["lsre", "connect", "root@192.168.10.101"]
+    argv18 = ["lsre", "brief", "--json"]
+    _rewrite_argv_for_default_run(argv18)
+    assert argv18 == ["lsre", "brief", "--json"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -357,6 +363,7 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_init_request("请帮我初始化 lazysre")
     assert _looks_like_init_request("我要配置 OpenAI Key")
     assert _looks_like_status_request("帮我看下当前状态")
+    assert _looks_like_brief_request("给我一个总览简报")
     assert _looks_like_scan_request("自动检测当前环境并列出问题")
     assert _looks_like_swarm_diagnose_request("看看服务器上的服务有没有异常")
     assert _looks_like_remote_diagnose_request("远程诊断 root@192.168.10.101 的 docker swarm")
@@ -408,8 +415,10 @@ def test_normalize_chat_input_text() -> None:
     assert _normalize_slash_command_text("/quikstart") == "/quickstart"
     assert _normalize_slash_command_text("/stauts probe") == "/status probe"
     assert _normalize_slash_command_text("/conect root@192.168.10.101") == "/connect root@192.168.10.101"
+    assert _normalize_slash_command_text("/brif") == "/brief"
     assert _normalize_natural_language_text("请看模版库") == "请看模板库"
     assert _normalize_natural_language_text("conect root@192.168.10.101") == "connect root@192.168.10.101"
+    assert _normalize_natural_language_text("brif") == "brief"
     assert _normalize_chat_input_text("/templete list") == "/template list"
     assert _normalize_chat_input_text("quikstart 一下") == "quickstart 一下"
 
@@ -588,6 +597,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["login"]) is False
     assert _should_launch_assistant(["logout"]) is False
     assert _should_launch_assistant(["status"]) is False
+    assert _should_launch_assistant(["brief"]) is False
     assert _should_launch_assistant(["scan"]) is False
     assert _should_launch_assistant(["swarm"]) is False
     assert _should_launch_assistant(["watch"]) is False
@@ -1263,6 +1273,48 @@ def test_build_environment_scan_briefing_when_no_targets() -> None:
     assert briefing["status"] == "attention"
     assert "暂未发现" in briefing["headline"]
     assert briefing["next"].startswith("未发现可直接访问")
+
+
+def test_build_overview_briefing_prefers_remote_attention() -> None:
+    scan_report = {
+        "summary": {"pass": 5, "warn": 0, "error": 0},
+        "usable_targets": ["docker-swarm"],
+        "issues": [],
+        "suggestions": [],
+        "next_actions": ["lazysre swarm --logs"],
+        "briefing": {
+            "status": "healthy",
+            "headline": "已发现可纳管目标：docker-swarm，可以直接开始自然语言诊断。",
+            "evidence": ["checks: pass=5 warn=0 error=0"],
+            "next": "lazysre swarm --logs",
+        },
+    }
+    remote_report = {
+        "target": "root@192.168.10.101",
+        "ok": False,
+        "summary": {"pass": 3, "warn": 1, "error": 0},
+        "checks": [],
+        "unhealthy_services": [{"name": "api", "replicas": "0/1"}],
+        "bad_nodes": [],
+        "root_causes": [],
+        "recommendations": ["lazysre remote root@192.168.10.101 --service api --logs"],
+        "briefing": {
+            "status": "attention",
+            "headline": "发现 1 个远程 Swarm 服务副本异常：api(0/1)。",
+            "evidence": ["checks: pass=3 warn=1 error=0"],
+            "next": "lazysre remote root@192.168.10.101 --service api --logs",
+        },
+    }
+
+    briefing = _build_overview_briefing(scan_report=scan_report, remote_report=remote_report)
+    commands = _build_overview_recommended_commands(
+        {"briefing": briefing, "scan": scan_report, "remote": remote_report}
+    )
+
+    assert briefing["status"] == "attention"
+    assert "远程" in briefing["headline"]
+    assert briefing["next"] == "lazysre remote root@192.168.10.101 --service api --logs"
+    assert commands[0] == "lazysre remote root@192.168.10.101 --service api --logs"
 
 
 def test_collect_swarm_health_report_detects_unhealthy_service(monkeypatch: pytest.MonkeyPatch) -> None:

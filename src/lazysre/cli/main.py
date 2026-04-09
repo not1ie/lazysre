@@ -268,6 +268,26 @@ def scan(
     _render_environment_discovery(report)
 
 
+@app.command("brief")
+def brief(
+    target: Annotated[str, typer.Argument(help="Optional SSH target for remote briefing. Omit to use target.ssh_target.")] = "",
+    include_remote: Annotated[bool, typer.Option("--remote/--no-remote", help="Include saved or provided remote Docker/Swarm target.")] = True,
+    logs: Annotated[bool, typer.Option("--logs", help="Include remote Swarm service logs when remote briefing runs.")] = False,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds.")] = 5,
+    as_json: Annotated[bool, typer.Option("--json", help="Print overview briefing as JSON.")] = False,
+) -> None:
+    report = _build_overview_brief_report(
+        target=target,
+        include_remote=include_remote,
+        include_logs=logs,
+        timeout_sec=timeout_sec,
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_overview_brief_report(report)
+
+
 @app.command("swarm")
 def swarm(
     service: Annotated[str, typer.Option("--service", help="Optional service name filter.")] = "",
@@ -3859,6 +3879,167 @@ def _render_environment_discovery(report: dict[str, object]) -> None:
         _console.print(Panel("\n".join(f"- {item}" for item in actions), title="Next Actions", border_style="green"))
 
 
+def _build_overview_brief_report(
+    *,
+    target: str,
+    include_remote: bool,
+    include_logs: bool,
+    timeout_sec: int,
+) -> dict[str, object]:
+    scan_report = _collect_environment_discovery(timeout_sec=timeout_sec, secrets_file=None)
+    remote_target = _resolve_ssh_target_arg(target) if include_remote else ""
+    remote_report: dict[str, object] | None = None
+    if remote_target:
+        remote_report = _collect_remote_docker_report(
+            target=remote_target,
+            service_filter="",
+            include_logs=include_logs,
+            tail=120 if include_logs else 80,
+            timeout_sec=timeout_sec,
+        )
+    report: dict[str, object] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "overview-brief",
+        "mode": "read-only/no-secret",
+        "include_remote": bool(remote_report),
+        "remote_target": remote_target,
+        "scan": scan_report,
+        "remote": remote_report,
+    }
+    report["briefing"] = _build_overview_briefing(scan_report=scan_report, remote_report=remote_report)
+    report["recommended_commands"] = _build_overview_recommended_commands(report)
+    return report
+
+
+def _brief_status_rank(status: str) -> int:
+    return {"healthy": 0, "clear": 0, "attention": 1, "needs_attention": 1, "blocked": 2}.get(str(status), 1)
+
+
+def _build_overview_briefing(
+    *,
+    scan_report: dict[str, object],
+    remote_report: dict[str, object] | None,
+) -> dict[str, object]:
+    scan_briefing = scan_report.get("briefing", {})
+    if not isinstance(scan_briefing, dict):
+        scan_briefing = _build_environment_scan_briefing(scan_report)
+    remote_briefing = {}
+    if isinstance(remote_report, dict):
+        remote_briefing = remote_report.get("briefing", {})
+        if not isinstance(remote_briefing, dict):
+            remote_briefing = _build_remote_briefing(remote_report)
+
+    scan_status = str(scan_briefing.get("status", "attention"))
+    remote_status = str(remote_briefing.get("status", "")) if remote_briefing else ""
+    status = scan_status
+    if remote_status and _brief_status_rank(remote_status) > _brief_status_rank(status):
+        status = remote_status
+
+    scan_headline = str(scan_briefing.get("headline", "")).strip()
+    remote_headline = str(remote_briefing.get("headline", "")).strip()
+    if remote_headline:
+        headline = f"本机：{scan_headline} 远程：{remote_headline}"
+    else:
+        headline = f"本机：{scan_headline}"
+
+    evidence: list[str] = []
+    for prefix, briefing in (("scan", scan_briefing), ("remote", remote_briefing)):
+        raw_evidence = briefing.get("evidence", []) if isinstance(briefing, dict) else []
+        if not isinstance(raw_evidence, list):
+            continue
+        for item in raw_evidence[:3]:
+            evidence.append(f"{prefix}: {item}")
+
+    next_step = str(remote_briefing.get("next", "")).strip() if remote_briefing and remote_status in {"blocked", "attention"} else ""
+    if not next_step:
+        next_step = str(scan_briefing.get("next", "")).strip()
+    if not next_step and remote_briefing:
+        next_step = str(remote_briefing.get("next", "")).strip()
+    if not next_step:
+        next_step = "lazysre scan"
+    return {
+        "status": status,
+        "headline": headline.strip(),
+        "evidence": evidence[:6],
+        "next": next_step,
+    }
+
+
+def _build_overview_recommended_commands(report: dict[str, object]) -> list[str]:
+    commands: list[str] = []
+    def _push(value: str) -> None:
+        command = str(value or "").strip()
+        lower = command.lower()
+        if (
+            re.search(r"[\u4e00-\u9fff]", command)
+            and not lower.startswith(("lazysre ", "lsre ", "python -m lazysre"))
+        ):
+            return
+        if command and _looks_like_shell_command(command):
+            commands.append(command)
+
+    briefing = report.get("briefing", {})
+    if isinstance(briefing, dict) and str(briefing.get("next", "")).strip():
+        _push(str(briefing.get("next", "")).strip())
+    scan_report = report.get("scan", {})
+    if isinstance(scan_report, dict):
+        scan_briefing = scan_report.get("briefing", {})
+        if isinstance(scan_briefing, dict) and str(scan_briefing.get("next", "")).strip():
+            _push(str(scan_briefing.get("next", "")).strip())
+        actions = scan_report.get("next_actions", [])
+        if isinstance(actions, list):
+            for item in actions[:3]:
+                _push(str(item))
+    remote_report = report.get("remote", {})
+    if isinstance(remote_report, dict):
+        remote_briefing = remote_report.get("briefing", {})
+        if isinstance(remote_briefing, dict) and str(remote_briefing.get("next", "")).strip():
+            _push(str(remote_briefing.get("next", "")).strip())
+        recommendations = remote_report.get("recommendations", [])
+        if isinstance(recommendations, list):
+            for item in recommendations[:4]:
+                _push(str(item))
+    commands.append("lazysre autopilot")
+    return _dedupe_strings([item for item in commands if item.strip()])[:8]
+
+
+def _render_overview_brief_report(report: dict[str, object]) -> None:
+    if not (_console and Table):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    briefing = report.get("briefing", {})
+    if isinstance(briefing, dict) and Panel:
+        evidence = briefing.get("evidence", [])
+        evidence_lines = [f"- {item}" for item in evidence[:6]] if isinstance(evidence, list) else []
+        lines = [
+            f"状态: {briefing.get('status', '-')}",
+            f"结论: {briefing.get('headline', '-')}",
+        ]
+        if evidence_lines:
+            lines.extend(["证据:", *[str(item) for item in evidence_lines]])
+        if str(briefing.get("next", "")).strip():
+            lines.append(f"下一步: {briefing.get('next')}")
+        _console.print(Panel("\n".join(lines), title="LazySRE Brief", border_style="magenta"))
+    table = Table(title="Recommended Commands")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Command", style="green")
+    commands = report.get("recommended_commands", [])
+    if isinstance(commands, list):
+        for idx, command in enumerate(commands[:8], 1):
+            table.add_row(str(idx), str(command))
+    _console.print(table)
+    scan_report = report.get("scan", {})
+    if isinstance(scan_report, dict):
+        scan_briefing = scan_report.get("briefing", {})
+        if isinstance(scan_briefing, dict) and Panel:
+            _console.print(Panel(str(scan_briefing.get("headline", "")), title="Scan", border_style="cyan"))
+    remote_report = report.get("remote", {})
+    if isinstance(remote_report, dict):
+        remote_briefing = remote_report.get("briefing", {})
+        if isinstance(remote_briefing, dict) and Panel:
+            _console.print(Panel(str(remote_briefing.get("headline", "")), title="Remote", border_style="cyan"))
+
+
 def _collect_swarm_health_report(
     *,
     service_filter: str = "",
@@ -5568,6 +5749,19 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
         report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
         if _console:
             _render_environment_discovery(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return True
+
+    if subcommand == "brief":
+        report = _build_overview_brief_report(
+            target=_extract_ssh_target_from_text(" ".join(tokens[1:])),
+            include_remote=True,
+            include_logs="--logs" in " ".join(tokens[1:]).lower(),
+            timeout_sec=5,
+        )
+        if _console:
+            _render_overview_brief_report(report)
         else:
             typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return True
@@ -7354,6 +7548,7 @@ def _looks_like_shell_command(text: str) -> bool:
         "systemctl ",
         "journalctl ",
         "ssh ",
+        "lazysre ",
         "lsre ",
         "python ",
         "python3 ",
@@ -7411,6 +7606,7 @@ def _render_chat_short_help() -> None:
     lines = [
         "LazySRE Chat 快捷命令",
         "- /help: 查看帮助",
+        "- /brief [user@host]: 汇总本机 scan 和可选远程目标，直接给一份 AI 总览简报",
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
         "- /swarm [--logs]: 检查 Docker Swarm 服务、副本、任务失败证据",
         "- /watch [--count N]: 持续巡检并输出异常摘要",
@@ -7485,6 +7681,7 @@ def _normalize_natural_language_text(text: str) -> str:
         (r"\bactons\b", "actions"),
         (r"\bauto[-_\s]?pilot\b", "autopilot"),
         (r"\bconect\b", "connect"),
+        (r"\bbrif\b", "brief"),
     ]
     for pattern, replacement in replacements:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
@@ -7517,6 +7714,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "actons": "actions",
         "auto-pilot": "autopilot",
         "conect": "connect",
+        "brif": "brief",
         "hepl": "help",
     }
     known = [
@@ -7529,6 +7727,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "login",
         "init",
         "quickstart",
+        "brief",
         "scan",
         "swarm",
         "watch",
@@ -7621,6 +7820,19 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
             if _console:
                 _render_environment_discovery(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/brief"):
+            tail = text[len("/brief") :].strip()
+            report = _build_overview_brief_report(
+                target=_extract_ssh_target_from_text(tail),
+                include_remote=True,
+                include_logs="--logs" in tail.lower() or "日志" in tail,
+                timeout_sec=5,
+            )
+            if _console:
+                _render_overview_brief_report(report)
             else:
                 typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
             continue
@@ -8451,6 +8663,18 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             _render_action_inbox(inbox)
         else:
             typer.echo(json.dumps(inbox, ensure_ascii=False, indent=2))
+        return True
+    if _looks_like_brief_request(text):
+        report = _build_overview_brief_report(
+            target=_extract_ssh_target_from_text(text),
+            include_remote=True,
+            include_logs=any(k in lowered for k in ("日志", "logs")),
+            timeout_sec=5,
+        )
+        if _console:
+            _render_overview_brief_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return True
     if _looks_like_scan_request(text):
         report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
@@ -10312,6 +10536,25 @@ def _looks_like_scan_request(text: str) -> bool:
     return any(k in lowered for k in keywords)
 
 
+def _looks_like_brief_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "简报",
+        "总览",
+        "总体情况",
+        "整体情况",
+        "一眼看",
+        "给我总结",
+        "给我一个摘要",
+        "brief",
+        "overview",
+        "summary",
+    )
+    return any(k in lowered for k in keywords)
+
+
 def _looks_like_swarm_diagnose_request(text: str) -> bool:
     lowered = text.lower().strip()
     if not lowered:
@@ -11061,6 +11304,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "fix",
         "approve",
         "status",
+        "brief",
         "scan",
         "swarm",
         "watch",
@@ -11125,6 +11369,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "fix",
         "approve",
         "status",
+        "brief",
         "scan",
         "swarm",
         "watch",
