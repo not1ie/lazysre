@@ -18,6 +18,9 @@ curl -fsSL https://raw.githubusercontent.com/not1ie/lazysre/main/scripts/install
 # 启动
 lazysre
 # 首次直接启动会自动生成只读 LazySRE Brief，并给出下一步命令
+# 全屏 TUI（类似 Claude Code 的左右分区交互；不支持全屏时可用 --demo 预览）
+lazysre tui
+lazysre tui --demo
 # 兼容短命令
 lsre
 # 或 python 模块方式
@@ -49,6 +52,9 @@ lazysre actions --run 1
 lazysre autopilot
 # 远程自动驾驶：通过 SSH 诊断远程 Docker/Swarm
 lazysre autopilot --remote root@192.168.10.101 --logs
+# 生产闭环修复：Observe -> Plan -> Apply -> Verify -> Rollback Advice
+lazysre remediate "修复 swarm 副本不足"
+lazysre --execute remediate "修复 swarm 副本不足" --apply --rollback-on-failure
 # 首次启动向导（安装检查+LLM Key+目标连通性）
 lazysre setup
 # 交互式初始化（更像 Gemini/Claude：一步步填完即可）
@@ -123,6 +129,8 @@ lazysre --provider kimi chat
 - 持续巡检：`watch` 可定期扫描环境并输出异常摘要/JSONL
 - 行动收件箱：`actions` 将最近巡检结果转换成编号建议、模板命令与风险提示
 - 自动驾驶：`autopilot` 串起扫描、巡检、行动清单和修复计划
+- 全屏 TUI：`tui` 提供类似 Claude Code 的左右分区交互，支持自然语言、快捷命令和同屏结果流
+- 生产闭环修复：`remediate` 串起 Observe -> Plan -> Apply -> Verify -> Rollback Advice
 - 异常记忆：`watch` 发现的问题会写入长期记忆，后续相似诊断会自动引用历史经验
 - 安全执行器：支持 Dry-run、风险分级、审批确认、审计日志
 - ReAct 风格修复：支持自动生成修复计划与回滚命令
@@ -140,8 +148,11 @@ lazysre
 lsre
 lsre chat
 lsre "检查 k8s pod 状态"
+# 全屏 TUI 与闭环修复
+lsre tui
+lsre remediate "修复当前巡检发现的问题"
 # chat 快捷命令
-# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /doctor [/doctor fix] [/doctor strict]
+# /help /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /remediate /tui /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
@@ -208,6 +219,9 @@ lsre autopilot --remote root@192.168.10.101 --logs --report-md .data/remote-auto
 lsre autopilot --remote @target --logs
 # 直接消费最新巡检证据生成修复计划
 lsre fix "修复巡检发现的问题"
+# 闭环修复会先只读诊断，再执行修复，再只读验证；失败时可自动给出/执行回滚路径
+lsre remediate "修复巡检发现的问题"
+lsre --execute remediate "修复巡检发现的问题" --apply --rollback-on-failure
 # 环境预检（依赖/配置/连通性）
 lsre doctor
 lsre doctor --json

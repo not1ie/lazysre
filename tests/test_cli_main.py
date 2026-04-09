@@ -127,6 +127,10 @@ from lazysre.cli.main import (
     _render_cached_startup_brief,
     _version_info,
     _version_text,
+    _build_tui_dashboard_snapshot,
+    _render_tui_demo_text,
+    _derive_closed_loop_plan,
+    _infer_verification_commands,
     _safe_run_command,
     _should_launch_assistant,
 )
@@ -136,6 +140,7 @@ from lazysre.cli.llm import (
     OpenAICompatibleFunctionCallingLLM,
 )
 from lazysre.cli.fix_mode import FixPlan
+from lazysre.cli.policy import assess_command
 from lazysre.cli.runbook import find_runbook
 from lazysre.cli.secrets import SecretStore
 from lazysre.cli.target import TargetEnvironment, TargetEnvStore
@@ -269,6 +274,12 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv20 = ["lsre", "--version"]
     _rewrite_argv_for_default_run(argv20)
     assert argv20 == ["lsre", "--version"]
+    argv21 = ["lsre", "tui", "--demo"]
+    _rewrite_argv_for_default_run(argv21)
+    assert argv21 == ["lsre", "tui", "--demo"]
+    argv22 = ["lsre", "remediate", "swarm 副本不足", "--json"]
+    _rewrite_argv_for_default_run(argv22)
+    assert argv22 == ["lsre", "remediate", "swarm 副本不足", "--json"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -613,6 +624,8 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["watch"]) is False
     assert _should_launch_assistant(["actions"]) is False
     assert _should_launch_assistant(["autopilot"]) is False
+    assert _should_launch_assistant(["remediate"]) is False
+    assert _should_launch_assistant(["tui"]) is False
     assert _should_launch_assistant(["connect"]) is False
     assert _should_launch_assistant(["remote"]) is False
     assert _should_launch_assistant(["doctor"]) is False
@@ -646,6 +659,60 @@ def test_version_info_and_cli_version_output() -> None:
     assert result.returncode == 0
     assert "lazysre" in result.stdout
     assert str(info["version"]) in result.stdout
+
+
+def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
+    snapshot = _build_tui_dashboard_snapshot({"execute": False, "provider": "mock", "model": "test-model"})
+    rendered = _render_tui_demo_text(snapshot)
+
+    assert "LazySRE Fullscreen TUI" in rendered
+    assert "provider=mock" in rendered
+    assert "/remediate <目标>" in rendered
+    assert "/swarm --logs" in rendered
+
+
+def test_closed_loop_template_plan_infers_verify_commands() -> None:
+    plan = _derive_closed_loop_plan(
+        objective="swarm 副本不足",
+        observation={
+            "action_inbox": {
+                "actions": [
+                    {
+                        "template": "swarm-replicas-unhealthy",
+                        "variables": {"service": "api", "tail": "50"},
+                    }
+                ]
+            }
+        },
+        from_last_plan=False,
+    )
+
+    assert plan["source"] == "template"
+    assert plan["template"] == "swarm-replicas-unhealthy"
+    assert "docker service update --force api" in plan["apply_commands"]
+    assert "docker service rollback api" in plan["rollback_commands"]
+    assert any("docker service ps api" in cmd for cmd in plan["verify_commands"])
+
+
+def test_infer_verification_commands_for_k8s_and_swarm() -> None:
+    plan = FixPlan(
+        apply_commands=[
+            "kubectl -n prod rollout restart deploy/payment",
+            "docker service update --force api",
+        ],
+        rollback_commands=[],
+    )
+
+    commands = _infer_verification_commands(plan)
+    assert "kubectl get pods -A --field-selector=status.phase!=Running" in commands
+    assert "docker service ps api --no-trunc" in commands
+
+
+def test_docker_service_mutations_are_not_read_only() -> None:
+    assert assess_command(["docker", "service", "ps", "api"]).risk_level == "low"
+    assert assess_command(["docker", "service", "logs", "api"]).risk_level == "low"
+    assert assess_command(["docker", "service", "update", "--force", "api"]).risk_level == "high"
+    assert assess_command(["docker", "service", "rollback", "api"]).risk_level == "high"
 
 
 def test_extract_named_field_handles_markdown_and_plain_prefix() -> None:

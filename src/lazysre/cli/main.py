@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from difflib import get_close_matches
+import io
 import json
 import os
 import re
@@ -14,6 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Formatter
+import textwrap
 from typing import Annotated
 
 import typer
@@ -487,6 +490,63 @@ def autopilot(
             provider=str(options["provider"]),
             max_steps=int(options["max_steps"]),
         )
+
+
+@app.command("remediate")
+def remediate(
+    ctx: typer.Context,
+    objective: Annotated[str, typer.Argument(help="Natural-language remediation objective.")] = "修复当前巡检发现的问题",
+    remote_target: Annotated[str, typer.Option("--remote", help="Observe an SSH Docker/Swarm target before planning.")] = "",
+    service: Annotated[str, typer.Option("--service", help="Optional remote Swarm service filter.")] = "",
+    include_logs: Annotated[bool, typer.Option("--logs", help="Include logs during observation.")] = False,
+    apply: Annotated[bool, typer.Option("--apply", help="Apply the remediation plan. Default is dry-run planning.")] = False,
+    verify: Annotated[bool, typer.Option("--verify/--no-verify", help="Run read-only verification after apply/planning.")] = True,
+    rollback_on_failure: Annotated[bool, typer.Option("--rollback-on-failure", help="Run rollback commands when apply or verify fails in execute mode.")] = False,
+    from_last_plan: Annotated[bool, typer.Option("--from-last-plan", help="Use .data/lsre-fix-last.json instead of deriving a plan from observation.")] = False,
+    max_apply_steps: Annotated[int, typer.Option("--max-apply-steps", help="Max apply commands to run.")] = 6,
+    as_json: Annotated[bool, typer.Option("--json", help="Print closed-loop report as JSON.")] = False,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
+    report = _run_closed_loop_remediation(
+        objective=objective,
+        remote_target=remote_target,
+        service_filter=service,
+        include_logs=include_logs,
+        apply=apply,
+        verify=verify,
+        rollback_on_failure=rollback_on_failure,
+        from_last_plan=from_last_plan,
+        max_apply_steps=max(1, min(max_apply_steps, 30)),
+        execute=bool(options["execute"]),
+        approval_mode=str(options["approval_mode"]),
+        audit_log=str(options["audit_log"]),
+        allow_high_risk=False,
+        auto_approve_low_risk=True,
+        model=str(options["model"]),
+        provider=str(options["provider"]),
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    _render_closed_loop_report(report)
 
 
 @app.command("remote")
@@ -1088,6 +1148,33 @@ def chat(
     _assistant_chat_loop(options)
 
 
+@app.command("tui")
+def tui(
+    ctx: typer.Context,
+    demo: Annotated[bool, typer.Option("--demo", help="Render a static TUI preview instead of opening fullscreen mode.")] = False,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
+    _run_tui(options, demo=demo)
+
+
 @app.command("fix")
 def fix_instruction(
     ctx: typer.Context,
@@ -1509,6 +1596,17 @@ def _run_fix(
         model=model,
         provider=provider,
     )
+    verify_summary = _execute_read_only_commands(
+        _infer_verification_commands(plan),
+        stage="verify",
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+    )
+    if _console and Panel:
+        _console.print(Panel(json.dumps(verify_summary, ensure_ascii=False, indent=2), title="Post-Apply Verification", border_style="green" if int(verify_summary.get("failed", 0) or 0) == 0 else "yellow"))
+    else:
+        typer.echo("Post-Apply Verification:")
+        typer.echo(json.dumps(verify_summary, ensure_ascii=False, indent=2))
 
     _persist_successful_fix_case(
         instruction=instruction,
@@ -7681,6 +7779,8 @@ def _render_chat_short_help() -> None:
         "- /autopilot [目标]: 自动扫描 -> 巡检 -> 行动清单，可加 --fix 生成修复计划",
         "- /connect [user@host]: 远程连接体检；SSH 连通后自动保存为默认远程目标",
         "- /remote [user@host] [--logs]: 通过 SSH 只读诊断远程 Docker/Swarm；已保存 ssh_target 时可省略主机",
+        "- /remediate <目标>: 生产闭环修复（Observe -> Plan -> Apply -> Verify -> Rollback Advice）",
+        "- /tui: 启动全屏 TUI（也可直接运行 lazysre tui）",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
@@ -7730,6 +7830,227 @@ def _render_chat_short_help() -> None:
         _console.print(Panel(text, border_style="cyan"))
     else:
         typer.echo(text)
+
+
+def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, object]:
+    target = TargetEnvStore().load()
+    return {
+        "title": "LazySRE TUI",
+        "version": __version__,
+        "mode": "execute" if bool(options.get("execute", False)) else "dry-run",
+        "provider": str(options.get("provider", "auto")),
+        "model": str(options.get("model", settings.model_name)),
+        "namespace": str(target.k8s_namespace or "default"),
+        "ssh_target": str(target.ssh_target or settings.target_ssh_target or ""),
+        "prometheus_url": str(target.prometheus_url or settings.target_prometheus_url or ""),
+        "shortcuts": [
+            "/brief",
+            "/scan",
+            "/swarm --logs",
+            "/autopilot",
+            "/remediate <目标>",
+            "/mode execute",
+            "exit",
+        ],
+    }
+
+
+def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
+    shortcuts = snapshot.get("shortcuts", [])
+    if not isinstance(shortcuts, list):
+        shortcuts = []
+    lines = [
+        "╭─ LazySRE Fullscreen TUI ─────────────────────────────────────────╮",
+        f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
+        "├─ Target ────────────────────────────────────────────────────────┤",
+        f"│ namespace={snapshot.get('namespace', '-')}",
+        f"│ ssh_target={snapshot.get('ssh_target', '-') or '(not set)'}",
+        f"│ prometheus={snapshot.get('prometheus_url', '-') or '(not set)'}",
+        "├─ Shortcuts ─────────────────────────────────────────────────────┤",
+        *[f"│ {item}" for item in shortcuts],
+        "├─ Conversation ──────────────────────────────────────────────────┤",
+        "│ 直接输入自然语言，例如：检查当前服务器 / 修复 swarm 副本不足",
+        "│ 底部输入框提交后会在同屏显示 Observe/Action/Result。",
+        "╰─────────────────────────────────────────────────────────────────╯",
+    ]
+    return "\n".join(lines)
+
+
+def _run_tui(options: dict[str, object], *, demo: bool) -> None:
+    snapshot = _build_tui_dashboard_snapshot(options)
+    if demo or (not sys.stdin.isatty()) or (not sys.stdout.isatty()):
+        typer.echo(_render_tui_demo_text(snapshot))
+        return
+    try:
+        import curses
+    except Exception:
+        typer.echo("当前 Python 环境不支持 curses，使用预览模式：")
+        typer.echo(_render_tui_demo_text(snapshot))
+        return
+    curses.wrapper(lambda stdscr: _run_curses_tui(stdscr, options, snapshot))
+
+
+def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, object]) -> None:
+    import curses
+
+    curses.curs_set(1)
+    stdscr.keypad(True)
+    history: list[tuple[str, str]] = [
+        ("LazySRE", "全屏 TUI 已启动。输入自然语言，或使用 /brief /scan /swarm /autopilot /remediate。"),
+    ]
+    input_text = ""
+    status = "ready"
+    while True:
+        _draw_tui(stdscr, snapshot=snapshot, history=history, input_text=input_text, status=status)
+        key = stdscr.get_wch()
+        if isinstance(key, str):
+            if key in {"\n", "\r"}:
+                text = input_text.strip()
+                input_text = ""
+                if not text:
+                    continue
+                if text.lower() in {"exit", "quit", ":q", "/exit", "/quit"}:
+                    break
+                history.append(("You", text))
+                status = "running"
+                _draw_tui(stdscr, snapshot=snapshot, history=history, input_text=input_text, status=status)
+                output = _handle_tui_input(text, options)
+                history.append(("LazySRE", output.strip() or "(no output)"))
+                status = "ready"
+                continue
+            if key in {"\x7f", "\b"}:
+                input_text = input_text[:-1]
+                continue
+            if key == "\x1b":
+                break
+            if key.isprintable():
+                input_text += key
+                continue
+        elif key in {curses.KEY_BACKSPACE, curses.KEY_DC}:
+            input_text = input_text[:-1]
+
+
+def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, str]], input_text: str, status: str) -> None:
+    height, width = stdscr.getmaxyx()
+    stdscr.erase()
+    sidebar_w = min(max(24, width // 4), 34)
+    title = f" LazySRE {snapshot.get('version', '-')} | {status} "
+    stdscr.addnstr(0, 0, title.ljust(width), width - 1)
+    for y in range(1, height - 2):
+        if sidebar_w < width:
+            stdscr.addch(y, sidebar_w, "|")
+    side_lines = [
+        f"mode: {snapshot.get('mode', '-')}",
+        f"provider: {snapshot.get('provider', '-')}",
+        f"model: {snapshot.get('model', '-')}",
+        f"ns: {snapshot.get('namespace', '-')}",
+        f"ssh: {snapshot.get('ssh_target', '-') or 'not set'}",
+        "",
+        "Shortcuts:",
+        "/brief",
+        "/scan",
+        "/swarm --logs",
+        "/autopilot",
+        "/remediate ...",
+        "/mode execute",
+        "Esc/exit quit",
+    ]
+    for idx, line in enumerate(side_lines[: max(0, height - 4)], 1):
+        stdscr.addnstr(idx, 1, line, max(1, sidebar_w - 2))
+
+    content_w = max(10, width - sidebar_w - 3)
+    rows: list[str] = []
+    for speaker, text in history[-30:]:
+        rows.append(f"{speaker}:")
+        for raw in str(text).splitlines() or [""]:
+            rows.extend(textwrap.wrap(raw, width=content_w) or [""])
+        rows.append("")
+    visible = rows[-max(1, height - 5) :]
+    for idx, line in enumerate(visible, 1):
+        stdscr.addnstr(idx, sidebar_w + 2, line, content_w)
+    prompt = f"lsre> {input_text}"
+    stdscr.addnstr(height - 2, 0, "-" * max(1, width - 1), width - 1)
+    stdscr.addnstr(height - 1, 0, prompt, width - 1)
+    stdscr.move(height - 1, min(len(prompt), width - 2))
+    stdscr.refresh()
+
+
+def _capture_plain_output(callback) -> str:
+    global _console
+    old_console = _console
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        _console = None
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            callback()
+    except Exception as exc:
+        print(f"error: {exc}", file=out)
+    finally:
+        _console = old_console
+    return "\n".join(x for x in [out.getvalue().strip(), err.getvalue().strip()] if x)
+
+
+def _handle_tui_input(text: str, options: dict[str, object]) -> str:
+    normalized = _normalize_chat_input_text(text)
+    lowered = normalized.lower()
+    if lowered in {"/help", "help", "?"}:
+        return _render_tui_demo_text(_build_tui_dashboard_snapshot(options))
+    if lowered.startswith("/brief"):
+        tail = normalized[len("/brief") :].strip()
+        return _capture_plain_output(lambda: _render_overview_brief_report(_build_overview_brief_report(target=tail, include_remote=True, include_logs="--logs" in lowered, timeout_sec=5)))
+    if lowered.startswith("/scan"):
+        return _capture_plain_output(lambda: _render_environment_discovery(_collect_environment_discovery(timeout_sec=5, secrets_file=None)))
+    if lowered.startswith("/swarm"):
+        return _capture_plain_output(lambda: _render_swarm_health_report(_collect_swarm_health_report(service_filter=_extract_swarm_service_name(normalized), include_logs="--logs" in lowered, tail=120, timeout_sec=6)))
+    if lowered.startswith("/autopilot"):
+        goal = normalized[len("/autopilot") :].strip() or "巡检当前环境并给出下一步行动"
+        return _capture_plain_output(lambda: _render_autopilot_report(_run_autopilot_cycle(goal=goal, include_swarm=True, include_logs="--logs" in lowered, remember=True, timeout_sec=5)))
+    if lowered.startswith("/remediate"):
+        objective = normalized[len("/remediate") :].strip() or "修复当前巡检发现的问题"
+        return _capture_plain_output(
+            lambda: _render_closed_loop_report(
+                _run_closed_loop_remediation(
+                    objective=objective,
+                    remote_target=_extract_ssh_target_from_text(normalized),
+                    service_filter=_extract_swarm_service_name(normalized),
+                    include_logs="--logs" in lowered,
+                    apply="--apply" in lowered,
+                    verify=True,
+                    rollback_on_failure="--rollback-on-failure" in lowered,
+                    from_last_plan=False,
+                    max_apply_steps=6,
+                    execute=bool(options.get("execute", False)),
+                    approval_mode=str(options.get("approval_mode", "balanced")),
+                    audit_log=str(options.get("audit_log", ".data/lsre-audit.jsonl")),
+                    allow_high_risk=False,
+                    auto_approve_low_risk=True,
+                    model=str(options.get("model", settings.model_name)),
+                    provider=str(options.get("provider", "auto")),
+                )
+            )
+        )
+    return _capture_plain_output(
+        lambda: _run_once(
+            instruction=normalized,
+            execute=bool(options.get("execute", False)),
+            approve=bool(options.get("approve", False)),
+            interactive_approval=bool(options.get("interactive_approval", True)),
+            stream_output=False,
+            verbose_reasoning=False,
+            approval_mode=str(options.get("approval_mode", "balanced")),
+            audit_log=str(options.get("audit_log", ".data/lsre-audit.jsonl")),
+            lock_file=str(options.get("lock_file", ".data/lsre-tool-lock.json")),
+            session_file=str(options.get("session_file", ".data/lsre-session.json")),
+            deny_tool=list(options.get("deny_tool", [])),
+            deny_prefix=list(options.get("deny_prefix", [])),
+            tool_pack=list(options.get("tool_pack", ["builtin"])),
+            remote_gateway=list(options.get("remote_gateway", [])),
+            model=str(options.get("model", settings.model_name)),
+            provider=str(options.get("provider", "auto")),
+            max_steps=int(options.get("max_steps", 6)),
+        )
+    )
 
 
 def _normalize_natural_language_text(text: str) -> str:
@@ -7782,6 +8103,8 @@ def _normalize_slash_command_text(text: str) -> str:
         "auto-pilot": "autopilot",
         "conect": "connect",
         "brif": "brief",
+        "remedate": "remediate",
+        "remediatee": "remediate",
         "hepl": "help",
     }
     known = [
@@ -7802,6 +8125,8 @@ def _normalize_slash_command_text(text: str) -> str:
         "autopilot",
         "connect",
         "remote",
+        "remediate",
+        "tui",
         "setup",
         "status",
         "doctor",
@@ -7882,6 +8207,9 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower() in {"/context", "/ctx"}:
             _render_context_snapshot(options, execute_mode=runtime_execute)
+            continue
+        if text.lower().startswith("/tui"):
+            _run_tui({**options, "execute": runtime_execute}, demo=False)
             continue
         if text.lower().startswith("/scan"):
             report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
@@ -8000,6 +8328,38 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                     provider=str(options["provider"]),
                     max_steps=int(options["max_steps"]),
                 )
+            continue
+        if text.lower().startswith("/remediate"):
+            tail = text[len("/remediate") :].strip()
+            apply_requested = "--apply" in tail.lower() or "执行" in tail
+            rollback_requested = "--rollback-on-failure" in tail.lower() or "失败回滚" in tail
+            objective = re.sub(r"--(?:apply|rollback-on-failure|logs)\b", "", tail, flags=re.IGNORECASE).strip()
+            report = _run_closed_loop_remediation(
+                objective=objective or "修复当前巡检发现的问题",
+                remote_target=_extract_ssh_target_from_text(tail),
+                service_filter=_extract_swarm_service_name(tail),
+                include_logs="--logs" in tail.lower() or "日志" in tail,
+                apply=apply_requested,
+                verify=True,
+                rollback_on_failure=rollback_requested,
+                from_last_plan="last" in tail.lower() or "最近计划" in tail,
+                max_apply_steps=6,
+                execute=_resolve_execute_for_apply_request(
+                    runtime_execute,
+                    label="闭环修复执行",
+                    apply=apply_requested,
+                ),
+                approval_mode=str(options["approval_mode"]),
+                audit_log=str(options["audit_log"]),
+                allow_high_risk=False,
+                auto_approve_low_risk=True,
+                model=str(options["model"]),
+                provider=str(options["provider"]),
+            )
+            if _console:
+                _render_closed_loop_report(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
             continue
         if text.lower().startswith("/remote"):
             tail = text[len("/remote") :].strip()
@@ -8928,6 +9288,327 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
     return False
 
 
+def _run_closed_loop_remediation(
+    *,
+    objective: str,
+    remote_target: str,
+    service_filter: str,
+    include_logs: bool,
+    apply: bool,
+    verify: bool,
+    rollback_on_failure: bool,
+    from_last_plan: bool,
+    max_apply_steps: int,
+    execute: bool,
+    approval_mode: str,
+    audit_log: str,
+    allow_high_risk: bool,
+    auto_approve_low_risk: bool,
+    model: str,
+    provider: str,
+) -> dict[str, object]:
+    observation = (
+        _run_remote_autopilot_cycle(
+            goal=objective,
+            target=_resolve_ssh_target_arg(remote_target),
+            service_filter=service_filter,
+            include_logs=include_logs,
+            timeout_sec=6,
+        )
+        if remote_target.strip()
+        else _run_autopilot_cycle(
+            goal=objective,
+            include_swarm=True,
+            include_logs=include_logs,
+            remember=True,
+            timeout_sec=5,
+        )
+    )
+    plan_payload = _derive_closed_loop_plan(
+        objective=objective,
+        observation=observation,
+        from_last_plan=from_last_plan,
+    )
+    plan = FixPlan(
+        apply_commands=[str(x) for x in list(plan_payload.get("apply_commands", []))],
+        rollback_commands=[str(x) for x in list(plan_payload.get("rollback_commands", []))],
+    )
+    diagnose_commands = [str(x) for x in list(plan_payload.get("diagnose_commands", []))]
+    verify_commands = [str(x) for x in list(plan_payload.get("verify_commands", []))]
+    execution = _run_closed_loop_execution(
+        diagnose_commands=diagnose_commands,
+        plan=plan,
+        verify_commands=verify_commands,
+        apply=apply,
+        verify=verify,
+        rollback_on_failure=rollback_on_failure,
+        max_apply_steps=max_apply_steps,
+        execute=execute,
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+        allow_high_risk=allow_high_risk,
+        auto_approve_low_risk=auto_approve_low_risk,
+        model=model,
+        provider=provider,
+    )
+    report = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "closed-loop-remediation",
+        "objective": objective,
+        "mode": "execute" if execute else "dry-run",
+        "apply_requested": apply,
+        "observation": {
+            "source": observation.get("source", ""),
+            "status": observation.get("status", ""),
+            "summary": observation.get("summary", {}),
+            "next_step": observation.get("next_step", ""),
+        },
+        "plan": plan_payload,
+        "execution": execution,
+        "ok": bool(execution.get("ok", False)),
+        "next_step": _closed_loop_next_step(execution),
+    }
+    _write_json_file(Path(".data/lsre-remediation-last.json"), report)
+    return report
+
+
+def _derive_closed_loop_plan(
+    *,
+    objective: str,
+    observation: dict[str, object],
+    from_last_plan: bool,
+) -> dict[str, object]:
+    if from_last_plan:
+        loaded = _load_last_fix_plan()
+        if loaded:
+            return {
+                "source": "last-fix-plan",
+                "template": "",
+                "diagnose_commands": _infer_verification_commands(loaded),
+                "apply_commands": loaded.apply_commands,
+                "rollback_commands": loaded.rollback_commands,
+                "verify_commands": _infer_verification_commands(loaded),
+            }
+    template = match_template_for_text(objective)
+    actions = (observation.get("action_inbox", {}) if isinstance(observation.get("action_inbox", {}), dict) else {}).get("actions", [])
+    first_action = actions[0] if isinstance(actions, list) and actions and isinstance(actions[0], dict) else {}
+    if not template:
+        template_name = str(first_action.get("template", "")).strip()
+        template = get_remediation_template(template_name) if template_name else None
+    if template:
+        variables = first_action.get("variables", {})
+        overrides = {str(k): str(v) for k, v in variables.items()} if isinstance(variables, dict) else {}
+        rendered = render_remediation_template(template=template, overrides=overrides)
+        plan = FixPlan(
+            apply_commands=[str(x) for x in list(rendered.get("apply_commands", []))],
+            rollback_commands=[str(x) for x in list(rendered.get("rollback_commands", []))],
+        )
+        return {
+            "source": "template",
+            "template": template.name,
+            "variables": rendered.get("variables", {}),
+            "diagnose_commands": [str(x) for x in list(rendered.get("diagnose_commands", []))],
+            "apply_commands": plan.apply_commands,
+            "rollback_commands": plan.rollback_commands,
+            "verify_commands": _infer_verification_commands(plan, diagnose_commands=[str(x) for x in list(rendered.get("diagnose_commands", []))]),
+        }
+    command = str(first_action.get("command", "")).strip()
+    diagnose = [command] if command and _looks_like_shell_command(command) else []
+    return {
+        "source": "observation-action",
+        "template": "",
+        "variables": {},
+        "diagnose_commands": diagnose,
+        "apply_commands": [],
+        "rollback_commands": [],
+        "verify_commands": diagnose,
+    }
+
+
+def _run_closed_loop_execution(
+    *,
+    diagnose_commands: list[str],
+    plan: FixPlan,
+    verify_commands: list[str],
+    apply: bool,
+    verify: bool,
+    rollback_on_failure: bool,
+    max_apply_steps: int,
+    execute: bool,
+    approval_mode: str,
+    audit_log: str,
+    allow_high_risk: bool,
+    auto_approve_low_risk: bool,
+    model: str,
+    provider: str,
+) -> dict[str, object]:
+    diagnose_result = _execute_read_only_commands(
+        diagnose_commands,
+        stage="diagnose",
+        approval_mode=approval_mode,
+        audit_log=audit_log,
+    )
+    if apply and plan.apply_commands:
+        apply_result = _execute_fix_plan_steps(
+            plan=plan,
+            max_apply_steps=max_apply_steps,
+            execute=execute,
+            approval_mode=approval_mode,
+            audit_log=audit_log,
+            allow_high_risk=allow_high_risk,
+            auto_approve_low_risk=auto_approve_low_risk,
+            model=model,
+            provider=provider,
+        )
+    else:
+        apply_result = {
+            "executed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "skipped_high_risk": 0,
+            "skipped_reason": "apply not requested" if not apply else "no apply commands",
+        }
+    verify_result = (
+        _execute_read_only_commands(
+            verify_commands,
+            stage="verify",
+            approval_mode=approval_mode,
+            audit_log=audit_log,
+        )
+        if verify
+        else {"executed": 0, "succeeded": 0, "failed": 0, "skipped": 0, "items": []}
+    )
+    failed = (
+        int(diagnose_result.get("failed", 0) or 0)
+        + int(apply_result.get("failed", 0) or 0)
+        + int(verify_result.get("failed", 0) or 0)
+    )
+    rollback_result: dict[str, object] = {"executed": 0, "succeeded": 0, "failed": 0, "skipped": 0, "items": []}
+    if rollback_on_failure and execute and failed and plan.rollback_commands:
+        rollback_result = _execute_fix_plan_steps(
+            plan=FixPlan(apply_commands=plan.rollback_commands, rollback_commands=[]),
+            max_apply_steps=len(plan.rollback_commands),
+            execute=True,
+            approval_mode=approval_mode,
+            audit_log=audit_log,
+            allow_high_risk=True,
+            auto_approve_low_risk=True,
+            model=model,
+            provider=provider,
+            skip_confirm=True,
+        )
+    return {
+        "ok": failed == 0,
+        "diagnose": diagnose_result,
+        "apply": apply_result,
+        "verify": verify_result,
+        "rollback": rollback_result,
+    }
+
+
+def _execute_read_only_commands(
+    commands: list[str],
+    *,
+    stage: str,
+    approval_mode: str,
+    audit_log: str,
+) -> dict[str, object]:
+    executor = SafeExecutor(
+        dry_run=False,
+        approval_mode=approval_mode,
+        approval_granted=True,
+        audit_logger=AuditLogger(Path(audit_log)),
+    )
+    items: list[dict[str, object]] = []
+    executed = succeeded = failed = skipped = 0
+    for command_text in _dedupe_strings(commands)[:12]:
+        try:
+            command = shlex.split(command_text)
+        except ValueError as exc:
+            skipped += 1
+            items.append({"command": command_text, "ok": False, "skipped": True, "reason": str(exc)})
+            continue
+        decision = assess_command(command, approval_mode=approval_mode)
+        if decision.risk_level != "low":
+            skipped += 1
+            items.append(
+                {
+                    "command": command_text,
+                    "ok": False,
+                    "skipped": True,
+                    "reason": f"{stage} only runs read-only commands; risk={decision.risk_level}",
+                }
+            )
+            continue
+        result = asyncio.run(executor.run(command))
+        executed += 1
+        succeeded += 1 if result.ok else 0
+        failed += 0 if result.ok else 1
+        items.append(
+            {
+                "command": command_text,
+                "ok": result.ok,
+                "exit_code": result.exit_code,
+                "stdout_preview": result.stdout[:500],
+                "stderr_preview": result.stderr[:500],
+            }
+        )
+    return {"executed": executed, "succeeded": succeeded, "failed": failed, "skipped": skipped, "items": items}
+
+
+def _infer_verification_commands(plan: FixPlan, *, diagnose_commands: list[str] | None = None) -> list[str]:
+    commands: list[str] = []
+    if diagnose_commands:
+        commands.extend(diagnose_commands[:4])
+    for command_text in plan.apply_commands:
+        text = str(command_text).strip()
+        if not text:
+            continue
+        if "rollout status" in text:
+            commands.append(text)
+        if text.startswith("docker service update ") or text.startswith("docker service rollback "):
+            parts = shlex.split(text)
+            service = parts[-1] if parts else ""
+            if service and not service.startswith("-"):
+                commands.append(f"docker service ps {service} --no-trunc")
+                commands.append("docker service ls --format '{{.Name}}\\t{{.Replicas}}\\t{{.Image}}'")
+        if text.startswith("kubectl ") and (" scale " in text or " set image " in text or " rollout restart " in text):
+            commands.append("kubectl get pods -A --field-selector=status.phase!=Running")
+    return _dedupe_strings(commands)
+
+
+def _closed_loop_next_step(execution: dict[str, object]) -> str:
+    if bool(execution.get("ok", False)):
+        return "闭环完成：诊断、执行/预演和验证阶段未发现失败。建议继续 watch 观察一个周期。"
+    rollback = execution.get("rollback", {})
+    if isinstance(rollback, dict) and int(rollback.get("executed", 0) or 0):
+        return "闭环检测到失败并已触发回滚。建议立刻查看 verify 阶段输出并保留审计日志。"
+    return "闭环检测到失败。建议先执行 lazysre undo 或带 --rollback-on-failure 重试，并查看 .data/lsre-remediation-last.json。"
+
+
+def _render_closed_loop_report(report: dict[str, object]) -> None:
+    if not (_console and Panel):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    execution = report.get("execution", {})
+    if not isinstance(execution, dict):
+        execution = {}
+    plan = report.get("plan", {})
+    if not isinstance(plan, dict):
+        plan = {}
+    lines = [
+        f"目标: {report.get('objective', '')}",
+        f"模式: {report.get('mode', '-')}",
+        f"计划来源: {plan.get('source', '-')}",
+        f"模板: {plan.get('template', '-') or '-'}",
+        f"诊断: {execution.get('diagnose', {}).get('succeeded', 0) if isinstance(execution.get('diagnose', {}), dict) else 0} ok",
+        f"执行: {execution.get('apply', {}).get('succeeded', 0) if isinstance(execution.get('apply', {}), dict) else 0} ok",
+        f"验证: {execution.get('verify', {}).get('succeeded', 0) if isinstance(execution.get('verify', {}), dict) else 0} ok",
+        f"下一步: {report.get('next_step', '')}",
+    ]
+    _console.print(Panel("\n".join(lines), title="Closed Loop Remediation", border_style="green" if report.get("ok") else "yellow"))
+
+
 def _run_remediation_template(
     *,
     template_name: str,
@@ -8993,8 +9674,14 @@ def _run_remediation_template(
             approval_mode=approval_mode,
         ),
     )
-    exec_summary = _execute_fix_plan_steps(
+    verify_commands = _infer_verification_commands(plan, diagnose_commands=diagnose_commands)
+    exec_summary = _run_closed_loop_execution(
+        diagnose_commands=diagnose_commands,
         plan=plan,
+        verify_commands=verify_commands,
+        apply=True,
+        verify=True,
+        rollback_on_failure=False,
         max_apply_steps=max_apply_steps,
         execute=execute,
         approval_mode=approval_mode,
@@ -9004,12 +9691,21 @@ def _run_remediation_template(
         model=model,
         provider=provider,
     )
+    if _console and Panel:
+        _console.print(Panel(json.dumps(exec_summary, ensure_ascii=False, indent=2), title="Template Closed Loop", border_style="green" if exec_summary.get("ok") else "yellow"))
+    else:
+        typer.echo(json.dumps(exec_summary, ensure_ascii=False, indent=2))
     _persist_successful_fix_case(
         instruction=f"[template] {template.name}",
         final_text=json.dumps(payload, ensure_ascii=False),
         plan=plan,
         plan_md_path=Path(".data/lsre-template-last.md"),
-        exec_summary=exec_summary,
+        exec_summary={
+            "executed": int(exec_summary.get("apply", {}).get("executed", 0)) if isinstance(exec_summary.get("apply", {}), dict) else 0,
+            "succeeded": int(exec_summary.get("apply", {}).get("succeeded", 0)) if isinstance(exec_summary.get("apply", {}), dict) else 0,
+            "failed": int(exec_summary.get("apply", {}).get("failed", 0)) if isinstance(exec_summary.get("apply", {}), dict) else 0,
+            "skipped_high_risk": int(exec_summary.get("apply", {}).get("skipped_high_risk", 0)) if isinstance(exec_summary.get("apply", {}), dict) else 0,
+        },
         apply=apply,
         execute=execute,
     )
@@ -11379,6 +12075,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
     commands = {
         "run",
         "chat",
+        "tui",
         "login",
         "logout",
         "init",
@@ -11394,6 +12091,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "watch",
         "actions",
         "autopilot",
+        "remediate",
         "connect",
         "remote",
         "doctor",
@@ -11447,6 +12145,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
     commands = {
         "run",
         "chat",
+        "tui",
         "login",
         "logout",
         "init",
@@ -11462,6 +12161,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "watch",
         "actions",
         "autopilot",
+        "remediate",
         "connect",
         "remote",
         "doctor",

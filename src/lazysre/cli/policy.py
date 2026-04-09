@@ -143,10 +143,17 @@ def _assess_kubectl(args: list[str], joined: str) -> tuple[str, list[str]]:
 
 
 def _assess_docker(args: list[str], joined: str) -> tuple[str, list[str]]:
-    read_only = {"ps", "images", "inspect", "stats", "logs", "service", "node", "info"}
+    read_only = {"ps", "images", "inspect", "stats", "logs", "node", "info"}
     mutate = {"restart", "stop", "start", "kill", "rm", "rmi", "run"}
 
     cmd = _first_subcommand(args)
+    if cmd == "service":
+        service_cmd = _first_subcommand(args[1:])
+        if service_cmd in {"ls", "ps", "logs", "inspect"}:
+            return "low", ["docker service 诊断查询命令。"]
+        if service_cmd in {"update", "scale", "rm", "rollback", "create"}:
+            return "high", ["docker service 变更类命令，可能影响 Swarm 服务。"]
+        return "medium", ["docker service 非白名单子命令，建议先审批。"]
     if cmd in read_only:
         return "low", ["docker 诊断查询命令。"]
     if cmd in mutate:
