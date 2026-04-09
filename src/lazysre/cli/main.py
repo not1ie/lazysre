@@ -4493,6 +4493,8 @@ def _run_remote_connect_flow(
             "target": _normalize_ssh_target(str(report.get("target", "") or "")),
             "reason": "save disabled",
         }
+    if "briefing" not in report:
+        report["briefing"] = _build_remote_briefing(report)
     return report
 
 
@@ -4512,7 +4514,7 @@ def _remote_report_payload(
     recommendations: list[str],
 ) -> dict[str, object]:
     summary = _summarize_doctor_checks(checks)
-    return {
+    payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": "remote-ssh",
         "target": target,
@@ -4529,6 +4531,101 @@ def _remote_report_payload(
         "logs": log_reports,
         "root_causes": root_causes,
         "recommendations": recommendations,
+    }
+    payload["briefing"] = _build_remote_briefing(payload)
+    return payload
+
+
+def _remote_report_check(report: dict[str, object], name: str) -> dict[str, object]:
+    checks = report.get("checks", [])
+    if not isinstance(checks, list):
+        return {}
+    for raw in checks:
+        item = raw if isinstance(raw, dict) else {}
+        if str(item.get("name", "")).strip() == name:
+            return item
+    return {}
+
+
+def _build_remote_briefing(report: dict[str, object]) -> dict[str, object]:
+    target = str(report.get("target", "") or "").strip() or "(unknown)"
+    summary = report.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    unhealthy = report.get("unhealthy_services", [])
+    unhealthy_items = unhealthy if isinstance(unhealthy, list) else []
+    bad_nodes = report.get("bad_nodes", [])
+    bad_node_items = bad_nodes if isinstance(bad_nodes, list) else []
+    root_causes = report.get("root_causes", [])
+    cause_items = root_causes if isinstance(root_causes, list) else []
+    recommendations = report.get("recommendations", [])
+    recommendation_items = recommendations if isinstance(recommendations, list) else []
+
+    ssh_check = _remote_report_check(report, "ssh.connect")
+    docker_check = _remote_report_check(report, "remote.docker.version")
+    swarm_check = _remote_report_check(report, "remote.docker.swarm")
+    status = "healthy" if bool(report.get("ok")) else "attention"
+    evidence: list[str] = []
+
+    if not _normalize_ssh_target(target):
+        status = "blocked"
+        headline = "SSH 目标格式不合法，LazySRE 还不能开始远程诊断。"
+    elif ssh_check and not bool(ssh_check.get("ok")):
+        status = "blocked"
+        headline = f"无法连接远程服务器 {target}，优先检查网络、SSH Key 或 ssh-agent。"
+        detail = str(ssh_check.get("detail", "") or "").strip()
+        if detail:
+            evidence.append(detail[:180])
+    elif docker_check and not bool(docker_check.get("ok")):
+        status = "attention"
+        headline = f"{target} 的 SSH 已连通，但 Docker 当前不可访问。"
+        detail = str(docker_check.get("detail", "") or "").strip()
+        if detail:
+            evidence.append(detail[:180])
+    elif swarm_check and not bool(swarm_check.get("ok")):
+        status = "attention"
+        headline = f"{target} 的 Docker 可访问，但没有检测到 active Swarm。"
+        detail = str(swarm_check.get("detail", "") or "").strip()
+        if detail:
+            evidence.append(f"Swarm state: {detail[:120]}")
+    elif unhealthy_items:
+        status = "attention"
+        names = [
+            f"{str(item.get('name', '-'))}({str(item.get('replicas', '-'))})"
+            for item in unhealthy_items[:4]
+            if isinstance(item, dict)
+        ]
+        headline = f"发现 {len(unhealthy_items)} 个远程 Swarm 服务副本异常：{', '.join(names) or 'unknown'}。"
+    elif bad_node_items:
+        status = "attention"
+        names = [
+            str(item.get("hostname", item.get("name", "-")))
+            for item in bad_node_items[:4]
+            if isinstance(item, dict)
+        ]
+        headline = f"发现 {len(bad_node_items)} 个远程 Swarm 节点状态异常：{', '.join(names) or 'unknown'}。"
+    else:
+        headline = f"{target} 远程 Docker/Swarm 只读体检未发现阻断性异常。"
+
+    if not evidence:
+        evidence.append(
+            f"checks: pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} error={summary.get('error', 0)}"
+        )
+    if cause_items:
+        first = cause_items[0] if isinstance(cause_items[0], dict) else {}
+        category = str(first.get("category", "unknown"))
+        service = str(first.get("service", "-"))
+        advice = str(first.get("advice", "")).strip()
+        evidence.append(f"root_cause={category} service={service}" + (f" advice={advice[:120]}" if advice else ""))
+
+    next_step = str(recommendation_items[0]).strip() if recommendation_items else ""
+    if not next_step:
+        next_step = f"lazysre remote {target} --json" if _normalize_ssh_target(target) else "lazysre connect root@host"
+    return {
+        "status": status,
+        "headline": headline,
+        "evidence": evidence[:4],
+        "next": next_step,
     }
 
 
@@ -4567,6 +4664,19 @@ def _render_remote_docker_report(report: dict[str, object]) -> None:
     )
     if Panel:
         _console.print(Panel(summary_text, title="Remote Docker/Swarm", border_style="cyan"))
+    briefing = report.get("briefing", {})
+    if isinstance(briefing, dict) and Panel:
+        evidence = briefing.get("evidence", [])
+        evidence_lines = [f"- {item}" for item in evidence[:4]] if isinstance(evidence, list) else []
+        lines = [
+            f"状态: {briefing.get('status', '-')}",
+            f"结论: {briefing.get('headline', '-')}",
+        ]
+        if evidence_lines:
+            lines.extend(["证据:", *[str(item) for item in evidence_lines]])
+        if str(briefing.get("next", "")).strip():
+            lines.append(f"下一步: {briefing.get('next')}")
+        _console.print(Panel("\n".join(lines), title="AI Briefing", border_style="magenta"))
     table = Table(title="Remote Checks")
     table.add_column("Check", style="cyan")
     table.add_column("Severity", style="white", no_wrap=True)
@@ -4605,9 +4715,25 @@ def _render_remote_docker_report_markdown(report: dict[str, object]) -> str:
         f"- OK: `{report.get('ok', False)}`",
         f"- Summary: pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} error={summary.get('error', 0)}",
         "",
-        "## Checks",
+        "## Briefing",
         "",
     ]
+    briefing = report.get("briefing", {})
+    if isinstance(briefing, dict) and briefing:
+        lines.append(f"- Status: `{briefing.get('status', '-')}`")
+        lines.append(f"- Headline: {briefing.get('headline', '-')}")
+        evidence = briefing.get("evidence", [])
+        if isinstance(evidence, list) and evidence:
+            lines.append(f"- Evidence: {'; '.join(str(item) for item in evidence[:4])}")
+        if str(briefing.get("next", "")).strip():
+            lines.append(f"- Next: `{briefing.get('next')}`")
+    else:
+        lines.append("- No briefing generated.")
+    lines.extend([
+        "",
+        "## Checks",
+        "",
+    ])
     for raw in report.get("checks", []):
         if not isinstance(raw, dict):
             continue

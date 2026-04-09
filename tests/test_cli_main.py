@@ -23,6 +23,7 @@ from lazysre.cli.main import (
     _normalize_ssh_target,
     _resolve_ssh_target_arg,
     _remote_report_check_ok,
+    _build_remote_briefing,
     _run_remote_connect_flow,
     _collect_watch_snapshot,
     _run_autopilot_cycle,
@@ -1321,8 +1322,36 @@ def test_collect_remote_docker_report_detects_swarm_issue(monkeypatch: pytest.Mo
     assert report["ok"] is False
     assert report["unhealthy_services"][0]["name"] == "api"
     assert report["root_causes"][0]["category"] == "swarm_image_pull_failed"
+    assert report["briefing"]["status"] == "attention"
+    assert "api" in report["briefing"]["headline"]
     assert "lazysre remote root@192.168.10.101 --service api --logs" in report["recommendations"]
     assert any("docker service logs" in item for item in calls)
+
+
+def test_build_remote_briefing_classifies_ssh_blocker() -> None:
+    report = {
+        "target": "root@192.168.10.101",
+        "ok": False,
+        "summary": {"pass": 0, "warn": 0, "error": 1},
+        "checks": [
+            {
+                "name": "ssh.connect",
+                "ok": False,
+                "severity": "error",
+                "detail": "connection timed out",
+            }
+        ],
+        "unhealthy_services": [],
+        "bad_nodes": [],
+        "root_causes": [],
+        "recommendations": ["先确认本机可执行：ssh root@192.168.10.101 'docker version'"],
+    }
+
+    briefing = _build_remote_briefing(report)
+
+    assert briefing["status"] == "blocked"
+    assert "无法连接" in briefing["headline"]
+    assert briefing["next"].startswith("先确认本机可执行")
 
 
 def test_run_remote_connect_flow_saves_target_after_ssh_success(

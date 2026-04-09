@@ -31,6 +31,7 @@ lazysre swarm --logs
 lazysre remote root@192.168.10.101 --logs
 # 首次连接体检：SSH 连通后自动保存默认远程目标
 lazysre connect root@192.168.10.101
+# 输出包含 AI Briefing：连通性、Docker/Swarm 状态、关键证据和下一步命令
 # 保存默认远程目标后，后续可以直接 lazysre remote
 lazysre target set --ssh-target root@192.168.10.101
 lazysre remote --logs
