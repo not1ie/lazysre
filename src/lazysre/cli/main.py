@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Formatter
@@ -285,6 +286,31 @@ def swarm(
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return
     _render_swarm_health_report(report)
+
+
+@app.command("watch")
+def watch(
+    interval_sec: Annotated[int, typer.Option("--interval-sec", help="Seconds between scans.")] = 60,
+    count: Annotated[int, typer.Option("--count", help="Number of scan cycles. Use 1 for one-shot.")] = 1,
+    include_swarm: Annotated[bool, typer.Option("--swarm/--no-swarm", help="Include Docker Swarm health snapshot.")] = True,
+    include_logs: Annotated[bool, typer.Option("--logs", help="Include Swarm logs for unhealthy services.")] = False,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Per-check timeout seconds.")] = 5,
+    output: Annotated[str, typer.Option("--output", help="Optional JSONL output path.")] = "",
+    as_json: Annotated[bool, typer.Option("--json", help="Print watch snapshots as JSON.")] = False,
+) -> None:
+    snapshots = _run_watch_snapshots(
+        interval_sec=interval_sec,
+        count=count,
+        include_swarm=include_swarm,
+        include_logs=include_logs,
+        timeout_sec=timeout_sec,
+        output=Path(output).expanduser() if output.strip() else None,
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(snapshots, ensure_ascii=False, indent=2))
+        return
+    for snapshot in snapshots:
+        _render_watch_snapshot(snapshot)
 
 
 @app.command("doctor")
@@ -3839,6 +3865,152 @@ def _render_swarm_health_report(report: dict[str, object]) -> None:
         _console.print(Panel("\n".join(f"- {item}" for item in recommendations), title="Recommendations", border_style="green"))
 
 
+def _run_watch_snapshots(
+    *,
+    interval_sec: int,
+    count: int,
+    include_swarm: bool,
+    include_logs: bool,
+    timeout_sec: int,
+    output: Path | None = None,
+) -> list[dict[str, object]]:
+    cycles = max(1, min(int(count or 1), 1000))
+    interval = max(1, min(int(interval_sec or 60), 24 * 60 * 60))
+    snapshots: list[dict[str, object]] = []
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+    for idx in range(cycles):
+        snapshot = _collect_watch_snapshot(
+            cycle=idx + 1,
+            include_swarm=include_swarm,
+            include_logs=include_logs,
+            timeout_sec=timeout_sec,
+        )
+        snapshots.append(snapshot)
+        if output:
+            with output.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+        if idx < cycles - 1:
+            time.sleep(interval)
+    return snapshots
+
+
+def _collect_watch_snapshot(
+    *,
+    cycle: int,
+    include_swarm: bool,
+    include_logs: bool,
+    timeout_sec: int,
+) -> dict[str, object]:
+    scan_report = _collect_environment_discovery(timeout_sec=timeout_sec, secrets_file=None)
+    swarm_report: dict[str, object] | None = None
+    if include_swarm:
+        swarm_report = _collect_swarm_health_report(
+            include_logs=include_logs,
+            timeout_sec=timeout_sec,
+            tail=120 if include_logs else 80,
+        )
+    alerts = _build_watch_alerts(scan_report=scan_report, swarm_report=swarm_report)
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "cycle": cycle,
+        "ok": len(alerts) == 0,
+        "alerts": alerts,
+        "scan_summary": scan_report.get("summary", {}),
+        "usable_targets": scan_report.get("usable_targets", []),
+        "scan_issues": scan_report.get("issues", [])[:12] if isinstance(scan_report.get("issues", []), list) else [],
+        "swarm": {
+            "ok": swarm_report.get("ok", False) if isinstance(swarm_report, dict) else None,
+            "summary": swarm_report.get("summary", {}) if isinstance(swarm_report, dict) else {},
+            "unhealthy_services": swarm_report.get("unhealthy_services", []) if isinstance(swarm_report, dict) else [],
+            "bad_nodes": swarm_report.get("bad_nodes", []) if isinstance(swarm_report, dict) else [],
+            "recommendations": swarm_report.get("recommendations", []) if isinstance(swarm_report, dict) else [],
+        },
+        "suggestions": scan_report.get("suggestions", []),
+    }
+
+
+def _build_watch_alerts(
+    *,
+    scan_report: dict[str, object],
+    swarm_report: dict[str, object] | None,
+) -> list[dict[str, str]]:
+    alerts: list[dict[str, str]] = []
+    for issue in scan_report.get("issues", []):
+        if not isinstance(issue, dict):
+            continue
+        name = str(issue.get("name", ""))
+        severity = str(issue.get("severity", "warn"))
+        if severity == "pass":
+            continue
+        if name in {"llm.provider_key", "prometheus.ready"}:
+            continue
+        alerts.append(
+            {
+                "source": "scan",
+                "severity": severity,
+                "name": name,
+                "detail": str(issue.get("detail", ""))[:240],
+                "hint": str(issue.get("hint", ""))[:240],
+            }
+        )
+    if isinstance(swarm_report, dict):
+        for row in list(swarm_report.get("unhealthy_services", []))[:10]:
+            if isinstance(row, dict):
+                alerts.append(
+                    {
+                        "source": "swarm",
+                        "severity": "warn",
+                        "name": str(row.get("name", "service")),
+                        "detail": f"replicas={row.get('replicas', '-')}",
+                        "hint": f"lazysre swarm --service {row.get('name', '')} --logs",
+                    }
+                )
+        for row in list(swarm_report.get("bad_nodes", []))[:10]:
+            if isinstance(row, dict):
+                alerts.append(
+                    {
+                        "source": "swarm",
+                        "severity": "warn",
+                        "name": str(row.get("hostname", "node")),
+                        "detail": f"status={row.get('status', '-')} availability={row.get('availability', '-')}",
+                        "hint": "检查节点网络、磁盘和 docker daemon 状态",
+                    }
+                )
+    return alerts[:30]
+
+
+def _render_watch_snapshot(snapshot: dict[str, object]) -> None:
+    if not (_console and Table):
+        typer.echo(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        return
+    alerts = snapshot.get("alerts", [])
+    summary_text = (
+        f"cycle={snapshot.get('cycle', 1)} ok={snapshot.get('ok', False)} "
+        f"alerts={len(alerts) if isinstance(alerts, list) else 0} "
+        f"targets={', '.join(str(x) for x in snapshot.get('usable_targets', [])) or 'none'}"
+    )
+    if Panel:
+        _console.print(Panel(summary_text, title="LazySRE Watch", border_style="cyan"))
+    table = Table(title="Watch Alerts")
+    table.add_column("Source", style="cyan")
+    table.add_column("Severity", style="white", no_wrap=True)
+    table.add_column("Name", style="yellow")
+    table.add_column("Detail", style="white")
+    table.add_column("Hint", style="green")
+    if isinstance(alerts, list):
+        for raw in alerts:
+            item = raw if isinstance(raw, dict) else {}
+            table.add_row(
+                str(item.get("source", "-")),
+                str(item.get("severity", "-")),
+                str(item.get("name", "-")),
+                str(item.get("detail", "-"))[:140],
+                str(item.get("hint", ""))[:140],
+            )
+    _console.print(table)
+
+
 def _safe_int(value: str) -> int:
     try:
         return int(str(value).strip())
@@ -5228,6 +5400,7 @@ def _render_chat_short_help() -> None:
         "- /help: 查看帮助",
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
         "- /swarm [--logs]: 检查 Docker Swarm 服务、副本、任务失败证据",
+        "- /watch [--count N]: 持续巡检并输出异常摘要",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
@@ -5335,6 +5508,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "quickstart",
         "scan",
         "swarm",
+        "watch",
         "setup",
         "status",
         "doctor",
@@ -5437,6 +5611,24 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 _render_swarm_health_report(report)
             else:
                 typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/watch"):
+            count_match = re.search(r"--count\s+(\d+)", text, flags=re.IGNORECASE)
+            count = int(count_match.group(1)) if count_match else 1
+            include_logs = "--logs" in text.lower() or "日志" in text
+            snapshots = _run_watch_snapshots(
+                interval_sec=60,
+                count=count,
+                include_swarm=True,
+                include_logs=include_logs,
+                timeout_sec=5,
+                output=None,
+            )
+            if _console:
+                for snapshot in snapshots:
+                    _render_watch_snapshot(snapshot)
+            else:
+                typer.echo(json.dumps(snapshots, ensure_ascii=False, indent=2))
             continue
         if text.lower().startswith("/mode "):
             tail = text[len("/mode ") :].strip().lower()
@@ -6045,6 +6237,21 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             _render_swarm_health_report(report)
         else:
             typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return True
+    if _looks_like_watch_request(text):
+        snapshots = _run_watch_snapshots(
+            interval_sec=60,
+            count=1,
+            include_swarm=True,
+            include_logs=any(k in lowered for k in ("日志", "logs")),
+            timeout_sec=5,
+            output=None,
+        )
+        if _console:
+            for snapshot in snapshots:
+                _render_watch_snapshot(snapshot)
+        else:
+            typer.echo(json.dumps(snapshots, ensure_ascii=False, indent=2))
         return True
     if _looks_like_quickstart_request(text):
         report = _run_quickstart(
@@ -7864,6 +8071,22 @@ def _looks_like_swarm_diagnose_request(text: str) -> bool:
     return any(k in lowered for k in keywords)
 
 
+def _looks_like_watch_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "持续巡检",
+        "开始巡检",
+        "巡检一下",
+        "定时检查",
+        "持续观察",
+        "watch",
+        "monitor",
+    )
+    return any(k in lowered for k in keywords)
+
+
 def _extract_swarm_service_name(text: str) -> str:
     raw = str(text or "").strip()
     if not raw:
@@ -8370,6 +8593,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "status",
         "scan",
         "swarm",
+        "watch",
         "doctor",
         "install-doctor",
         "setup",
@@ -8429,6 +8653,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "status",
         "scan",
         "swarm",
+        "watch",
         "doctor",
         "install-doctor",
         "setup",

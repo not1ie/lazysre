@@ -379,6 +379,42 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
                     text_stream(token)
             return LLMTurn(response_id="mock-final", text=rendered, tool_calls=[])
 
+        if previous_response_id == "mock-swarm-1" and tool_outputs:
+            service_hint = "lazysre_lazysre"
+            rendered = "\n".join(
+                [
+                    f"[mock:{model}] Swarm 诊断完成：",
+                    "",
+                    "## Status",
+                    "Diagnosing",
+                    "",
+                    "## Reasoning",
+                    "已优先采集 Docker Swarm service/node/task 证据，下一步应聚焦副本不足、任务拒绝或镜像拉取失败。",
+                    "",
+                    "## Evidence",
+                    *[f"- call={item.call_id}: {item.output[:160]}" for item in tool_outputs],
+                    "",
+                    "## Apply Commands",
+                    "```bash",
+                    f"docker service ps {service_hint} --no-trunc",
+                    f"docker service logs --tail 200 {service_hint}",
+                    f"docker service update --force {service_hint}",
+                    "```",
+                    "",
+                    "## Rollback Commands",
+                    "```bash",
+                    f"docker service rollback {service_hint}",
+                    "```",
+                    "",
+                    "## Risk Level",
+                    "High - service update 会滚动替换任务，可能造成短暂抖动，必须审批后执行。",
+                ]
+            )
+            if text_stream:
+                for token in _chunk_text(rendered):
+                    text_stream(token)
+            return LLMTurn(response_id="mock-final", text=rendered, tool_calls=[])
+
         if previous_response_id and tool_outputs:
             lines = [
                 f"[mock:{model}] 工具执行结果汇总：",
@@ -410,6 +446,17 @@ class MockFunctionCallingLLM(FunctionCallingLLM):
             return LLMTurn(response_id="mock-final", text=rendered, tool_calls=[])
 
         text = (user_input or "").lower()
+        if any(word in text for word in ("swarm", "docker service", "副本不足", "服务副本", "服务有没有异常", "服务健康")):
+            return LLMTurn(
+                response_id="mock-swarm-1",
+                tool_calls=[
+                    ToolCall(
+                        call_id="mock-swarm-context-1",
+                        name="get_swarm_context",
+                        arguments={"include_logs": False, "tail": 80},
+                    )
+                ],
+            )
         if any(word in text for word in ("变慢", "慢了", "latency", "延迟", "响应慢", "支付服务")):
             return LLMTurn(
                 response_id="mock-react-1",

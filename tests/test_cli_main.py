@@ -18,6 +18,7 @@ from lazysre.cli.main import (
     _collect_runtime_status,
     _collect_environment_discovery,
     _collect_swarm_health_report,
+    _collect_watch_snapshot,
     _default_report_output_path,
     _doctor_is_healthy,
     _extract_template_var_items_from_text,
@@ -55,6 +56,7 @@ from lazysre.cli.main import (
     _looks_like_reset_request,
     _looks_like_scan_request,
     _looks_like_swarm_diagnose_request,
+    _looks_like_watch_request,
     _looks_like_report_request,
     _looks_like_target_show_request,
     _looks_like_target_update_request,
@@ -188,27 +190,30 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv5 = ["lsre", "swarm", "--json"]
     _rewrite_argv_for_default_run(argv5)
     assert argv5 == ["lsre", "swarm", "--json"]
-    argv6 = ["lsre", "setup", "--json"]
+    argv6 = ["lsre", "watch", "--count", "1"]
     _rewrite_argv_for_default_run(argv6)
-    assert argv6 == ["lsre", "setup", "--json"]
-    argv7 = ["lsre", "template", "list"]
+    assert argv6 == ["lsre", "watch", "--count", "1"]
+    argv7 = ["lsre", "setup", "--json"]
     _rewrite_argv_for_default_run(argv7)
-    assert argv7 == ["lsre", "template", "list"]
-    argv8 = ["lsre", "init"]
+    assert argv7 == ["lsre", "setup", "--json"]
+    argv8 = ["lsre", "template", "list"]
     _rewrite_argv_for_default_run(argv8)
-    assert argv8 == ["lsre", "init"]
-    argv9 = ["lsre", "login", "--api-key", "sk-xxx"]
+    assert argv8 == ["lsre", "template", "list"]
+    argv9 = ["lsre", "init"]
     _rewrite_argv_for_default_run(argv9)
-    assert argv9 == ["lsre", "login", "--api-key", "sk-xxx"]
-    argv10 = ["lsre", "quickstart", "--json"]
+    assert argv9 == ["lsre", "init"]
+    argv10 = ["lsre", "login", "--api-key", "sk-xxx"]
     _rewrite_argv_for_default_run(argv10)
-    assert argv10 == ["lsre", "quickstart", "--json"]
-    argv11 = ["lsre", "reset"]
+    assert argv10 == ["lsre", "login", "--api-key", "sk-xxx"]
+    argv11 = ["lsre", "quickstart", "--json"]
     _rewrite_argv_for_default_run(argv11)
-    assert argv11 == ["lsre", "reset"]
-    argv12 = ["lsre", "undo"]
+    assert argv11 == ["lsre", "quickstart", "--json"]
+    argv12 = ["lsre", "reset"]
     _rewrite_argv_for_default_run(argv12)
-    assert argv12 == ["lsre", "undo"]
+    assert argv12 == ["lsre", "reset"]
+    argv13 = ["lsre", "undo"]
+    _rewrite_argv_for_default_run(argv13)
+    assert argv13 == ["lsre", "undo"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -315,6 +320,7 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_status_request("帮我看下当前状态")
     assert _looks_like_scan_request("自动检测当前环境并列出问题")
     assert _looks_like_swarm_diagnose_request("看看服务器上的服务有没有异常")
+    assert _looks_like_watch_request("开始巡检一下")
     assert _extract_swarm_service_name("为什么 lazysre_lazysre 服务副本不足") == "lazysre_lazysre"
     assert _looks_like_doctor_request("做一次环境体检")
     assert _looks_like_install_doctor_request("做一下安装检查")
@@ -528,6 +534,7 @@ def test_should_launch_assistant_with_only_options() -> None:
     assert _should_launch_assistant(["status"]) is False
     assert _should_launch_assistant(["scan"]) is False
     assert _should_launch_assistant(["swarm"]) is False
+    assert _should_launch_assistant(["watch"]) is False
     assert _should_launch_assistant(["doctor"]) is False
     assert _should_launch_assistant(["install-doctor"]) is False
     assert _should_launch_assistant(["setup"]) is False
@@ -1162,3 +1169,33 @@ def test_collect_swarm_health_report_detects_unhealthy_service(monkeypatch: pyte
     assert report["unhealthy_services"][0]["name"] == "api"
     assert "No such image" in report["tasks"][0]["tasks"][0]["error"]
     assert report["logs"][0]["service"] == "api"
+
+
+def test_collect_watch_snapshot_rolls_up_scan_and_swarm_alerts(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_scan(*, timeout_sec: int, secrets_file: Path | None) -> dict[str, object]:
+        return {
+            "summary": {"warn": 1, "error": 0},
+            "usable_targets": ["docker-swarm"],
+            "issues": [
+                {"name": "docker.exited_containers", "severity": "warn", "detail": "old-api", "hint": "check logs"}
+            ],
+            "suggestions": ["分析 Docker Swarm 服务健康"],
+        }
+
+    def fake_swarm(**kwargs: object) -> dict[str, object]:
+        return {
+            "ok": False,
+            "summary": {"warn": 1, "error": 0},
+            "unhealthy_services": [{"name": "api", "replicas": "0/1"}],
+            "bad_nodes": [],
+            "recommendations": ["lazysre swarm --service api --logs"],
+        }
+
+    monkeypatch.setattr(cli_main, "_collect_environment_discovery", fake_scan)
+    monkeypatch.setattr(cli_main, "_collect_swarm_health_report", fake_swarm)
+
+    snapshot = _collect_watch_snapshot(cycle=1, include_swarm=True, include_logs=False, timeout_sec=3)
+
+    assert snapshot["ok"] is False
+    assert snapshot["usable_targets"] == ["docker-swarm"]
+    assert any(alert["source"] == "swarm" and alert["name"] == "api" for alert in snapshot["alerts"])

@@ -137,6 +137,57 @@ _TEMPLATES: tuple[RemediationTemplate, ...] = (
             "kubectl -n {namespace} rollout status {workload} --timeout=180s",
         ),
     ),
+    RemediationTemplate(
+        name="swarm-replicas-unhealthy",
+        title="Docker Swarm 副本不足恢复",
+        description="针对 Swarm service running/desired 不一致，先采集 task 失败证据，再执行滚动替换恢复。",
+        aliases=("swarm-replicas", "swarm副本不足", "service副本不足"),
+        trigger_keywords=("swarm", "副本不足", "replicas", "0/1", "service 异常", "服务副本"),
+        risk_level="high",
+        variables={
+            "service": "lazysre_lazysre",
+            "tail": "200",
+        },
+        diagnose_commands=(
+            "docker service ls --format '{{.Name}}\t{{.Replicas}}\t{{.Image}}'",
+            "docker service ps {service} --no-trunc",
+            "docker service logs --tail {tail} {service}",
+        ),
+        apply_commands=(
+            "docker service update --force {service}",
+            "docker service ps {service} --no-trunc",
+        ),
+        rollback_commands=(
+            "docker service rollback {service}",
+            "docker service ps {service} --no-trunc",
+        ),
+    ),
+    RemediationTemplate(
+        name="swarm-image-pull-failed",
+        title="Docker Swarm 镜像拉取失败恢复",
+        description="针对 Swarm task 被拒绝或 No such image，检查镜像与仓库登录后切换到可用镜像。",
+        aliases=("swarm-imagepull", "swarm镜像拉取失败", "docker-imagepull"),
+        trigger_keywords=("no such image", "pull access denied", "镜像拉取失败", "拉不下来", "image pull", "swarm"),
+        risk_level="high",
+        variables={
+            "service": "lazysre_lazysre",
+            "image": "your-registry/app:stable",
+            "tail": "200",
+        },
+        diagnose_commands=(
+            "docker service ps {service} --no-trunc",
+            "docker service inspect {service} --format '{{json .Spec.TaskTemplate.ContainerSpec.Image}}'",
+            "docker service logs --tail {tail} {service}",
+        ),
+        apply_commands=(
+            "docker service update --image {image} {service}",
+            "docker service ps {service} --no-trunc",
+        ),
+        rollback_commands=(
+            "docker service rollback {service}",
+            "docker service ps {service} --no-trunc",
+        ),
+    ),
 )
 
 
@@ -248,4 +299,3 @@ def _safe_format(command: str, values: dict[str, str]) -> str:
     for key, value in values.items():
         rendered = rendered.replace("{" + key + "}", str(value))
     return rendered
-

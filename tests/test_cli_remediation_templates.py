@@ -13,6 +13,7 @@ def test_list_templates_and_lookup_by_alias() -> None:
     names = {item.name for item in templates}
     assert "k8s-crashloopbackoff" in names
     assert "k8s-high-cpu" in names
+    assert "swarm-replicas-unhealthy" in names
     assert get_template("crashloop") is not None
 
 
@@ -20,6 +21,9 @@ def test_match_template_for_text() -> None:
     matched = match_template_for_text("线上支付 pod 出现 CrashLoopBackOff，帮我修复")
     assert matched is not None
     assert matched.name == "k8s-crashloopbackoff"
+    swarm = match_template_for_text("swarm service 副本不足 0/1，帮我修复")
+    assert swarm is not None
+    assert swarm.name == "swarm-replicas-unhealthy"
 
 
 def test_parse_var_items_and_render_template() -> None:
@@ -29,6 +33,11 @@ def test_parse_var_items_and_render_template() -> None:
     rendered = render_template(template, overrides=vars_map)
     apply_cmds = rendered["apply_commands"]
     assert "kubectl -n prod scale deploy/pay --replicas=5" in apply_cmds
+
+    swarm_template = get_template("swarm-replicas")
+    assert swarm_template is not None
+    swarm_rendered = render_template(swarm_template, overrides={"service": "api"})
+    assert "docker service update --force api" in swarm_rendered["apply_commands"]
 
 
 def test_detect_quick_fix_intent_with_apply_flag() -> None:

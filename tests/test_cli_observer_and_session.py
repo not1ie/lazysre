@@ -87,3 +87,17 @@ async def test_dispatcher_react_flow_for_latency_question() -> None:
     assert "get_cluster_context" in called_names
     assert "fetch_service_logs" in called_names
     assert "rollout restart" in result.final_text
+
+
+async def test_dispatcher_prefers_swarm_observer_for_service_health() -> None:
+    dispatcher = Dispatcher(
+        llm=MockFunctionCallingLLM(),
+        registry=build_default_registry(),
+        executor=SafeExecutor(dry_run=True),
+        model="gpt-5.4-mini",
+        max_steps=4,
+    )
+    result = await dispatcher.run("看看 Docker Swarm 服务有没有异常")
+    called_names = [str(e.message) for e in result.events if e.kind == "tool_call"]
+    assert "get_swarm_context" in called_names
+    assert "docker service update --force" in result.final_text
