@@ -123,6 +123,8 @@ from lazysre.cli.main import (
     _parse_chat_report_command,
     _parse_chat_template_command,
     _collect_install_doctor_report,
+    _write_first_scan_marker,
+    _render_cached_startup_brief,
     _safe_run_command,
     _should_launch_assistant,
 )
@@ -1272,7 +1274,7 @@ def test_build_environment_scan_briefing_when_no_targets() -> None:
 
     assert briefing["status"] == "attention"
     assert "暂未发现" in briefing["headline"]
-    assert briefing["next"].startswith("未发现可直接访问")
+    assert briefing["next"] == 'lazysre "帮我解释为什么当前机器还不能被 LazySRE 纳管"'
 
 
 def test_build_overview_briefing_prefers_remote_attention() -> None:
@@ -1315,6 +1317,55 @@ def test_build_overview_briefing_prefers_remote_attention() -> None:
     assert "远程" in briefing["headline"]
     assert briefing["next"] == "lazysre remote root@192.168.10.101 --service api --logs"
     assert commands[0] == "lazysre remote root@192.168.10.101 --service api --logs"
+
+
+def test_first_run_marker_accepts_overview_brief_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+    report = {
+        "source": "overview-brief",
+        "briefing": {
+            "status": "attention",
+            "headline": "本机：已发现可纳管目标。",
+            "evidence": ["scan: checks pass=3 warn=1 error=0"],
+            "next": "lazysre swarm --logs",
+        },
+        "scan": {
+            "summary": {"pass": 3, "warn": 1, "error": 0},
+            "usable_targets": ["docker-swarm"],
+            "issues": [{"name": "docker.exited_containers", "severity": "warn"}],
+            "suggestions": ["分析 Docker Swarm 服务健康"],
+            "next_actions": ["lazysre swarm --logs"],
+        },
+    }
+
+    marker = _write_first_scan_marker(report)
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+
+    assert payload["source"] == "overview-brief"
+    assert payload["briefing"]["next"] == "lazysre swarm --logs"
+    assert payload["usable_targets"] == ["docker-swarm"]
+
+
+def test_render_cached_startup_brief_prints_next_step(capsys: pytest.CaptureFixture[str]) -> None:
+    old_console = cli_main._console
+    try:
+        cli_main._console = None
+        _render_cached_startup_brief(
+            {
+                "generated_at_utc": "2026-04-09T00:00:00+00:00",
+                "briefing": {
+                    "status": "attention",
+                    "headline": "本机：发现 Docker Swarm。",
+                    "next": "lazysre swarm --logs",
+                },
+            }
+        )
+    finally:
+        cli_main._console = old_console
+
+    out = capsys.readouterr().out
+    assert "上次总览: attention" in out
+    assert "lazysre swarm --logs" in out
 
 
 def test_collect_swarm_health_report_detects_unhealthy_service(monkeypatch: pytest.MonkeyPatch) -> None:

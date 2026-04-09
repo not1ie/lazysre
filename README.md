@@ -17,6 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/not1ie/lazysre/main/scripts/install
 
 # 启动
 lazysre
+# 首次直接启动会自动生成只读 LazySRE Brief，并给出下一步命令
 # 兼容短命令
 lsre
 # 或 python 模块方式

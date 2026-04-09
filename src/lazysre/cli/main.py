@@ -3717,7 +3717,7 @@ def _build_environment_scan_briefing(report: dict[str, object]) -> dict[str, obj
         elif "docker" in targets:
             next_step = 'lazysre "检查 Docker 容器有没有异常退出"'
     if not next_step and action_items:
-        next_step = action_items[0]
+        next_step = next((item for item in action_items if _looks_like_shell_command(item)), "")
     if not next_step and suggestion_items:
         next_step = f'lazysre "{suggestion_items[0]}"'
     if not next_step:
@@ -6806,18 +6806,34 @@ def _write_setup_marker(report: dict[str, object]) -> Path:
 def _write_first_scan_marker(report: dict[str, object]) -> Path:
     marker = Path(settings.data_dir) / "lsre-onboarding.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
+    scan_report = report.get("scan", report)
+    if not isinstance(scan_report, dict):
+        scan_report = report
     payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "ready": False,
         "first_scan_done": True,
-        "scan_summary": report.get("summary", {}),
-        "usable_targets": report.get("usable_targets", []),
-        "issues": report.get("issues", [])[:8] if isinstance(report.get("issues", []), list) else [],
-        "suggestions": report.get("suggestions", [])[:5] if isinstance(report.get("suggestions", []), list) else [],
-        "next_actions": report.get("next_actions", [])[:8] if isinstance(report.get("next_actions", []), list) else [],
+        "source": str(report.get("source", "environment-scan")),
+        "briefing": report.get("briefing", {}),
+        "scan_summary": scan_report.get("summary", {}),
+        "usable_targets": scan_report.get("usable_targets", []),
+        "issues": scan_report.get("issues", [])[:8] if isinstance(scan_report.get("issues", []), list) else [],
+        "suggestions": scan_report.get("suggestions", [])[:5] if isinstance(scan_report.get("suggestions", []), list) else [],
+        "next_actions": scan_report.get("next_actions", [])[:8] if isinstance(scan_report.get("next_actions", []), list) else [],
     }
     marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return marker
+
+
+def _load_onboarding_marker() -> dict[str, object]:
+    marker = Path(settings.data_dir) / "lsre-onboarding.json"
+    if not marker.exists():
+        return {}
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _show_first_run_setup_hint_once() -> None:
@@ -6866,15 +6882,44 @@ def _remove_file_if_exists(path: Path) -> bool:
 def _maybe_auto_bootstrap_on_first_chat(options: dict[str, object]) -> None:
     marker = Path(settings.data_dir) / "lsre-onboarding.json"
     if marker.exists():
+        _render_cached_startup_brief(_load_onboarding_marker())
         return
-    typer.echo("首次启动：正在自动扫描当前机器（只读，不需要 K8s token）...")
-    report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
+    typer.echo("首次启动：正在生成总览简报（只读，不需要 K8s token；如已保存远程目标会一并检查）...")
+    report = _build_overview_brief_report(
+        target="",
+        include_remote=True,
+        include_logs=False,
+        timeout_sec=5,
+    )
     _write_first_scan_marker(report)
     if _console:
-        _render_environment_discovery(report)
+        _render_overview_brief_report(report)
     else:
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
-    typer.echo("你可以直接复制上面的建议来问我；需要交互式配置时再输入 /init。")
+    typer.echo("你可以直接复制上面的建议来问我；需要交互式配置时再输入 /init，想刷新总览可输入 /brief。")
+
+
+def _render_cached_startup_brief(marker: dict[str, object]) -> None:
+    briefing = marker.get("briefing", {})
+    if not isinstance(briefing, dict) or not briefing:
+        typer.echo("输入 /brief 可刷新当前环境总览，输入 /help 查看快捷命令。")
+        return
+    status = str(briefing.get("status", "-"))
+    headline = str(briefing.get("headline", "")).strip()
+    next_step = str(briefing.get("next", "")).strip()
+    generated = str(marker.get("generated_at_utc", "")).strip()
+    lines = [f"上次总览: {status}"]
+    if headline:
+        lines.append(headline)
+    if next_step:
+        lines.append(f"下一步: {next_step}")
+    if generated:
+        lines.append(f"生成时间: {generated}")
+    lines.append("输入 /brief 刷新总览，输入 /help 查看快捷命令。")
+    if _console and Panel:
+        _console.print(Panel("\n".join(lines), title="Startup Brief", border_style="cyan"))
+    else:
+        typer.echo("\n".join(lines))
 
 
 def _maybe_offer_one_click_env_fix(options: dict[str, object]) -> None:
@@ -7540,6 +7585,13 @@ def _append_command(items: list[str], seen: set[str], value: str, *, max_items: 
 
 
 def _looks_like_shell_command(text: str) -> bool:
+    stripped = str(text or "").strip()
+    lowered = stripped.lower()
+    if (
+        re.search(r"[\u4e00-\u9fff]", stripped)
+        and not lowered.startswith(("lazysre ", "lsre ", "python -m lazysre"))
+    ):
+        return False
     prefixes = (
         "kubectl ",
         "docker ",
@@ -7555,7 +7607,6 @@ def _looks_like_shell_command(text: str) -> bool:
         "bash ",
         "sh ",
     )
-    lowered = text.lower()
     return lowered.startswith(prefixes)
 
 
