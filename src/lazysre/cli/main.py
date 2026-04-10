@@ -8084,6 +8084,8 @@ def _render_chat_short_help() -> None:
         "- /init: 交互式初始化（API Key + 目标环境 + 探测）",
         "- /quickstart: 一键自动修复环境并完成快速就绪",
         f"- /login [--provider {provider_mode_help_text()}]: 保存对应 Provider API Key",
+        "- /providers: 查看当前 Provider 就绪状态、base_url 和默认模型",
+        "- /provider <name>: 切换当前会话使用的 Provider（auto/mock/openai/.../compatible）",
         "- /setup [--dry-run-probe]: 首次启动向导（安装检查+目标探测+LLM Key）",
         "- /status: 查看当前会话、目标配置、最近修复计划",
         "- /status probe: 追加目标探测摘要（dry-run）",
@@ -8114,6 +8116,7 @@ def _render_chat_short_help() -> None:
         "- 自然语言策略：先只跑只读步骤再执行写操作 / 解释第2步为什么执行",
         "- /memory: 查看最近故障记忆",
         "- /memory <query>: 检索相似历史案例",
+        "- TUI 里可用 Up/Down 浏览输入历史，Ctrl-L 或 /clear 清空屏幕",
         "- exit / quit: 退出",
     ]
     text = "\n".join(lines)
@@ -8190,10 +8193,12 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "session_turns": len(session_turns),
         "last_user": last_user[:120],
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
+        "active_provider": _resolve_runtime_provider_label(str(options.get("provider", "auto"))),
         "shortcuts": [
             "/brief",
             "/scan",
             "/refresh",
+            "/providers",
             "/swarm --logs",
             "/remote root@host --logs",
             "/autopilot",
@@ -8224,6 +8229,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         f"│ status={snapshot.get('status', '-')}",
         f"│ headline={snapshot.get('headline', '-')}",
         "├─ Target ────────────────────────────────────────────────────────┤",
+        f"│ active_provider={snapshot.get('active_provider', '-')}",
         f"│ usable_targets={', '.join(str(x) for x in usable_targets) or '(none)'}",
         f"│ providers={', '.join(str(x) for x in configured_providers) or '(unset)'}",
         f"│ namespace={snapshot.get('namespace', '-')}",
@@ -8237,7 +8243,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         *[f"│ {item}" for item in shortcuts],
         "├─ Conversation ──────────────────────────────────────────────────┤",
         "│ 直接输入自然语言，例如：检查当前服务器 / 修复 swarm 副本不足",
-        "│ Tab 自动补全命令，底部输入框提交后会同屏显示 Observe/Action/Result。",
+        "│ Tab 自动补全命令，Up/Down 浏览历史，Ctrl-L 清屏。",
         "╰─────────────────────────────────────────────────────────────────╯",
     ]
     return "\n".join(lines)
@@ -8262,13 +8268,14 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
 
     curses.curs_set(1)
     stdscr.keypad(True)
-    history: list[tuple[str, str]] = [
-        ("LazySRE", "全屏 TUI 已启动。输入自然语言，或使用 /brief /scan /swarm /autopilot /remediate。"),
-    ]
+    history: list[tuple[str, str]] = [("LazySRE", _tui_welcome_message())]
     input_text = ""
     status = "ready"
     completion_index = -1
     completion_seed = ""
+    input_history: list[str] = []
+    history_index = -1
+    history_seed = ""
     while True:
         _draw_tui(stdscr, snapshot=snapshot, history=history, input_text=input_text, status=status)
         key = stdscr.get_wch()
@@ -8280,6 +8287,16 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                     continue
                 if text.lower() in {"exit", "quit", ":q", "/exit", "/quit"}:
                     break
+                if text.lower() in {"/clear", "/cls"}:
+                    history = [("LazySRE", "已清空当前屏幕内容。输入 /help /providers /brief 继续。")]
+                    status = "ready"
+                    history_index = -1
+                    history_seed = ""
+                    completion_index = -1
+                    completion_seed = ""
+                    continue
+                if (not input_history) or (input_history[-1] != text):
+                    input_history.append(text)
                 history.append(("You", text))
                 status = "running"
                 _draw_tui(stdscr, snapshot=snapshot, history=history, input_text=input_text, status=status)
@@ -8289,6 +8306,8 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 status = "ready"
                 completion_index = -1
                 completion_seed = ""
+                history_index = -1
+                history_seed = ""
                 continue
             if key == "\t":
                 input_text, completion_index, completion_seed = _cycle_tui_completion(
@@ -8298,10 +8317,21 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                     completion_seed=completion_seed,
                 )
                 continue
+            if key == "\x0c":
+                history = [("LazySRE", "已清空当前屏幕内容。输入 /help /providers /brief 继续。")]
+                input_text = ""
+                status = "ready"
+                completion_index = -1
+                completion_seed = ""
+                history_index = -1
+                history_seed = ""
+                continue
             if key in {"\x7f", "\b"}:
                 input_text = input_text[:-1]
                 completion_index = -1
                 completion_seed = ""
+                history_index = -1
+                history_seed = ""
                 continue
             if key == "\x1b":
                 break
@@ -8309,18 +8339,38 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 input_text += key
                 completion_index = -1
                 completion_seed = ""
+                history_index = -1
+                history_seed = ""
                 continue
+        elif key == curses.KEY_UP:
+            input_text, history_index, history_seed = _cycle_tui_input_history(
+                input_text,
+                input_history=input_history,
+                history_index=history_index,
+                history_seed=history_seed,
+                direction="up",
+            )
+        elif key == curses.KEY_DOWN:
+            input_text, history_index, history_seed = _cycle_tui_input_history(
+                input_text,
+                input_history=input_history,
+                history_index=history_index,
+                history_seed=history_seed,
+                direction="down",
+            )
         elif key in {curses.KEY_BACKSPACE, curses.KEY_DC}:
             input_text = input_text[:-1]
             completion_index = -1
             completion_seed = ""
+            history_index = -1
+            history_seed = ""
 
 
 def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, str]], input_text: str, status: str) -> None:
     height, width = stdscr.getmaxyx()
     stdscr.erase()
     sidebar_w = min(max(28, width // 3), 46)
-    title = f" LazySRE {snapshot.get('version', '-')} | {status} | Tab autocomplete | Esc quit "
+    title = f" LazySRE {snapshot.get('version', '-')} | {status} | Tab autocomplete | Up/Down history | Ctrl-L clear | Esc quit "
     stdscr.addnstr(0, 0, title.ljust(width), width - 1)
     for y in range(1, height - 2):
         if sidebar_w < width:
@@ -8398,6 +8448,35 @@ def _wrap_tui_text_lines(text: str, *, width: int) -> list[str]:
     return textwrap.wrap(value, width=max(12, width)) or [value]
 
 
+def _tui_welcome_message() -> str:
+    return "全屏 TUI 已启动。输入自然语言，或使用 /brief /scan /providers /swarm /autopilot /remediate。"
+
+
+def _cycle_tui_input_history(
+    input_text: str,
+    *,
+    input_history: list[str],
+    history_index: int,
+    history_seed: str,
+    direction: str,
+) -> tuple[str, int, str]:
+    if not input_history:
+        return input_text, -1, ""
+    if direction == "up":
+        if history_index == -1:
+            history_seed = input_text
+            history_index = len(input_history) - 1
+        elif history_index > 0:
+            history_index -= 1
+        return input_history[history_index], history_index, history_seed
+    if history_index == -1:
+        return input_text, history_index, history_seed
+    if history_index < len(input_history) - 1:
+        history_index += 1
+        return input_history[history_index], history_index, history_seed
+    return history_seed, -1, history_seed
+
+
 def _cycle_tui_completion(
     input_text: str,
     *,
@@ -8431,6 +8510,9 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
         [
             *[str(item) for item in shortcuts if str(item).strip()],
             *[str(item) for item in recommended if str(item).strip()],
+            "/providers",
+            "/provider auto",
+            "/provider mock",
             "/doctor fix",
             "/quickstart",
             "/status probe",
@@ -8459,11 +8541,107 @@ def _capture_plain_output(callback) -> str:
     return "\n".join(x for x in [out.getvalue().strip(), err.getvalue().strip()] if x)
 
 
+def _resolve_runtime_provider_label(provider: str, *, secrets_file: Path | None = None) -> str:
+    mode = str(provider or "auto").strip().lower() or "auto"
+    if mode == "auto":
+        resolved = _resolve_default_provider(secrets_file=secrets_file)
+        return f"auto->{resolved}"
+    return mode
+
+
+def _build_provider_runtime_report(options: dict[str, object], *, secrets_file: Path | None = None) -> dict[str, object]:
+    requested_provider = str(options.get("provider", "auto") or "auto").strip().lower() or "auto"
+    checks = _build_provider_setup_checks(secrets_file=secrets_file)
+    active_provider = _resolve_default_provider(secrets_file=secrets_file) if requested_provider == "auto" else requested_provider
+    active_check = checks.get(active_provider, {}) if active_provider in checks else {}
+    return {
+        "requested_provider": requested_provider,
+        "active_provider": active_provider,
+        "requested_model": str(options.get("model", settings.model_name)),
+        "resolved_model": _resolve_provider_default_model(active_provider, secrets_file=secrets_file)
+        or resolve_model_name(active_provider, str(options.get("model", settings.model_name))),
+        "providers": checks,
+        "active_ready": bool(active_check.get("ok", False)),
+        "active_hint": str(active_check.get("hint", "")),
+        "active_detail": str(active_check.get("detail", "")),
+    }
+
+
+def _render_provider_runtime_report(report: dict[str, object]) -> None:
+    if not (_console and Table and Panel):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    summary = Table(title="Provider Runtime")
+    summary.add_column("Item", style="cyan")
+    summary.add_column("Value", style="white")
+    summary.add_row("Requested", str(report.get("requested_provider", "-")))
+    summary.add_row("Active", str(report.get("active_provider", "-")))
+    summary.add_row("Model", str(report.get("resolved_model", "-")))
+    summary.add_row("Ready", "yes" if bool(report.get("active_ready")) else "no")
+    _console.print(summary)
+
+    providers = report.get("providers", {})
+    if isinstance(providers, dict):
+        table = Table(title="Configured Providers")
+        table.add_column("Provider", style="cyan")
+        table.add_column("Ready", style="white")
+        table.add_column("Detail", style="white")
+        for name in PROVIDER_SPECS:
+            row = providers.get(name, {})
+            if not isinstance(row, dict):
+                continue
+            table.add_row(
+                str(row.get("label", name)),
+                "PASS" if bool(row.get("ok")) else "FAIL",
+                str(row.get("detail", ""))[:180],
+            )
+        _console.print(table)
+    if (not bool(report.get("active_ready"))) and str(report.get("active_hint", "")).strip():
+        _console.print(Panel(str(report.get("active_hint", "")), border_style="yellow"))
+
+
+def _switch_runtime_provider(options: dict[str, object], provider_name: str, *, secrets_file: Path | None = None) -> str:
+    requested = str(provider_name or "").strip().lower()
+    if not requested:
+        report = _build_provider_runtime_report(options, secrets_file=secrets_file)
+        return json.dumps(report, ensure_ascii=False, indent=2) if not _console else _capture_plain_output(
+            lambda: _render_provider_runtime_report(report)
+        )
+    if requested not in {"auto", "mock", *PROVIDER_SPECS.keys()}:
+        return provider_mode_error_text()
+    if requested not in {"auto", "mock"}:
+        checks = _build_provider_setup_checks(secrets_file=secrets_file)
+        row = checks.get(requested, {})
+        if isinstance(row, dict) and (not bool(row.get("ok"))):
+            hint = str(row.get("hint", "")).strip()
+            if hint:
+                return f"Provider {requested} 尚未就绪。{hint}"
+            return f"Provider {requested} 尚未就绪。"
+    options["provider"] = requested
+    if requested == "auto":
+        options["model"] = settings.model_name
+    elif requested == "mock":
+        options["model"] = resolve_model_name("openai", settings.model_name)
+    else:
+        options["model"] = _resolve_provider_default_model(requested, secrets_file=secrets_file) or resolve_model_name(
+            requested,
+            str(options.get("model", settings.model_name)),
+        )
+    return (
+        f"已切换 Provider: {_resolve_runtime_provider_label(requested, secrets_file=secrets_file)} "
+        f"(model={options.get('model', settings.model_name)})"
+    )
+
+
 def _handle_tui_input(text: str, options: dict[str, object]) -> str:
     normalized = _normalize_chat_input_text(text)
     lowered = normalized.lower()
     if lowered in {"/help", "help", "?"}:
         return _render_tui_demo_text(_build_tui_dashboard_snapshot(options))
+    if lowered in {"/providers", "/provider", "/provider show"}:
+        return _capture_plain_output(lambda: _render_provider_runtime_report(_build_provider_runtime_report(options)))
+    if lowered.startswith("/provider "):
+        return _switch_runtime_provider(options, normalized[len("/provider ") :].strip())
     if lowered in {"/mode", "/mode show"}:
         return f"当前模式: {'execute' if bool(options.get('execute', False)) else 'dry-run'}"
     if lowered.startswith("/mode "):
@@ -8745,6 +8923,12 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower() in {"/context", "/ctx"}:
             _render_context_snapshot(options, execute_mode=runtime_execute)
+            continue
+        if text.lower() in {"/providers", "/provider", "/provider show"}:
+            _render_provider_runtime_report(_build_provider_runtime_report(options))
+            continue
+        if text.lower().startswith("/provider "):
+            typer.echo(_switch_runtime_provider(options, text[len("/provider ") :].strip()))
             continue
         if text.lower().startswith("/tui"):
             _run_tui({**options, "execute": runtime_execute}, demo=False)

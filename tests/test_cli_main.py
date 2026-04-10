@@ -132,6 +132,9 @@ from lazysre.cli.main import (
     _build_tui_dashboard_snapshot,
     _render_tui_demo_text,
     _cycle_tui_completion,
+    _cycle_tui_input_history,
+    _build_provider_runtime_report,
+    _switch_runtime_provider,
     _tui_completion_candidates,
     _derive_closed_loop_plan,
     _infer_verification_commands,
@@ -421,6 +424,55 @@ def test_build_provider_setup_checks_marks_compatible_missing_base_url(tmp_path:
 
     assert checks["compatible"]["ok"] is False
     assert "缺少 base_url" in str(checks["compatible"]["hint"])
+
+
+def test_build_provider_runtime_report_and_switch_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets_path = tmp_path / "secrets.json"
+    store = SecretStore(secrets_path)
+    store.set_api_key("compatible", "compat-key-123")
+    store.set_provider_base_url("compatible", "https://oneapi.example.com/v1")
+    store.set_provider_model("compatible", "gpt-4o-mini")
+
+    monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "deepseek_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "qwen_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "kimi_api_key", "", raising=False)
+
+    report = _build_provider_runtime_report(
+        {"provider": "auto", "model": "gpt-5.4-mini"},
+        secrets_file=secrets_path,
+    )
+
+    assert report["active_provider"] == "compatible"
+    assert report["resolved_model"] == "gpt-4o-mini"
+    assert report["active_ready"] is True
+
+    options = {"provider": "auto", "model": "gpt-5.4-mini"}
+    message = _switch_runtime_provider(options, "compatible", secrets_file=secrets_path)
+    assert "已切换 Provider" in message
+    assert options["provider"] == "compatible"
+    assert options["model"] == "gpt-4o-mini"
+
+
+def test_switch_runtime_provider_rejects_unready_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets_path = tmp_path / "secrets.json"
+    store = SecretStore(secrets_path)
+    store.set_api_key("compatible", "compat-key-123")
+
+    monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "deepseek_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "qwen_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "kimi_api_key", "", raising=False)
+
+    options = {"provider": "auto", "model": "gpt-5.4-mini"}
+    message = _switch_runtime_provider(options, "compatible", secrets_file=secrets_path)
+
+    assert "尚未就绪" in message
+    assert options["provider"] == "auto"
 
 
 def test_detect_fix_and_apply_intent() -> None:
@@ -753,7 +805,8 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/remediate <目标>" in rendered
     assert "/swarm --logs" in rendered
     assert "/refresh" in rendered
-    assert "Tab 自动补全命令" in rendered
+    assert "/providers" in rendered
+    assert "Up/Down 浏览历史" in rendered
 
 
 def test_natural_language_remediate_detection() -> None:
@@ -1776,7 +1829,7 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
 
 def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:
     snapshot = {
-        "shortcuts": ["/brief", "/scan", "/refresh"],
+        "shortcuts": ["/brief", "/scan", "/refresh", "/providers"],
         "recommended_commands": ["lazysre swarm --logs", "lazysre autopilot"],
     }
 
@@ -1784,6 +1837,19 @@ def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:
 
     assert "/refresh" in candidates
     assert "/scan" not in candidates
+
+
+def test_cycle_tui_input_history_roundtrip() -> None:
+    history = ["/scan", "/providers", "检查 swarm"]
+    text1, idx1, seed1 = _cycle_tui_input_history("", input_history=history, history_index=-1, history_seed="", direction="up")
+    text2, idx2, seed2 = _cycle_tui_input_history(text1, input_history=history, history_index=idx1, history_seed=seed1, direction="up")
+    text3, idx3, seed3 = _cycle_tui_input_history(text2, input_history=history, history_index=idx2, history_seed=seed2, direction="down")
+
+    assert text1 == "检查 swarm"
+    assert text2 == "/providers"
+    assert text3 == "检查 swarm"
+    assert idx3 == 2
+    assert seed3 == ""
 
 
 def test_cycle_tui_completion_keeps_original_prefix_across_tabs() -> None:
