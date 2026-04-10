@@ -6517,6 +6517,57 @@ def _read_recent_audit_events(path: Path, *, limit: int = 4) -> list[str]:
     return list(reversed(events))
 
 
+def _read_recent_audit_timeline(path: Path, *, limit: int = 5) -> list[dict[str, str]]:
+    if limit <= 0 or not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    items: list[dict[str, str]] = []
+    for raw in reversed(lines):
+        text = raw.strip()
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        timestamp = str(payload.get("timestamp", "")).strip()
+        time_label = ""
+        if "T" in timestamp:
+            time_label = timestamp.split("T", 1)[1][:5]
+        elif timestamp:
+            time_label = timestamp[:16]
+        command = payload.get("command")
+        if isinstance(command, list):
+            command_text = " ".join(str(part).strip() for part in command if str(part).strip())
+        else:
+            command_text = str(command or payload.get("action") or payload.get("tool") or payload.get("event") or "").strip()
+        if not command_text:
+            continue
+        ok_flag = payload.get("ok")
+        status = "ok" if ok_flag is True else "fail" if ok_flag is False else str(payload.get("status", "")).strip() or "info"
+        mode = "dry-run" if bool(payload.get("dry_run")) else "exec"
+        target = str(payload.get("remote_target", "")).strip()
+        summary = command_text[:96]
+        if target:
+            summary = f"{target} :: {summary}"[:110]
+        items.append(
+            {
+                "time": time_label or "--:--",
+                "status": status,
+                "mode": mode,
+                "summary": summary,
+            }
+        )
+        if len(items) >= limit:
+            break
+    return list(reversed(items))
+
+
 def _build_tui_recent_activity_context(options: dict[str, object]) -> dict[str, object]:
     items: list[str] = []
     commands: list[str] = []
@@ -6571,6 +6622,19 @@ def _render_recent_activity_text(options: dict[str, object]) -> str:
     lines = ["Recent Activity", *[f"- {item}" for item in items]]
     if commands:
         lines.extend(["", "Suggested Next Commands", *[f"- {item}" for item in commands]])
+    return "\n".join(lines)
+
+
+def _render_timeline_text(options: dict[str, object]) -> str:
+    audit_log = Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))).expanduser()
+    timeline = _read_recent_audit_timeline(audit_log, limit=6)
+    if not timeline:
+        return "Execution Timeline\n- 还没有执行轨迹，先运行 /scan、/brief、/remediate 或其它命令。"
+    lines = ["Execution Timeline"]
+    for item in timeline:
+        lines.append(
+            f"- {item.get('time', '--:--')} [{item.get('status', 'info')}/{item.get('mode', '-')}] {item.get('summary', '')}"
+        )
     return "\n".join(lines)
 
 
@@ -8165,6 +8229,7 @@ def _render_chat_short_help() -> None:
         "LazySRE Chat 快捷命令",
         "- /help: 查看帮助",
         "- /activity: 查看最近巡检、修复计划和审计轨迹，并给出建议下一步",
+        "- /timeline: 查看最近执行时间线（命令、状态、dry-run/exec）",
         "- /brief [user@host]: 汇总本机 scan 和可选远程目标，直接给一份 AI 总览简报",
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
         "- /swarm [--logs]: 检查 Docker Swarm 服务、副本、任务失败证据",
@@ -8293,6 +8358,15 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     recent_activity = recent_activity_context.get("items", [])
     if not isinstance(recent_activity, list):
         recent_activity = []
+    timeline_entries_raw = _read_recent_audit_timeline(
+        Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))).expanduser(),
+        limit=4,
+    )
+    timeline_entries = [
+        f"{item.get('time', '--:--')} [{item.get('status', 'info')}/{item.get('mode', '-')}] {item.get('summary', '')}"
+        for item in timeline_entries_raw
+        if isinstance(item, dict)
+    ]
     return {
         "title": "LazySRE TUI",
         "version": __version__,
@@ -8313,12 +8387,14 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "recent_commands": recent_commands[-3:],
         "recent_activity": recent_activity,
         "recent_activity_commands": recent_activity_context.get("commands", []),
+        "timeline_entries": timeline_entries,
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
         "active_provider": _resolve_runtime_provider_label(str(options.get("provider", "auto"))),
         "shortcuts": [
             "/brief",
             "/scan",
             "/activity",
+            "/timeline",
             "/refresh",
             "/providers",
             "/swarm --logs",
@@ -8350,6 +8426,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     recent_activity_commands = snapshot.get("recent_activity_commands", [])
     if not isinstance(recent_activity_commands, list):
         recent_activity_commands = []
+    timeline_entries = snapshot.get("timeline_entries", [])
+    if not isinstance(timeline_entries, list):
+        timeline_entries = []
     recent_commands = snapshot.get("recent_commands", [])
     if not isinstance(recent_commands, list):
         recent_commands = []
@@ -8374,6 +8453,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         "├─ Recommended ───────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in recommended[:4]],
         *([ "├─ Command Trail ─────────────────────────────────────────────────┤"] + [f"│ {item}" for item in recent_commands[-3:]] if recent_commands else []),
+        *([ "├─ Execution Timeline ────────────────────────────────────────────┤"] + [f"│ {item}" for item in timeline_entries[:3]] if timeline_entries else []),
         "├─ Shortcuts ─────────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in shortcuts],
         "├─ Conversation ──────────────────────────────────────────────────┤",
@@ -8553,6 +8633,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     recent_activity_commands = snapshot.get("recent_activity_commands", [])
     if not isinstance(recent_activity_commands, list):
         recent_activity_commands = []
+    timeline_entries = snapshot.get("timeline_entries", [])
+    if not isinstance(timeline_entries, list):
+        timeline_entries = []
     recent_commands = snapshot.get("recent_commands", [])
     if not isinstance(recent_commands, list):
         recent_commands = []
@@ -8592,6 +8675,10 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         lines.extend(["", "Command Trail:"])
         for item in recent_commands[-3:]:
             lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
+    if timeline_entries:
+        lines.extend(["", "Execution Timeline:"])
+        for item in timeline_entries[:3]:
+            lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
     lines.extend(["", "Shortcuts:"])
     for item in shortcuts[:6]:
         lines.extend(_wrap_tui_text_lines(str(item), width=width))
@@ -8602,6 +8689,8 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
 def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history: list[tuple[str, str]]) -> str:
     recent_activity = snapshot.get("recent_activity", [])
     activity_count = len(recent_activity) if isinstance(recent_activity, list) else 0
+    timeline_entries = snapshot.get("timeline_entries", [])
+    timeline_count = len(timeline_entries) if isinstance(timeline_entries, list) else 0
     targets = snapshot.get("usable_targets", [])
     target_count = len(targets) if isinstance(targets, list) else 0
     last_you = ""
@@ -8615,6 +8704,7 @@ def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history:
         f"provider={snapshot.get('active_provider', snapshot.get('provider', '-'))}",
         f"targets={target_count}",
         f"activity={activity_count}",
+        f"timeline={timeline_count}",
     ]
     if last_you:
         parts.append(f"last={last_you[:48]}")
@@ -8629,7 +8719,7 @@ def _wrap_tui_text_lines(text: str, *, width: int) -> list[str]:
 
 
 def _tui_welcome_message() -> str:
-    return "全屏 TUI 已启动。输入自然语言，或使用 /activity /brief /scan /providers /swarm /autopilot /remediate。"
+    return "全屏 TUI 已启动。输入自然语言，或使用 /activity /timeline /brief /scan /providers /swarm /autopilot /remediate。"
 
 
 def _cycle_tui_input_history(
@@ -8694,6 +8784,7 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/provider auto",
             "/provider mock",
             "/activity",
+            "/timeline",
             "/doctor fix",
             "/quickstart",
             "/status probe",
@@ -8821,6 +8912,8 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
         return _render_tui_demo_text(_build_tui_dashboard_snapshot(options))
     if lowered.startswith("/activity"):
         return _render_recent_activity_text(options)
+    if lowered.startswith("/timeline"):
+        return _render_timeline_text(options)
     if lowered in {"/providers", "/provider", "/provider show"}:
         return _capture_plain_output(lambda: _render_provider_runtime_report(_build_provider_runtime_report(options)))
     if lowered.startswith("/provider "):
@@ -9037,6 +9130,8 @@ def _normalize_slash_command_text(text: str) -> str:
         "undo",
         "memory",
         "apply",
+        "activity",
+        "timeline",
     ]
     corrected = aliases.get(command, "")
     if not corrected:
@@ -9103,6 +9198,9 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower().startswith("/activity"):
             typer.echo(_render_recent_activity_text({**options, "execute": runtime_execute}))
+            continue
+        if text.lower().startswith("/timeline"):
+            typer.echo(_render_timeline_text({**options, "execute": runtime_execute}))
             continue
         if text.lower() in {"/mode", "/mode show"}:
             _render_mode_hint(runtime_execute)

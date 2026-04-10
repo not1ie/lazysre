@@ -132,6 +132,7 @@ from lazysre.cli.main import (
     _build_tui_dashboard_snapshot,
     _render_tui_demo_text,
     _render_recent_activity_text,
+    _render_timeline_text,
     _build_tui_footer_line,
     _cycle_tui_completion,
     _cycle_tui_input_history,
@@ -811,6 +812,7 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/refresh" in rendered
     assert "/providers" in rendered
     assert "/activity" in rendered
+    assert "/timeline" in rendered
     assert "Recent Activity" in rendered
     assert "Command Trail" in rendered
     assert "Up/Down 浏览历史" in rendered
@@ -1890,6 +1892,7 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert any("docker service ls" in item for item in snapshot["recent_activity"])
     assert "/activity" in snapshot["recent_activity_commands"]
     assert "/swarm --service api --logs" in snapshot["recent_activity_commands"]
+    assert any("08:30 [ok/exec] docker service ls" in item for item in snapshot["timeline_entries"])
 
 
 def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1924,6 +1927,43 @@ def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monk
     assert "/swarm --service payment --logs" in rendered
 
 
+def test_render_timeline_text_includes_audit_entries(tmp_path: Path) -> None:
+    audit_log = tmp_path / "audit.jsonl"
+    audit_log.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-10T08:30:00+00:00",
+                        "ok": True,
+                        "dry_run": False,
+                        "command": ["docker", "service", "ls"],
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-10T08:31:00+00:00",
+                        "ok": False,
+                        "dry_run": True,
+                        "remote_target": "root@10.0.0.8",
+                        "command": ["kubectl", "get", "pods"],
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rendered = _render_timeline_text({"audit_log": str(audit_log)})
+
+    assert "Execution Timeline" in rendered
+    assert "08:30 [ok/exec] docker service ls" in rendered
+    assert "08:31 [fail/dry-run] root@10.0.0.8 :: kubectl get pods" in rendered
+
+
 def test_build_tui_footer_line_includes_last_user_command() -> None:
     footer = _build_tui_footer_line(
         snapshot={
@@ -1931,6 +1971,7 @@ def test_build_tui_footer_line_includes_last_user_command() -> None:
             "active_provider": "auto->mock",
             "usable_targets": ["docker", "kubernetes"],
             "recent_activity": ["watch attention alerts=1 cycle=2", "fix plan | cmds=1 | 重启 payment"],
+            "timeline_entries": ["08:30 [ok/exec] docker service ls"],
         },
         status="running",
         history=[
@@ -1944,6 +1985,7 @@ def test_build_tui_footer_line_includes_last_user_command() -> None:
     assert "provider=auto->mock" in footer
     assert "targets=2" in footer
     assert "activity=2" in footer
+    assert "timeline=1" in footer
     assert "last=/activity" in footer
 
 
