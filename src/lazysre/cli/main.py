@@ -8581,6 +8581,7 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
         elif key == curses.KEY_F2:
             options["tui_panel"] = _next_tui_panel(str(options.get("tui_panel", snapshot.get("sidebar_panel", "overview"))))
             snapshot.update(_build_tui_dashboard_snapshot(options))
+            history.append(("LazySRE", f"左侧面板已切换到 {snapshot.get('sidebar_panel', 'overview')}。"))
             status = f"panel:{snapshot.get('sidebar_panel', 'overview')}"
         elif key in {curses.KEY_BACKSPACE, curses.KEY_DC}:
             input_text = input_text[:-1]
@@ -8653,6 +8654,8 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         recent_commands = []
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     lines = [
+        *_build_tui_panel_tabs(panel, width=width),
+        "",
         f"panel: {panel}",
         f"status: {snapshot.get('status', '-')}",
         f"mode: {snapshot.get('mode', '-')}",
@@ -8778,6 +8781,14 @@ def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history:
     if last_you:
         parts.append(f"last={last_you[:48]}")
     return " | ".join(parts)
+
+
+def _build_tui_panel_tabs(active_panel: str, *, width: int) -> list[str]:
+    normalized = _normalize_tui_panel_name(active_panel)
+    labels = []
+    for name in ["overview", "activity", "timeline", "providers"]:
+        labels.append(f"[{name}]" if name == normalized else name)
+    return textwrap.wrap("Panels: " + " | ".join(labels), width=max(20, width)) or ["Panels: " + " | ".join(labels)]
 
 
 def _wrap_tui_text_lines(text: str, *, width: int) -> list[str]:

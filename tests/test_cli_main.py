@@ -134,6 +134,7 @@ from lazysre.cli.main import (
     _render_recent_activity_text,
     _render_timeline_text,
     _build_tui_footer_line,
+    _build_tui_panel_tabs,
     _build_tui_sidebar_lines,
     _normalize_tui_panel_name,
     _switch_tui_panel,
@@ -2012,6 +2013,15 @@ def test_switch_tui_panel_updates_options() -> None:
     assert "providers" in msg2
 
 
+def test_build_tui_panel_tabs_marks_active_panel() -> None:
+    lines = _build_tui_panel_tabs("timeline", width=80)
+    joined = "\n".join(lines)
+
+    assert "[timeline]" in joined
+    assert "overview" in joined
+    assert "providers" in joined
+
+
 def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
     snapshot = {
         "sidebar_panel": "timeline",
@@ -2036,6 +2046,8 @@ def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
     lines = _build_tui_sidebar_lines(snapshot, width=32)
     joined = "\n".join(lines)
 
+    assert "Panels:" in joined
+    assert "[timeline]" in joined
     assert "panel: timeline" in joined
     assert "Execution Timeline:" in joined
     assert "Command Trail:" in joined
