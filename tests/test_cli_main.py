@@ -797,7 +797,9 @@ def test_version_info_and_cli_version_output() -> None:
 
 
 def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
-    snapshot = _build_tui_dashboard_snapshot({"execute": False, "provider": "mock", "model": "test-model"})
+    snapshot = _build_tui_dashboard_snapshot(
+        {"execute": False, "provider": "mock", "model": "test-model", "audit_log": "missing.jsonl"}
+    )
     rendered = _render_tui_demo_text(snapshot)
 
     assert "LazySRE Fullscreen TUI" in rendered
@@ -806,6 +808,7 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/swarm --logs" in rendered
     assert "/refresh" in rendered
     assert "/providers" in rendered
+    assert "Recent Activity" in rendered
     assert "Up/Down 浏览历史" in rendered
 
 
@@ -1787,6 +1790,7 @@ def test_render_cached_startup_brief_prints_next_step(capsys: pytest.CaptureFixt
 def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
     session_file = tmp_path / "session.json"
+    audit_log = tmp_path / "audit.jsonl"
     session_file.write_text(
         json.dumps(
             {
@@ -1815,9 +1819,60 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
         ),
         encoding="utf-8",
     )
+    (tmp_path / "lsre-watch-last.json").write_text(
+        json.dumps(
+            {
+                "cycle": 3,
+                "alerts": [{"source": "swarm", "name": "api", "detail": "replicas=0/1"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "lsre-fix-last.json").write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-04-10T00:10:00+00:00",
+                "instruction": "重启 api 服务以恢复副本",
+                "plan": {"apply_commands": ["docker service update --force api"]},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    audit_log.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-10T08:30:00+00:00",
+                        "status": "ok",
+                        "command": ["docker", "service", "ls"],
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-10T08:31:00+00:00",
+                        "status": "ok",
+                        "action": "scan",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     snapshot = _build_tui_dashboard_snapshot(
-        {"execute": False, "provider": "mock", "model": "test-model", "session_file": str(session_file)}
+        {
+            "execute": False,
+            "provider": "mock",
+            "model": "test-model",
+            "session_file": str(session_file),
+            "audit_log": str(audit_log),
+        }
     )
 
     assert snapshot["status"] == "attention"
@@ -1825,6 +1880,9 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert snapshot["session_turns"] == 2
     assert snapshot["last_user"] == "重启它"
     assert snapshot["recommended_commands"][0] == "lazysre swarm --logs"
+    assert any("watch attention alerts=1 cycle=3" in item for item in snapshot["recent_activity"])
+    assert any("fix plan | cmds=1" in item for item in snapshot["recent_activity"])
+    assert any("docker service ls" in item for item in snapshot["recent_activity"])
 
 
 def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:

@@ -6471,6 +6471,78 @@ def _read_last_fix_plan_summary(path: Path) -> dict[str, object]:
     }
 
 
+def _read_recent_audit_events(path: Path, *, limit: int = 4) -> list[str]:
+    if limit <= 0 or not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    events: list[str] = []
+    for raw in reversed(lines):
+        text = raw.strip()
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        timestamp = str(payload.get("timestamp", "")).strip()
+        stamp = ""
+        if "T" in timestamp:
+            stamp = timestamp.split("T", 1)[1][:5]
+        elif timestamp:
+            stamp = timestamp[:16]
+        status = str(
+            payload.get("status")
+            or payload.get("result")
+            or ("ok" if payload.get("ok") is True else "error" if payload.get("ok") is False else "")
+        ).strip()
+        command = payload.get("command")
+        command_text = ""
+        if isinstance(command, list):
+            command_text = " ".join(str(part).strip() for part in command if str(part).strip())
+        elif command is not None:
+            command_text = str(command).strip()
+        action = str(payload.get("action") or payload.get("tool") or payload.get("event") or "").strip()
+        summary = command_text or action or str(payload.get("message", "")).strip()
+        if not summary:
+            continue
+        parts = [part for part in [stamp, status, summary[:96]] if part]
+        events.append(" | ".join(parts))
+        if len(events) >= limit:
+            break
+    return list(reversed(events))
+
+
+def _build_tui_recent_activity(options: dict[str, object]) -> list[str]:
+    items: list[str] = []
+    watch_snapshot = _load_latest_watch_snapshot(None)
+    if watch_snapshot:
+        alerts = watch_snapshot.get("alerts", [])
+        alert_count = len(alerts) if isinstance(alerts, list) else 0
+        items.append(
+            "watch "
+            + (
+                f"attention alerts={alert_count} cycle={watch_snapshot.get('cycle', '-')}"
+                if alert_count
+                else f"healthy cycle={watch_snapshot.get('cycle', '-')}"
+            )
+        )
+    last_fix_path = Path(str(options.get("fix_plan_file", Path(settings.data_dir) / "lsre-fix-last.json"))).expanduser()
+    last_fix = _read_last_fix_plan_summary(last_fix_path)
+    if bool(last_fix.get("exists")):
+        instruction = str(last_fix.get("instruction", "")).strip() or "最近一次修复计划"
+        items.append(f"fix plan | cmds={last_fix.get('apply_commands', 0)} | {instruction[:72]}")
+    audit_log = Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))).expanduser()
+    items.extend(_read_recent_audit_events(audit_log, limit=3))
+    if not items:
+        return ["还没有最近活动，先运行 /scan、/brief 或一次自然语言诊断。"]
+    return _dedupe_strings([str(item).strip() for item in items if str(item).strip()])[:5]
+
+
 def _render_status_snapshot(snapshot: dict[str, object]) -> None:
     if not (_console and Table):
         typer.echo(json.dumps(snapshot, ensure_ascii=False, indent=2))
@@ -8175,6 +8247,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         ]
         if cmd not in recommended_commands
     )
+    recent_activity = _build_tui_recent_activity(options)
     return {
         "title": "LazySRE TUI",
         "version": __version__,
@@ -8192,6 +8265,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "prometheus_url": str(target.prometheus_url or settings.target_prometheus_url or ""),
         "session_turns": len(session_turns),
         "last_user": last_user[:120],
+        "recent_activity": recent_activity,
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
         "active_provider": _resolve_runtime_provider_label(str(options.get("provider", "auto"))),
         "shortcuts": [
@@ -8222,6 +8296,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     configured_providers = snapshot.get("configured_providers", [])
     if not isinstance(configured_providers, list):
         configured_providers = []
+    recent_activity = snapshot.get("recent_activity", [])
+    if not isinstance(recent_activity, list):
+        recent_activity = []
     lines = [
         "╭─ LazySRE Fullscreen TUI ─────────────────────────────────────────╮",
         f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
@@ -8237,6 +8314,8 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         f"│ prometheus={snapshot.get('prometheus_url', '-') or '(not set)'}",
         f"│ session_turns={snapshot.get('session_turns', 0)}",
         f"│ last_user={snapshot.get('last_user', '-') or '-'}",
+        "├─ Recent Activity ───────────────────────────────────────────────┤",
+        *[f"│ {item}" for item in recent_activity[:4]],
         "├─ Recommended ───────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in recommended[:4]],
         "├─ Shortcuts ─────────────────────────────────────────────────────┤",
@@ -8410,6 +8489,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     configured = snapshot.get("configured_providers", [])
     if not isinstance(configured, list):
         configured = []
+    recent_activity = snapshot.get("recent_activity", [])
+    if not isinstance(recent_activity, list):
+        recent_activity = []
     lines = [
         f"status: {snapshot.get('status', '-')}",
         f"mode: {snapshot.get('mode', '-')}",
@@ -8430,6 +8512,10 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     if last_user:
         lines.extend(["", "Last Input:"])
         lines.extend(_wrap_tui_text_lines(last_user, width=width))
+    if recent_activity:
+        lines.extend(["", "Recent Activity:"])
+        for item in recent_activity[:4]:
+            lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
     if recommended:
         lines.extend(["", "Recommended:"])
         for item in recommended[:4]:

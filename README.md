@@ -21,7 +21,7 @@ lazysre
 # 首次启动会自动生成只读 LazySRE Brief，并给出下一步命令
 lazysre tui
 lazysre tui --demo
-# TUI 内支持 Tab 自动补全、Up/Down 历史、Ctrl-L 清屏、/refresh 刷新总览、/providers 查看模型配置
+# TUI 内支持 Tab 自动补全、Up/Down 历史、Ctrl-L 清屏、/refresh 刷新总览、/providers 查看模型配置，并在侧边栏显示最近活动时间线
 # 兼容短命令
 lsre
 # 或 python 模块方式
@@ -145,7 +145,7 @@ lazysre --provider compatible
 - 持续巡检：`watch` 可定期扫描环境并输出异常摘要/JSONL
 - 行动收件箱：`actions` 将最近巡检结果转换成编号建议、模板命令与风险提示
 - 自动驾驶：`autopilot` 串起扫描、巡检、行动清单和修复计划
-- 全屏 TUI：`tui` 提供类似 Claude Code 的左右分区交互，支持自然语言、快捷命令和同屏结果流
+- 全屏 TUI：`tui` 提供类似 Claude Code 的左右分区交互，支持自然语言、快捷命令、最近活动时间线和同屏结果流
 - 生产闭环修复：`remediate` 串起 Observe -> Plan -> Apply -> Verify -> Rollback Advice
 - 异常记忆：`watch` 发现的问题会写入长期记忆，后续相似诊断会自动引用历史经验
 - 安全执行器：支持 Dry-run、风险分级、审批确认、审计日志
