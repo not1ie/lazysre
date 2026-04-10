@@ -153,6 +153,28 @@ def root(
         "provider": provider,
         "max_steps": max(1, min(max_steps, 12)),
     }
+    if ctx.invoked_subcommand is None and _should_launch_default_tui(sys.argv[1:]):
+        options = _merged_options(
+            ctx,
+            execute=None,
+            approve=None,
+            interactive_approval=None,
+            stream_output=None,
+            verbose_reasoning=None,
+            approval_mode=None,
+            audit_log=None,
+            lock_file=None,
+            session_file=None,
+            deny_tool=None,
+            deny_prefix=None,
+            tool_pack=None,
+            remote_gateway=None,
+            model=None,
+            provider=None,
+            max_steps=None,
+        )
+        _run_tui(options, demo=False)
+        raise typer.Exit()
     if ctx.invoked_subcommand is None and _should_launch_assistant(sys.argv[1:]):
         options = _merged_options(
             ctx,
@@ -12870,7 +12892,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         return
 
 
-def _should_launch_assistant(tokens: list[str]) -> bool:
+def _should_launch_default_tui(tokens: list[str]) -> bool:
     if not tokens:
         return True
     commands = {
@@ -12937,6 +12959,75 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
             continue
         return False
     return True
+
+
+def _should_launch_assistant(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    commands = {
+        "run",
+        "chat",
+        "tui",
+        "login",
+        "logout",
+        "init",
+        "quickstart",
+        "reset",
+        "undo",
+        "fix",
+        "approve",
+        "status",
+        "brief",
+        "scan",
+        "swarm",
+        "watch",
+        "actions",
+        "autopilot",
+        "remediate",
+        "connect",
+        "remote",
+        "doctor",
+        "install-doctor",
+        "setup",
+        "report",
+        "template",
+        "runbook",
+        "pack",
+        "target",
+        "history",
+        "memory",
+        "version",
+        "--help",
+        "--version",
+        "-V",
+        "-h",
+    }
+    options_with_value = {
+        "--approval-mode",
+        "--audit-log",
+        "--lock-file",
+        "--session-file",
+        "--deny-tool",
+        "--deny-prefix",
+        "--tool-pack",
+        "--remote-gateway",
+        "--model",
+        "--provider",
+        "--max-steps",
+    }
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token in commands:
+            return False
+        if token.startswith("-"):
+            if token in options_with_value and idx + 1 < len(tokens):
+                idx += 2
+                continue
+            idx += 1
+            continue
+        return False
+    return False
 
 
 if __name__ == "__main__":

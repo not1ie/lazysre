@@ -17,8 +17,8 @@ curl -fsSL https://raw.githubusercontent.com/not1ie/lazysre/main/scripts/install
 
 # 启动
 lazysre
-# 首次直接启动会自动生成只读 LazySRE Brief，并给出下一步命令
-# 全屏 TUI（类似 Claude Code 的左右分区交互；不支持全屏时可用 --demo 预览）
+# 默认直接进入全屏 TUI（类似 Gemini / Claude Code）
+# 首次启动会自动生成只读 LazySRE Brief，并给出下一步命令
 lazysre tui
 lazysre tui --demo
 # TUI 内支持 Tab 自动补全、/refresh 刷新总览、同屏展示推荐下一步
@@ -149,6 +149,7 @@ lazysre --provider kimi chat
 ```bash
 # 对话与诊断
 lazysre
+# 直接启动默认进入 TUI
 lsre
 lsre chat
 lsre "检查 k8s pod 状态"

@@ -113,6 +113,7 @@ from lazysre.cli.main import (
     _render_incident_report_markdown,
     _rewrite_argv_for_default_run,
     _summarize_doctor_checks,
+    _should_launch_default_tui,
     _push_report_to_git,
     _resolve_default_provider,
     _resolve_provider_api_key,
@@ -613,10 +614,45 @@ def test_build_quick_k8s_action_plan_from_memory(tmp_path: Path) -> None:
     assert "kubectl -n ops scale deploy/payment --replicas=4" in scale_plan["commands"]
 
 
-def test_should_launch_assistant_with_only_options() -> None:
-    assert _should_launch_assistant(["--provider", "mock"]) is True
-    assert _should_launch_assistant(["--verbose-reasoning"]) is True
-    assert _should_launch_assistant([]) is True
+def test_should_launch_default_tui_with_only_options() -> None:
+    assert _should_launch_default_tui(["--provider", "mock"]) is True
+    assert _should_launch_default_tui(["--verbose-reasoning"]) is True
+    assert _should_launch_default_tui([]) is True
+    assert _should_launch_default_tui(["chat"]) is False
+    assert _should_launch_default_tui(["init"]) is False
+    assert _should_launch_default_tui(["quickstart"]) is False
+    assert _should_launch_default_tui(["reset"]) is False
+    assert _should_launch_default_tui(["undo"]) is False
+    assert _should_launch_default_tui(["login"]) is False
+    assert _should_launch_default_tui(["logout"]) is False
+    assert _should_launch_default_tui(["status"]) is False
+    assert _should_launch_default_tui(["brief"]) is False
+    assert _should_launch_default_tui(["scan"]) is False
+    assert _should_launch_default_tui(["swarm"]) is False
+    assert _should_launch_default_tui(["watch"]) is False
+    assert _should_launch_default_tui(["actions"]) is False
+    assert _should_launch_default_tui(["autopilot"]) is False
+    assert _should_launch_default_tui(["remediate"]) is False
+    assert _should_launch_default_tui(["tui"]) is False
+    assert _should_launch_default_tui(["connect"]) is False
+    assert _should_launch_default_tui(["remote"]) is False
+    assert _should_launch_default_tui(["doctor"]) is False
+    assert _should_launch_default_tui(["install-doctor"]) is False
+    assert _should_launch_default_tui(["setup"]) is False
+    assert _should_launch_default_tui(["template"]) is False
+    assert _should_launch_default_tui(["report"]) is False
+    assert _should_launch_default_tui(["runbook"]) is False
+    assert _should_launch_default_tui(["approve"]) is False
+    assert _should_launch_default_tui(["memory"]) is False
+    assert _should_launch_default_tui(["version"]) is False
+    assert _should_launch_default_tui(["--version"]) is False
+    assert _should_launch_default_tui(["检查k8s"]) is False
+
+
+def test_should_launch_assistant_is_no_longer_default_surface() -> None:
+    assert _should_launch_assistant(["--provider", "mock"]) is False
+    assert _should_launch_assistant(["--verbose-reasoning"]) is False
+    assert _should_launch_assistant([]) is False
     assert _should_launch_assistant(["chat"]) is False
     assert _should_launch_assistant(["init"]) is False
     assert _should_launch_assistant(["quickstart"]) is False
