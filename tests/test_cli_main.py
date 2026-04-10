@@ -13,6 +13,7 @@ from lazysre.cli.main import (
     _build_cli_llm,
     _build_provider_setup_checks,
     _build_doctor_gate,
+    _build_discovery_target_updates,
     _build_incident_report_payload,
     _compute_doctor_autofix,
     _collect_runtime_status,
@@ -129,6 +130,8 @@ from lazysre.cli.main import (
     _version_text,
     _build_tui_dashboard_snapshot,
     _render_tui_demo_text,
+    _cycle_tui_completion,
+    _tui_completion_candidates,
     _derive_closed_loop_plan,
     _infer_verification_commands,
     _looks_like_remediate_request,
@@ -673,6 +676,8 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "provider=mock" in rendered
     assert "/remediate <目标>" in rendered
     assert "/swarm --logs" in rendered
+    assert "/refresh" in rendered
+    assert "Tab 自动补全命令" in rendered
 
 
 def test_natural_language_remediate_detection() -> None:
@@ -958,9 +963,23 @@ def test_doctor_is_healthy_strict_and_non_strict() -> None:
 
 
 def test_compute_doctor_autofix_sets_safe_defaults(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "target_prometheus_url", "", raising=False)
+    monkeypatch.setattr(settings, "target_k8s_api_url", "", raising=False)
     monkeypatch.setattr(
         "lazysre.cli.main._detect_kubectl_current_context",
         lambda: "autofix-context",
+    )
+    monkeypatch.setattr(
+        "lazysre.cli.main._detect_kubectl_server",
+        lambda: "https://10.0.0.1:6443",
+    )
+    monkeypatch.setattr(
+        "lazysre.cli.main._detect_kubectl_default_namespace",
+        lambda: "prod",
+    )
+    monkeypatch.setattr(
+        "lazysre.cli.main._detect_prometheus_ready_url",
+        lambda: "http://prometheus:9090",
     )
     target = TargetEnvironment(
         prometheus_url="",
@@ -971,9 +990,9 @@ def test_compute_doctor_autofix_sets_safe_defaults(monkeypatch) -> None:
         k8s_verify_tls=False,
     )
     updates, actions = _compute_doctor_autofix(target)
-    assert updates.get("k8s_namespace") == "default"
-    assert "prometheus_url" in updates
-    assert "k8s_api_url" in updates
+    assert updates.get("k8s_namespace") == "prod"
+    assert updates.get("prometheus_url") == "http://prometheus:9090"
+    assert updates.get("k8s_api_url") == "https://10.0.0.1:6443"
     assert updates.get("k8s_context") == "autofix-context"
     assert actions
 
@@ -1494,6 +1513,39 @@ def test_collect_environment_discovery_scans_without_k8s_token(
     assert report["briefing"]["next"] == "lazysre swarm --logs"
 
 
+def test_build_discovery_target_updates_prefers_discovered_values() -> None:
+    target = TargetEnvironment(
+        prometheus_url="",
+        k8s_api_url="",
+        k8s_context="",
+        k8s_namespace="default",
+        k8s_bearer_token="",
+        k8s_verify_tls=False,
+        ssh_target="",
+    )
+
+    updates = _build_discovery_target_updates(
+        target,
+        {
+            "discoveries": {
+                "prometheus": {"url": "http://prometheus:9090"},
+                "kubernetes": {
+                    "context": "prod-cluster",
+                    "server": "https://10.0.0.1:6443",
+                    "namespace": "prod",
+                },
+            }
+        },
+    )
+
+    assert updates == {
+        "prometheus_url": "http://prometheus:9090",
+        "k8s_context": "prod-cluster",
+        "k8s_api_url": "https://10.0.0.1:6443",
+        "k8s_namespace": "prod",
+    }
+
+
 def test_build_environment_scan_briefing_when_no_targets() -> None:
     report = {
         "summary": {"pass": 1, "warn": 2, "error": 0},
@@ -1601,6 +1653,75 @@ def test_render_cached_startup_brief_prints_next_step(capsys: pytest.CaptureFixt
     out = capsys.readouterr().out
     assert "上次总览: attention" in out
     assert "lazysre swarm --logs" in out
+
+
+def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+    session_file = tmp_path / "session.json"
+    session_file.write_text(
+        json.dumps(
+            {
+                "turns": [
+                    {"user": "检查 swarm 服务", "assistant": "好的"},
+                    {"user": "重启它", "assistant": "已生成计划"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "lsre-onboarding.json").write_text(
+        json.dumps(
+            {
+                "generated_at_utc": "2026-04-10T00:00:00+00:00",
+                "usable_targets": ["docker-swarm", "kubernetes"],
+                "next_actions": ["lazysre swarm --logs"],
+                "briefing": {
+                    "status": "attention",
+                    "headline": "本机已发现 Swarm 和 K8s，可直接开始诊断。",
+                    "next": "lazysre swarm --logs",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = _build_tui_dashboard_snapshot(
+        {"execute": False, "provider": "mock", "model": "test-model", "session_file": str(session_file)}
+    )
+
+    assert snapshot["status"] == "attention"
+    assert "docker-swarm" in snapshot["usable_targets"]
+    assert snapshot["session_turns"] == 2
+    assert snapshot["last_user"] == "重启它"
+    assert snapshot["recommended_commands"][0] == "lazysre swarm --logs"
+
+
+def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:
+    snapshot = {
+        "shortcuts": ["/brief", "/scan", "/refresh"],
+        "recommended_commands": ["lazysre swarm --logs", "lazysre autopilot"],
+    }
+
+    candidates = _tui_completion_candidates("/r", snapshot)
+
+    assert "/refresh" in candidates
+    assert "/scan" not in candidates
+
+
+def test_cycle_tui_completion_keeps_original_prefix_across_tabs() -> None:
+    snapshot = {
+        "shortcuts": ["/refresh", "/remote root@host --logs"],
+        "recommended_commands": [],
+    }
+
+    first, idx, seed = _cycle_tui_completion("/r", snapshot=snapshot, completion_index=-1, completion_seed="")
+    second, idx2, seed2 = _cycle_tui_completion(first, snapshot=snapshot, completion_index=idx, completion_seed=seed)
+
+    assert first == "/refresh"
+    assert second == "/remote root@host --logs"
+    assert seed2 == "/r"
 
 
 def test_collect_swarm_health_report_detects_unhealthy_service(monkeypatch: pytest.MonkeyPatch) -> None:

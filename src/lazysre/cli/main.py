@@ -3638,6 +3638,18 @@ def _scan_kubernetes_environment(kubectl_path: str, *, timeout_sec: int) -> dict
     if not context_name:
         return {"discovery": discovery, "checks": checks}
 
+    server_probe = _safe_run_command(
+        [kubectl_path, "config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}"],
+        timeout_sec=timeout_sec,
+    )
+    discovery["server"] = str(server_probe.get("stdout", "")).strip()
+
+    namespace_probe = _safe_run_command(
+        [kubectl_path, "config", "view", "--minify", "-o", "jsonpath={.contexts[0].context.namespace}"],
+        timeout_sec=timeout_sec,
+    )
+    discovery["namespace"] = str(namespace_probe.get("stdout", "")).strip() or "default"
+
     nodes_probe = _safe_run_command(
         [kubectl_path, "get", "nodes", "--request-timeout=5s", "-o", "name"],
         timeout_sec=timeout_sec,
@@ -6611,14 +6623,17 @@ def _run_first_run_setup(
     store = TargetEnvStore(profile_file)
     target = store.load()
     setup_actions: list[str] = []
+    discovery_report = _collect_environment_discovery(
+        timeout_sec=max(2, min(timeout_sec, 6)),
+        secrets_file=secrets_file,
+    )
     if apply_defaults:
         updates = _compute_setup_default_updates(target)
-        if updates:
-            target = store.update(**updates)
-            setup_actions.extend(
-                f"set {key}={value}" if key != "k8s_bearer_token" else "set k8s_bearer_token=(hidden)"
-                for key, value in updates.items()
-            )
+        discovery_updates = _build_discovery_target_updates(target, discovery_report)
+        merged_updates = {**updates, **discovery_updates}
+        if merged_updates:
+            target = store.update(**merged_updates)
+            setup_actions.extend(_format_target_update_actions(merged_updates, source="autofill"))
 
     install_report = _collect_install_doctor_report()
     provider_checks = _build_provider_setup_checks(secrets_file=secrets_file)
@@ -6664,6 +6679,7 @@ def _run_first_run_setup(
         "active_provider": active_provider,
         "providers": provider_checks,
         "install": install_report,
+        "discovery": discovery_report,
         "probe": probe_report,
         "next_actions": next_actions,
     }
@@ -6859,6 +6875,45 @@ def _compute_setup_default_updates(target) -> dict[str, object]:
         candidate = str(settings.target_k8s_namespace or "").strip() or "default"
         updates["k8s_namespace"] = candidate
     return updates
+
+
+def _build_discovery_target_updates(target, discovery_report: dict[str, object]) -> dict[str, object]:
+    discoveries = discovery_report.get("discoveries", {})
+    if not isinstance(discoveries, dict):
+        discoveries = {}
+    updates: dict[str, object] = {}
+
+    prometheus = discoveries.get("prometheus", {})
+    if isinstance(prometheus, dict):
+        prom_url = str(prometheus.get("url", "")).strip()
+        if prom_url and (not str(getattr(target, "prometheus_url", "") or "").strip()):
+            updates["prometheus_url"] = prom_url
+
+    kubernetes = discoveries.get("kubernetes", {})
+    if isinstance(kubernetes, dict):
+        context_name = str(kubernetes.get("context", "")).strip()
+        server = str(kubernetes.get("server", "")).strip()
+        namespace = str(kubernetes.get("namespace", "")).strip()
+        current_context = str(getattr(target, "k8s_context", "") or "").strip()
+        current_server = str(getattr(target, "k8s_api_url", "") or "").strip()
+        current_namespace = str(getattr(target, "k8s_namespace", "") or "").strip()
+        if context_name and (not current_context):
+            updates["k8s_context"] = context_name
+        if server and (not current_server):
+            updates["k8s_api_url"] = server
+        if namespace and ((not current_namespace) or (current_namespace == "default" and namespace != "default")):
+            updates["k8s_namespace"] = namespace
+    return updates
+
+
+def _format_target_update_actions(updates: dict[str, object], *, source: str) -> list[str]:
+    actions: list[str] = []
+    for key, value in updates.items():
+        if key == "k8s_bearer_token":
+            actions.append(f"{source}: set {key}=(hidden)")
+        else:
+            actions.append(f"{source}: set {key}={value}")
+    return actions
 
 
 def _resolve_setup_provider(provider: str, *, secrets_file: Path | None = None) -> str:
@@ -7235,6 +7290,33 @@ def _render_setup_report(report: dict[str, object]) -> None:
                 )
         _console.print(install_table)
 
+    discovery = report.get("discovery", {})
+    if isinstance(discovery, dict):
+        discovery_summary = discovery.get("summary", {})
+        usable_targets = discovery.get("usable_targets", [])
+        if not isinstance(discovery_summary, dict):
+            discovery_summary = {}
+        if not isinstance(usable_targets, list):
+            usable_targets = []
+        discovery_lines = [
+            f"Usable Targets: {', '.join(str(x) for x in usable_targets) or 'none'}",
+            (
+                "Discovery Summary: "
+                f"pass={discovery_summary.get('pass', 0)} "
+                f"warn={discovery_summary.get('warn', 0)} "
+                f"error={discovery_summary.get('error', 0)}"
+            ),
+        ]
+        issues = discovery.get("issues", [])
+        if isinstance(issues, list):
+            for item in issues[:4]:
+                if not isinstance(item, dict):
+                    continue
+                discovery_lines.append(
+                    f"- {item.get('severity', 'warn')}: {item.get('name', '-')} {str(item.get('detail', ''))[:120]}"
+                )
+        _console.print(Panel("\n".join(discovery_lines), title="Auto Discovery", border_style="cyan"))
+
     probe = report.get("probe", {})
     if isinstance(probe, dict):
         checks = probe.get("checks", {})
@@ -7422,14 +7504,29 @@ def _compute_doctor_autofix(target) -> tuple[dict[str, object], list[str]]:
     if not str(target.prometheus_url or "").strip() and settings.target_prometheus_url.strip():
         updates["prometheus_url"] = settings.target_prometheus_url.strip()
         actions.append("set prometheus_url from default settings")
+    elif not str(target.prometheus_url or "").strip():
+        detected_prometheus = _detect_prometheus_ready_url()
+        if detected_prometheus:
+            updates["prometheus_url"] = detected_prometheus
+            actions.append(f"set prometheus_url={detected_prometheus}")
     if not str(target.k8s_api_url or "").strip() and settings.target_k8s_api_url.strip():
         updates["k8s_api_url"] = settings.target_k8s_api_url.strip()
         actions.append("set k8s_api_url from default settings")
+    elif not str(target.k8s_api_url or "").strip():
+        detected_server = _detect_kubectl_server()
+        if detected_server:
+            updates["k8s_api_url"] = detected_server
+            actions.append(f"set k8s_api_url={detected_server}")
     if not str(target.k8s_context or "").strip():
         detected = _detect_kubectl_current_context()
         if detected:
             updates["k8s_context"] = detected
             actions.append(f"set k8s_context={detected}")
+    detected_namespace = _detect_kubectl_default_namespace()
+    current_namespace = str(target.k8s_namespace or "").strip()
+    if detected_namespace and ((not current_namespace) or (current_namespace == "default" and detected_namespace != "default")):
+        updates["k8s_namespace"] = detected_namespace
+        actions.append(f"set k8s_namespace={detected_namespace}")
     return updates, actions
 
 
@@ -7449,6 +7546,46 @@ def _detect_kubectl_current_context() -> str:
     if completed.returncode != 0:
         return ""
     return (completed.stdout or "").strip()
+
+
+def _detect_kubectl_default_namespace() -> str:
+    return _detect_kubectl_minified_jsonpath("{.contexts[0].context.namespace}") or "default"
+
+
+def _detect_kubectl_server() -> str:
+    return _detect_kubectl_minified_jsonpath("{.clusters[0].cluster.server}")
+
+
+def _detect_kubectl_minified_jsonpath(path_expr: str) -> str:
+    if not shutil.which("kubectl"):
+        return ""
+    try:
+        completed = subprocess.run(
+            ["kubectl", "config", "view", "--minify", "-o", f"jsonpath={path_expr}"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return (completed.stdout or "").strip()
+
+
+def _detect_prometheus_ready_url(timeout_sec: int = 2) -> str:
+    curl_path = shutil.which("curl")
+    if not curl_path:
+        return ""
+    for url in _prometheus_candidate_urls():
+        probe = _safe_run_command(
+            [curl_path, "-fsS", "--max-time", str(max(1, timeout_sec)), f"{url.rstrip('/')}/-/ready"],
+            timeout_sec=max(2, timeout_sec + 1),
+        )
+        if bool(probe.get("ok")):
+            return url
+    return ""
 
 
 def _backup_target_profile(path: Path) -> str:
@@ -7813,6 +7950,7 @@ def _render_chat_short_help() -> None:
         "- /remote [user@host] [--logs]: 通过 SSH 只读诊断远程 Docker/Swarm；已保存 ssh_target 时可省略主机",
         "- /remediate <目标>: 生产闭环修复（Observe -> Plan -> Apply -> Verify -> Rollback Advice）",
         "- /tui: 启动全屏 TUI（也可直接运行 lazysre tui）",
+        "- /refresh: 刷新当前总览简报并更新 TUI/启动页摘要",
         "- /mode: 查看当前执行模式（dry-run/execute）",
         "- /mode execute|dry-run: 切换执行模式",
         "- /context: 查看会话记忆（最近 pod/service/namespace）",
@@ -7866,19 +8004,77 @@ def _render_chat_short_help() -> None:
 
 def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, object]:
     target = TargetEnvStore().load()
+    marker = _load_onboarding_marker()
+    briefing = marker.get("briefing", {}) if isinstance(marker, dict) else {}
+    if not isinstance(briefing, dict):
+        briefing = {}
+    session_store = SessionStore(Path(str(options.get("session_file", ".data/lsre-session.json"))))
+    session_turns = session_store.recent_turns(limit=30)
+    last_user = ""
+    if session_turns:
+        tail = session_turns[-1]
+        if isinstance(tail, dict):
+            last_user = str(tail.get("user", "")).strip()
+    provider_checks = _build_provider_setup_checks(secrets_file=None)
+    configured_providers = [
+        str(row.get("provider", name))
+        for name, row in provider_checks.items()
+        if isinstance(row, dict) and bool(row.get("ok"))
+    ]
+    usable_targets = marker.get("usable_targets", []) if isinstance(marker, dict) else []
+    if not isinstance(usable_targets, list):
+        usable_targets = []
+    if not usable_targets:
+        inferred_targets: list[str] = []
+        if shutil.which("docker"):
+            inferred_targets.append("docker")
+        if str(target.ssh_target or settings.target_ssh_target or "").strip():
+            inferred_targets.append("remote-ssh")
+        if str(target.k8s_context or "").strip() or str(target.k8s_api_url or "").strip():
+            inferred_targets.append("kubernetes")
+        if str(target.prometheus_url or settings.target_prometheus_url or "").strip():
+            inferred_targets.append("prometheus")
+        usable_targets = inferred_targets
+    recommended_commands = []
+    next_step = str(briefing.get("next", "")).strip()
+    if next_step:
+        recommended_commands.append(next_step)
+    marker_actions = marker.get("next_actions", []) if isinstance(marker, dict) else []
+    if isinstance(marker_actions, list):
+        recommended_commands.extend(str(item).strip() for item in marker_actions[:4] if str(item).strip())
+    recommended_commands.extend(
+        cmd
+        for cmd in [
+            "lazysre brief",
+            "lazysre scan",
+            "lazysre autopilot",
+        ]
+        if cmd not in recommended_commands
+    )
     return {
         "title": "LazySRE TUI",
         "version": __version__,
         "mode": "execute" if bool(options.get("execute", False)) else "dry-run",
         "provider": str(options.get("provider", "auto")),
         "model": str(options.get("model", settings.model_name)),
+        "status": str(briefing.get("status", "cold-start")),
+        "headline": str(briefing.get("headline", "")).strip() or "输入 /scan 或 /brief，LazySRE 会先给你一份现场总览。",
+        "generated_at": str(marker.get("generated_at_utc", "")).strip() if isinstance(marker, dict) else "",
+        "usable_targets": _dedupe_strings([str(item) for item in usable_targets if str(item).strip()]),
+        "configured_providers": configured_providers,
+        "provider_ready": bool(configured_providers),
         "namespace": str(target.k8s_namespace or "default"),
         "ssh_target": str(target.ssh_target or settings.target_ssh_target or ""),
         "prometheus_url": str(target.prometheus_url or settings.target_prometheus_url or ""),
+        "session_turns": len(session_turns),
+        "last_user": last_user[:120],
+        "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
         "shortcuts": [
             "/brief",
             "/scan",
+            "/refresh",
             "/swarm --logs",
+            "/remote root@host --logs",
             "/autopilot",
             "/remediate <目标>",
             "/mode execute",
@@ -7891,18 +8087,36 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     shortcuts = snapshot.get("shortcuts", [])
     if not isinstance(shortcuts, list):
         shortcuts = []
+    recommended = snapshot.get("recommended_commands", [])
+    if not isinstance(recommended, list):
+        recommended = []
+    usable_targets = snapshot.get("usable_targets", [])
+    if not isinstance(usable_targets, list):
+        usable_targets = []
+    configured_providers = snapshot.get("configured_providers", [])
+    if not isinstance(configured_providers, list):
+        configured_providers = []
     lines = [
         "╭─ LazySRE Fullscreen TUI ─────────────────────────────────────────╮",
         f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
+        "├─ Brief ─────────────────────────────────────────────────────────┤",
+        f"│ status={snapshot.get('status', '-')}",
+        f"│ headline={snapshot.get('headline', '-')}",
         "├─ Target ────────────────────────────────────────────────────────┤",
+        f"│ usable_targets={', '.join(str(x) for x in usable_targets) or '(none)'}",
+        f"│ providers={', '.join(str(x) for x in configured_providers) or '(unset)'}",
         f"│ namespace={snapshot.get('namespace', '-')}",
         f"│ ssh_target={snapshot.get('ssh_target', '-') or '(not set)'}",
         f"│ prometheus={snapshot.get('prometheus_url', '-') or '(not set)'}",
+        f"│ session_turns={snapshot.get('session_turns', 0)}",
+        f"│ last_user={snapshot.get('last_user', '-') or '-'}",
+        "├─ Recommended ───────────────────────────────────────────────────┤",
+        *[f"│ {item}" for item in recommended[:4]],
         "├─ Shortcuts ─────────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in shortcuts],
         "├─ Conversation ──────────────────────────────────────────────────┤",
         "│ 直接输入自然语言，例如：检查当前服务器 / 修复 swarm 副本不足",
-        "│ 底部输入框提交后会在同屏显示 Observe/Action/Result。",
+        "│ Tab 自动补全命令，底部输入框提交后会同屏显示 Observe/Action/Result。",
         "╰─────────────────────────────────────────────────────────────────╯",
     ]
     return "\n".join(lines)
@@ -7932,6 +8146,8 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
     ]
     input_text = ""
     status = "ready"
+    completion_index = -1
+    completion_seed = ""
     while True:
         _draw_tui(stdscr, snapshot=snapshot, history=history, input_text=input_text, status=status)
         key = stdscr.get_wch()
@@ -7950,46 +8166,48 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 history.append(("LazySRE", output.strip() or "(no output)"))
                 snapshot.update(_build_tui_dashboard_snapshot(options))
                 status = "ready"
+                completion_index = -1
+                completion_seed = ""
+                continue
+            if key == "\t":
+                input_text, completion_index, completion_seed = _cycle_tui_completion(
+                    input_text,
+                    snapshot=snapshot,
+                    completion_index=completion_index,
+                    completion_seed=completion_seed,
+                )
                 continue
             if key in {"\x7f", "\b"}:
                 input_text = input_text[:-1]
+                completion_index = -1
+                completion_seed = ""
                 continue
             if key == "\x1b":
                 break
             if key.isprintable():
                 input_text += key
+                completion_index = -1
+                completion_seed = ""
                 continue
         elif key in {curses.KEY_BACKSPACE, curses.KEY_DC}:
             input_text = input_text[:-1]
+            completion_index = -1
+            completion_seed = ""
 
 
 def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, str]], input_text: str, status: str) -> None:
     height, width = stdscr.getmaxyx()
     stdscr.erase()
-    sidebar_w = min(max(24, width // 4), 34)
-    title = f" LazySRE {snapshot.get('version', '-')} | {status} "
+    sidebar_w = min(max(28, width // 3), 46)
+    title = f" LazySRE {snapshot.get('version', '-')} | {status} | Tab autocomplete | Esc quit "
     stdscr.addnstr(0, 0, title.ljust(width), width - 1)
     for y in range(1, height - 2):
         if sidebar_w < width:
             stdscr.addch(y, sidebar_w, "|")
-    side_lines = [
-        f"mode: {snapshot.get('mode', '-')}",
-        f"provider: {snapshot.get('provider', '-')}",
-        f"model: {snapshot.get('model', '-')}",
-        f"ns: {snapshot.get('namespace', '-')}",
-        f"ssh: {snapshot.get('ssh_target', '-') or 'not set'}",
-        "",
-        "Shortcuts:",
-        "/brief",
-        "/scan",
-        "/swarm --logs",
-        "/autopilot",
-        "/remediate ...",
-        "/mode execute",
-        "Esc/exit quit",
-    ]
+    side_width = max(12, sidebar_w - 2)
+    side_lines = _build_tui_sidebar_lines(snapshot, width=side_width)
     for idx, line in enumerate(side_lines[: max(0, height - 4)], 1):
-        stdscr.addnstr(idx, 1, line, max(1, sidebar_w - 2))
+        stdscr.addnstr(idx, 1, line, side_width)
 
     content_w = max(10, width - sidebar_w - 3)
     rows: list[str] = []
@@ -8006,6 +8224,102 @@ def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, s
     stdscr.addnstr(height - 1, 0, prompt, width - 1)
     stdscr.move(height - 1, min(len(prompt), width - 2))
     stdscr.refresh()
+
+
+def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list[str]:
+    recommended = snapshot.get("recommended_commands", [])
+    if not isinstance(recommended, list):
+        recommended = []
+    shortcuts = snapshot.get("shortcuts", [])
+    if not isinstance(shortcuts, list):
+        shortcuts = []
+    usable_targets = snapshot.get("usable_targets", [])
+    if not isinstance(usable_targets, list):
+        usable_targets = []
+    configured = snapshot.get("configured_providers", [])
+    if not isinstance(configured, list):
+        configured = []
+    lines = [
+        f"status: {snapshot.get('status', '-')}",
+        f"mode: {snapshot.get('mode', '-')}",
+        f"provider: {snapshot.get('provider', '-')}",
+        f"model: {snapshot.get('model', '-')}",
+        f"targets: {', '.join(str(x) for x in usable_targets) or 'none'}",
+        f"providers: {', '.join(str(x) for x in configured) or 'unset'}",
+        f"ns: {snapshot.get('namespace', '-')}",
+        f"ssh: {snapshot.get('ssh_target', '-') or 'not set'}",
+        f"prom: {snapshot.get('prometheus_url', '-') or 'not set'}",
+        f"turns: {snapshot.get('session_turns', 0)}",
+    ]
+    headline = str(snapshot.get("headline", "")).strip()
+    if headline:
+        lines.extend(["", "Brief:"])
+        lines.extend(_wrap_tui_text_lines(headline, width=width))
+    last_user = str(snapshot.get("last_user", "")).strip()
+    if last_user:
+        lines.extend(["", "Last Input:"])
+        lines.extend(_wrap_tui_text_lines(last_user, width=width))
+    if recommended:
+        lines.extend(["", "Recommended:"])
+        for item in recommended[:4]:
+            lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
+    lines.extend(["", "Shortcuts:"])
+    for item in shortcuts[:6]:
+        lines.extend(_wrap_tui_text_lines(str(item), width=width))
+    lines.extend(["", "Tab: autocomplete"])
+    return lines
+
+
+def _wrap_tui_text_lines(text: str, *, width: int) -> list[str]:
+    value = str(text or "").strip()
+    if not value:
+        return [""]
+    return textwrap.wrap(value, width=max(12, width)) or [value]
+
+
+def _cycle_tui_completion(
+    input_text: str,
+    *,
+    snapshot: dict[str, object],
+    completion_index: int,
+    completion_seed: str,
+) -> tuple[str, int, str]:
+    seed = input_text.strip()
+    if completion_seed:
+        existing_candidates = _tui_completion_candidates(completion_seed, snapshot)
+        if seed in existing_candidates:
+            seed = completion_seed
+    if seed != completion_seed:
+        completion_index = -1
+        completion_seed = seed
+    candidates = _tui_completion_candidates(seed, snapshot)
+    if not candidates:
+        return input_text, -1, seed
+    next_index = (completion_index + 1) % len(candidates)
+    return candidates[next_index], next_index, completion_seed
+
+
+def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list[str]:
+    shortcuts = snapshot.get("shortcuts", [])
+    if not isinstance(shortcuts, list):
+        shortcuts = []
+    recommended = snapshot.get("recommended_commands", [])
+    if not isinstance(recommended, list):
+        recommended = []
+    candidates = _dedupe_strings(
+        [
+            *[str(item) for item in shortcuts if str(item).strip()],
+            *[str(item) for item in recommended if str(item).strip()],
+            "/doctor fix",
+            "/quickstart",
+            "/status probe",
+            "/refresh",
+        ]
+    )
+    seed = str(prefix or "").strip().lower()
+    if not seed:
+        return candidates
+    return [item for item in candidates if item.lower().startswith(seed)]
 
 
 def _capture_plain_output(callback) -> str:
@@ -8044,9 +8358,36 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
         return "用法：/mode execute 或 /mode dry-run"
     if lowered.startswith("/brief"):
         tail = normalized[len("/brief") :].strip()
-        return _capture_plain_output(lambda: _render_overview_brief_report(_build_overview_brief_report(target=tail, include_remote=True, include_logs="--logs" in lowered, timeout_sec=5)))
+        def _render_brief() -> None:
+            report = _build_overview_brief_report(
+                target=tail,
+                include_remote=True,
+                include_logs="--logs" in lowered,
+                timeout_sec=5,
+            )
+            _write_first_scan_marker(report)
+            _render_overview_brief_report(report)
+
+        return _capture_plain_output(_render_brief)
+    if lowered.startswith("/refresh"):
+        def _refresh_brief() -> None:
+            report = _build_overview_brief_report(
+                target="",
+                include_remote=True,
+                include_logs="--logs" in lowered,
+                timeout_sec=5,
+            )
+            _write_first_scan_marker(report)
+            _render_overview_brief_report(report)
+
+        return _capture_plain_output(_refresh_brief)
     if lowered.startswith("/scan"):
-        return _capture_plain_output(lambda: _render_environment_discovery(_collect_environment_discovery(timeout_sec=5, secrets_file=None)))
+        def _render_scan() -> None:
+            report = _collect_environment_discovery(timeout_sec=5, secrets_file=None)
+            _write_first_scan_marker(report)
+            _render_environment_discovery(report)
+
+        return _capture_plain_output(_render_scan)
     if lowered.startswith("/swarm"):
         return _capture_plain_output(lambda: _render_swarm_health_report(_collect_swarm_health_report(service_filter=_extract_swarm_service_name(normalized), include_logs="--logs" in lowered, tail=120, timeout_sec=6)))
     if lowered.startswith("/autopilot"):

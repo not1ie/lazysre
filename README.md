@@ -21,6 +21,7 @@ lazysre
 # 全屏 TUI（类似 Claude Code 的左右分区交互；不支持全屏时可用 --demo 预览）
 lazysre tui
 lazysre tui --demo
+# TUI 内支持 Tab 自动补全、/refresh 刷新总览、同屏展示推荐下一步
 # 兼容短命令
 lsre
 # 或 python 模块方式
@@ -62,6 +63,7 @@ lazysre setup
 lazysre init
 # 一键快速就绪（推荐，自动修复常见问题）
 lazysre quickstart
+# quickstart / setup 会自动吸收本机已发现的 kubeconfig context、namespace、Prometheus 地址到 profile
 # 本地保存模型 Key（后续无需每次 export）
 lazysre login --provider openai
 lazysre login --provider anthropic
