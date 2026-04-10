@@ -21,7 +21,7 @@ lazysre
 # 首次启动会自动生成只读 LazySRE Brief，并给出下一步命令
 lazysre tui
 lazysre tui --demo
-# TUI 内支持 Tab 自动补全、Up/Down 历史、Ctrl-L 清屏、/refresh 刷新总览、/providers 查看模型配置，并显示最近活动时间线、执行时间线、建议动作、命令轨迹和底部状态栏
+# TUI 内支持 Tab 自动补全、Up/Down 历史、Ctrl-L 清屏、F2 面板切换、/refresh 刷新总览、/providers 查看模型配置，并显示最近活动时间线、执行时间线、建议动作、命令轨迹和底部状态栏
 # 兼容短命令
 lsre
 # 或 python 模块方式
@@ -169,7 +169,7 @@ lsre "检查 k8s pod 状态"
 lsre tui
 lsre remediate "修复当前巡检发现的问题"
 # chat 快捷命令
-# /help /activity /timeline /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /providers /provider <name> /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /remediate /tui /doctor [/doctor fix] [/doctor strict]
+# /help /activity /timeline /panel [overview|activity|timeline|providers|next] /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /providers /provider <name> /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /remediate /tui /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7

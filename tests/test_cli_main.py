@@ -134,6 +134,9 @@ from lazysre.cli.main import (
     _render_recent_activity_text,
     _render_timeline_text,
     _build_tui_footer_line,
+    _build_tui_sidebar_lines,
+    _normalize_tui_panel_name,
+    _switch_tui_panel,
     _cycle_tui_completion,
     _cycle_tui_input_history,
     _build_provider_runtime_report,
@@ -813,6 +816,7 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/providers" in rendered
     assert "/activity" in rendered
     assert "/timeline" in rendered
+    assert "/panel next" in rendered
     assert "Recent Activity" in rendered
     assert "Command Trail" in rendered
     assert "Up/Down 浏览历史" in rendered
@@ -1987,6 +1991,55 @@ def test_build_tui_footer_line_includes_last_user_command() -> None:
     assert "activity=2" in footer
     assert "timeline=1" in footer
     assert "last=/activity" in footer
+
+
+def test_normalize_tui_panel_name_aliases() -> None:
+    assert _normalize_tui_panel_name("summary") == "overview"
+    assert _normalize_tui_panel_name("actions") == "activity"
+    assert _normalize_tui_panel_name("provider") == "providers"
+    assert _normalize_tui_panel_name("weird") == "overview"
+
+
+def test_switch_tui_panel_updates_options() -> None:
+    options = {"tui_panel": "overview"}
+
+    msg = _switch_tui_panel(options, "timeline")
+    assert options["tui_panel"] == "timeline"
+    assert "timeline" in msg
+
+    msg2 = _switch_tui_panel(options, "next")
+    assert options["tui_panel"] == "providers"
+    assert "providers" in msg2
+
+
+def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
+    snapshot = {
+        "sidebar_panel": "timeline",
+        "status": "attention",
+        "mode": "dry-run",
+        "provider": "auto",
+        "model": "gpt-5.4-mini",
+        "usable_targets": ["docker", "kubernetes"],
+        "configured_providers": ["openai", "compatible"],
+        "namespace": "ops",
+        "ssh_target": "root@10.0.0.8",
+        "prometheus_url": "http://127.0.0.1:9090",
+        "session_turns": 3,
+        "timeline_entries": ["08:30 [ok/exec] docker service ls"],
+        "recent_commands": ["/scan", "/timeline"],
+        "recent_activity": ["watch attention alerts=1 cycle=2"],
+        "recent_activity_commands": ["/activity"],
+        "recommended_commands": ["lazysre brief"],
+        "shortcuts": ["/brief", "/timeline", "/panel next"],
+    }
+
+    lines = _build_tui_sidebar_lines(snapshot, width=32)
+    joined = "\n".join(lines)
+
+    assert "panel: timeline" in joined
+    assert "Execution Timeline:" in joined
+    assert "Command Trail:" in joined
+    assert "Recent Activity:" not in joined
 
 
 def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:
