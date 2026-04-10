@@ -131,6 +131,7 @@ from lazysre.cli.main import (
     _version_text,
     _build_tui_dashboard_snapshot,
     _render_tui_demo_text,
+    _render_recent_activity_text,
     _cycle_tui_completion,
     _cycle_tui_input_history,
     _build_provider_runtime_report,
@@ -808,6 +809,7 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/swarm --logs" in rendered
     assert "/refresh" in rendered
     assert "/providers" in rendered
+    assert "/activity" in rendered
     assert "Recent Activity" in rendered
     assert "Up/Down 浏览历史" in rendered
 
@@ -1883,6 +1885,40 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert any("watch attention alerts=1 cycle=3" in item for item in snapshot["recent_activity"])
     assert any("fix plan | cmds=1" in item for item in snapshot["recent_activity"])
     assert any("docker service ls" in item for item in snapshot["recent_activity"])
+    assert "/activity" in snapshot["recent_activity_commands"]
+    assert "/swarm --service api --logs" in snapshot["recent_activity_commands"]
+
+
+def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+    (tmp_path / "lsre-watch-last.json").write_text(
+        json.dumps(
+            {
+                "cycle": 2,
+                "alerts": [{"source": "swarm", "name": "payment", "detail": "replicas=0/1"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "lsre-fix-last.json").write_text(
+        json.dumps(
+            {
+                "instruction": "重启 payment 服务",
+                "plan": {"apply_commands": ["docker service update --force payment"]},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    rendered = _render_recent_activity_text({"audit_log": str(tmp_path / "missing.jsonl")})
+
+    assert "Recent Activity" in rendered
+    assert "watch attention alerts=1 cycle=2" in rendered
+    assert "Suggested Next Commands" in rendered
+    assert "/activity" in rendered
+    assert "/swarm --service payment --logs" in rendered
 
 
 def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:

@@ -6517,8 +6517,9 @@ def _read_recent_audit_events(path: Path, *, limit: int = 4) -> list[str]:
     return list(reversed(events))
 
 
-def _build_tui_recent_activity(options: dict[str, object]) -> list[str]:
+def _build_tui_recent_activity_context(options: dict[str, object]) -> dict[str, object]:
     items: list[str] = []
+    commands: list[str] = []
     watch_snapshot = _load_latest_watch_snapshot(None)
     if watch_snapshot:
         alerts = watch_snapshot.get("alerts", [])
@@ -6531,16 +6532,46 @@ def _build_tui_recent_activity(options: dict[str, object]) -> list[str]:
                 else f"healthy cycle={watch_snapshot.get('cycle', '-')}"
             )
         )
+        if alert_count:
+            commands.append("/activity")
+            first_alert = alerts[0] if isinstance(alerts, list) and alerts else {}
+            if isinstance(first_alert, dict):
+                alert_name = str(first_alert.get("name", "")).strip()
+                alert_source = str(first_alert.get("source", "")).strip()
+                if alert_source.startswith("swarm") and alert_name:
+                    commands.append(f"/swarm --service {alert_name} --logs")
     last_fix_path = Path(str(options.get("fix_plan_file", Path(settings.data_dir) / "lsre-fix-last.json"))).expanduser()
     last_fix = _read_last_fix_plan_summary(last_fix_path)
     if bool(last_fix.get("exists")):
         instruction = str(last_fix.get("instruction", "")).strip() or "最近一次修复计划"
         items.append(f"fix plan | cmds={last_fix.get('apply_commands', 0)} | {instruction[:72]}")
+        commands.extend(["/activity", "/undo", "/approve"])
     audit_log = Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))).expanduser()
     items.extend(_read_recent_audit_events(audit_log, limit=3))
     if not items:
-        return ["还没有最近活动，先运行 /scan、/brief 或一次自然语言诊断。"]
-    return _dedupe_strings([str(item).strip() for item in items if str(item).strip()])[:5]
+        items = ["还没有最近活动，先运行 /scan、/brief 或一次自然语言诊断。"]
+        commands.append("/scan")
+    return {
+        "items": _dedupe_strings([str(item).strip() for item in items if str(item).strip()])[:5],
+        "commands": _dedupe_strings([str(item).strip() for item in commands if str(item).strip()])[:4],
+        "watch": watch_snapshot if isinstance(watch_snapshot, dict) else {},
+        "last_fix": last_fix,
+        "audit_log": str(audit_log),
+    }
+
+
+def _render_recent_activity_text(options: dict[str, object]) -> str:
+    context = _build_tui_recent_activity_context(options)
+    items = context.get("items", [])
+    if not isinstance(items, list):
+        items = []
+    commands = context.get("commands", [])
+    if not isinstance(commands, list):
+        commands = []
+    lines = ["Recent Activity", *[f"- {item}" for item in items]]
+    if commands:
+        lines.extend(["", "Suggested Next Commands", *[f"- {item}" for item in commands]])
+    return "\n".join(lines)
 
 
 def _render_status_snapshot(snapshot: dict[str, object]) -> None:
@@ -8133,6 +8164,7 @@ def _render_chat_short_help() -> None:
     lines = [
         "LazySRE Chat 快捷命令",
         "- /help: 查看帮助",
+        "- /activity: 查看最近巡检、修复计划和审计轨迹，并给出建议下一步",
         "- /brief [user@host]: 汇总本机 scan 和可选远程目标，直接给一份 AI 总览简报",
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
         "- /swarm [--logs]: 检查 Docker Swarm 服务、副本、任务失败证据",
@@ -8238,16 +8270,24 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     marker_actions = marker.get("next_actions", []) if isinstance(marker, dict) else []
     if isinstance(marker_actions, list):
         recommended_commands.extend(str(item).strip() for item in marker_actions[:4] if str(item).strip())
+    recent_activity_context = _build_tui_recent_activity_context(options)
     recommended_commands.extend(
         cmd
         for cmd in [
+            *[
+                str(item)
+                for item in recent_activity_context.get("commands", [])
+                if str(item).strip()
+            ],
             "lazysre brief",
             "lazysre scan",
             "lazysre autopilot",
         ]
         if cmd not in recommended_commands
     )
-    recent_activity = _build_tui_recent_activity(options)
+    recent_activity = recent_activity_context.get("items", [])
+    if not isinstance(recent_activity, list):
+        recent_activity = []
     return {
         "title": "LazySRE TUI",
         "version": __version__,
@@ -8266,11 +8306,13 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "session_turns": len(session_turns),
         "last_user": last_user[:120],
         "recent_activity": recent_activity,
+        "recent_activity_commands": recent_activity_context.get("commands", []),
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
         "active_provider": _resolve_runtime_provider_label(str(options.get("provider", "auto"))),
         "shortcuts": [
             "/brief",
             "/scan",
+            "/activity",
             "/refresh",
             "/providers",
             "/swarm --logs",
@@ -8299,6 +8341,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     recent_activity = snapshot.get("recent_activity", [])
     if not isinstance(recent_activity, list):
         recent_activity = []
+    recent_activity_commands = snapshot.get("recent_activity_commands", [])
+    if not isinstance(recent_activity_commands, list):
+        recent_activity_commands = []
     lines = [
         "╭─ LazySRE Fullscreen TUI ─────────────────────────────────────────╮",
         f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
@@ -8316,6 +8361,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         f"│ last_user={snapshot.get('last_user', '-') or '-'}",
         "├─ Recent Activity ───────────────────────────────────────────────┤",
         *[f"│ {item}" for item in recent_activity[:4]],
+        *([ "├─ Activity Actions ──────────────────────────────────────────────┤"] + [f"│ {item}" for item in recent_activity_commands[:3]] if recent_activity_commands else []),
         "├─ Recommended ───────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in recommended[:4]],
         "├─ Shortcuts ─────────────────────────────────────────────────────┤",
@@ -8492,6 +8538,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     recent_activity = snapshot.get("recent_activity", [])
     if not isinstance(recent_activity, list):
         recent_activity = []
+    recent_activity_commands = snapshot.get("recent_activity_commands", [])
+    if not isinstance(recent_activity_commands, list):
+        recent_activity_commands = []
     lines = [
         f"status: {snapshot.get('status', '-')}",
         f"mode: {snapshot.get('mode', '-')}",
@@ -8516,6 +8565,10 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         lines.extend(["", "Recent Activity:"])
         for item in recent_activity[:4]:
             lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
+    if recent_activity_commands:
+        lines.extend(["", "Activity Actions:"])
+        for item in recent_activity_commands[:3]:
+            lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
     if recommended:
         lines.extend(["", "Recommended:"])
         for item in recommended[:4]:
@@ -8535,7 +8588,7 @@ def _wrap_tui_text_lines(text: str, *, width: int) -> list[str]:
 
 
 def _tui_welcome_message() -> str:
-    return "全屏 TUI 已启动。输入自然语言，或使用 /brief /scan /providers /swarm /autopilot /remediate。"
+    return "全屏 TUI 已启动。输入自然语言，或使用 /activity /brief /scan /providers /swarm /autopilot /remediate。"
 
 
 def _cycle_tui_input_history(
@@ -8599,6 +8652,7 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/providers",
             "/provider auto",
             "/provider mock",
+            "/activity",
             "/doctor fix",
             "/quickstart",
             "/status probe",
@@ -8724,6 +8778,8 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
     lowered = normalized.lower()
     if lowered in {"/help", "help", "?"}:
         return _render_tui_demo_text(_build_tui_dashboard_snapshot(options))
+    if lowered.startswith("/activity"):
+        return _render_recent_activity_text(options)
     if lowered in {"/providers", "/provider", "/provider show"}:
         return _capture_plain_output(lambda: _render_provider_runtime_report(_build_provider_runtime_report(options)))
     if lowered.startswith("/provider "):
@@ -9003,6 +9059,9 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower() in {"/help", "/h"}:
             _render_chat_short_help()
+            continue
+        if text.lower().startswith("/activity"):
+            typer.echo(_render_recent_activity_text({**options, "execute": runtime_execute}))
             continue
         if text.lower() in {"/mode", "/mode show"}:
             _render_mode_hint(runtime_execute)
