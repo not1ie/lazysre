@@ -8243,6 +8243,11 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         tail = session_turns[-1]
         if isinstance(tail, dict):
             last_user = str(tail.get("user", "")).strip()
+    recent_commands = [
+        str(turn.get("user", "")).strip()
+        for turn in session_turns[-3:]
+        if isinstance(turn, dict) and str(turn.get("user", "")).strip()
+    ]
     provider_checks = _build_provider_setup_checks(secrets_file=None)
     configured_providers = [
         str(row.get("provider", name))
@@ -8305,6 +8310,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "prometheus_url": str(target.prometheus_url or settings.target_prometheus_url or ""),
         "session_turns": len(session_turns),
         "last_user": last_user[:120],
+        "recent_commands": recent_commands[-3:],
         "recent_activity": recent_activity,
         "recent_activity_commands": recent_activity_context.get("commands", []),
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
@@ -8344,6 +8350,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     recent_activity_commands = snapshot.get("recent_activity_commands", [])
     if not isinstance(recent_activity_commands, list):
         recent_activity_commands = []
+    recent_commands = snapshot.get("recent_commands", [])
+    if not isinstance(recent_commands, list):
+        recent_commands = []
     lines = [
         "╭─ LazySRE Fullscreen TUI ─────────────────────────────────────────╮",
         f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
@@ -8364,6 +8373,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         *([ "├─ Activity Actions ──────────────────────────────────────────────┤"] + [f"│ {item}" for item in recent_activity_commands[:3]] if recent_activity_commands else []),
         "├─ Recommended ───────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in recommended[:4]],
+        *([ "├─ Command Trail ─────────────────────────────────────────────────┤"] + [f"│ {item}" for item in recent_commands[-3:]] if recent_commands else []),
         "├─ Shortcuts ─────────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in shortcuts],
         "├─ Conversation ──────────────────────────────────────────────────┤",
@@ -8502,7 +8512,7 @@ def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, s
             stdscr.addch(y, sidebar_w, "|")
     side_width = max(12, sidebar_w - 2)
     side_lines = _build_tui_sidebar_lines(snapshot, width=side_width)
-    for idx, line in enumerate(side_lines[: max(0, height - 4)], 1):
+    for idx, line in enumerate(side_lines[: max(0, height - 5)], 1):
         stdscr.addnstr(idx, 1, line, side_width)
 
     content_w = max(10, width - sidebar_w - 3)
@@ -8512,9 +8522,11 @@ def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, s
         for raw in str(text).splitlines() or [""]:
             rows.extend(textwrap.wrap(raw, width=content_w) or [""])
         rows.append("")
-    visible = rows[-max(1, height - 5) :]
+    visible = rows[-max(1, height - 6) :]
     for idx, line in enumerate(visible, 1):
         stdscr.addnstr(idx, sidebar_w + 2, line, content_w)
+    footer = _build_tui_footer_line(snapshot=snapshot, status=status, history=history)
+    stdscr.addnstr(height - 3, 0, footer.ljust(width), width - 1)
     prompt = f"lsre> {input_text}"
     stdscr.addnstr(height - 2, 0, "-" * max(1, width - 1), width - 1)
     stdscr.addnstr(height - 1, 0, prompt, width - 1)
@@ -8541,6 +8553,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     recent_activity_commands = snapshot.get("recent_activity_commands", [])
     if not isinstance(recent_activity_commands, list):
         recent_activity_commands = []
+    recent_commands = snapshot.get("recent_commands", [])
+    if not isinstance(recent_commands, list):
+        recent_commands = []
     lines = [
         f"status: {snapshot.get('status', '-')}",
         f"mode: {snapshot.get('mode', '-')}",
@@ -8573,11 +8588,37 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         lines.extend(["", "Recommended:"])
         for item in recommended[:4]:
             lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
+    if recent_commands:
+        lines.extend(["", "Command Trail:"])
+        for item in recent_commands[-3:]:
+            lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
     lines.extend(["", "Shortcuts:"])
     for item in shortcuts[:6]:
         lines.extend(_wrap_tui_text_lines(str(item), width=width))
     lines.extend(["", "Tab: autocomplete"])
     return lines
+
+
+def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history: list[tuple[str, str]]) -> str:
+    recent_activity = snapshot.get("recent_activity", [])
+    activity_count = len(recent_activity) if isinstance(recent_activity, list) else 0
+    targets = snapshot.get("usable_targets", [])
+    target_count = len(targets) if isinstance(targets, list) else 0
+    last_you = ""
+    for speaker, text in reversed(history):
+        if speaker == "You":
+            last_you = str(text).strip()
+            break
+    parts = [
+        f"status={status}",
+        f"mode={snapshot.get('mode', '-')}",
+        f"provider={snapshot.get('active_provider', snapshot.get('provider', '-'))}",
+        f"targets={target_count}",
+        f"activity={activity_count}",
+    ]
+    if last_you:
+        parts.append(f"last={last_you[:48]}")
+    return " | ".join(parts)
 
 
 def _wrap_tui_text_lines(text: str, *, width: int) -> list[str]:

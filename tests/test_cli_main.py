@@ -132,6 +132,7 @@ from lazysre.cli.main import (
     _build_tui_dashboard_snapshot,
     _render_tui_demo_text,
     _render_recent_activity_text,
+    _build_tui_footer_line,
     _cycle_tui_completion,
     _cycle_tui_input_history,
     _build_provider_runtime_report,
@@ -811,6 +812,7 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/providers" in rendered
     assert "/activity" in rendered
     assert "Recent Activity" in rendered
+    assert "Command Trail" in rendered
     assert "Up/Down 浏览历史" in rendered
 
 
@@ -1881,6 +1883,7 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert "docker-swarm" in snapshot["usable_targets"]
     assert snapshot["session_turns"] == 2
     assert snapshot["last_user"] == "重启它"
+    assert snapshot["recent_commands"] == ["检查 swarm 服务", "重启它"]
     assert snapshot["recommended_commands"][0] == "lazysre swarm --logs"
     assert any("watch attention alerts=1 cycle=3" in item for item in snapshot["recent_activity"])
     assert any("fix plan | cmds=1" in item for item in snapshot["recent_activity"])
@@ -1919,6 +1922,29 @@ def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monk
     assert "Suggested Next Commands" in rendered
     assert "/activity" in rendered
     assert "/swarm --service payment --logs" in rendered
+
+
+def test_build_tui_footer_line_includes_last_user_command() -> None:
+    footer = _build_tui_footer_line(
+        snapshot={
+            "mode": "dry-run",
+            "active_provider": "auto->mock",
+            "usable_targets": ["docker", "kubernetes"],
+            "recent_activity": ["watch attention alerts=1 cycle=2", "fix plan | cmds=1 | 重启 payment"],
+        },
+        status="running",
+        history=[
+            ("LazySRE", "welcome"),
+            ("You", "/activity"),
+            ("LazySRE", "Recent Activity"),
+        ],
+    )
+
+    assert "status=running" in footer
+    assert "provider=auto->mock" in footer
+    assert "targets=2" in footer
+    assert "activity=2" in footer
+    assert "last=/activity" in footer
 
 
 def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:
