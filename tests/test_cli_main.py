@@ -134,6 +134,8 @@ from lazysre.cli.main import (
     _render_recent_activity_text,
     _render_timeline_text,
     _build_tui_footer_line,
+    _build_tui_panel_hint,
+    _build_tui_status_hint_line,
     _build_tui_panel_tabs,
     _build_tui_sidebar_lines,
     _normalize_tui_panel_name,
@@ -820,6 +822,8 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/panel next" in rendered
     assert "Recent Activity" in rendered
     assert "Command Trail" in rendered
+    assert "panel=overview" in rendered
+    assert "hint=" in rendered
     assert "Up/Down 浏览历史" in rendered
 
 
@@ -2022,6 +2026,19 @@ def test_build_tui_panel_tabs_marks_active_panel() -> None:
     assert "providers" in joined
 
 
+def test_build_tui_panel_hint_changes_by_panel() -> None:
+    assert "总览环境" in _build_tui_panel_hint("overview")
+    assert "建议动作" in _build_tui_panel_hint("activity")
+    assert "执行轨迹" in _build_tui_panel_hint("timeline")
+    assert "模型与网关" in _build_tui_panel_hint("providers")
+
+
+def test_build_tui_status_hint_line_uses_panel() -> None:
+    line = _build_tui_status_hint_line({"sidebar_panel": "timeline"})
+    assert line.startswith("hint>")
+    assert "执行轨迹" in line
+
+
 def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
     snapshot = {
         "sidebar_panel": "timeline",
@@ -2048,10 +2065,38 @@ def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
 
     assert "Panels:" in joined
     assert "[timeline]" in joined
+    assert "hint:" in joined
     assert "panel: timeline" in joined
     assert "Execution Timeline:" in joined
     assert "Command Trail:" in joined
     assert "Recent Activity:" not in joined
+
+
+def test_build_tui_sidebar_lines_shows_empty_state_for_activity_panel() -> None:
+    snapshot = {
+        "sidebar_panel": "activity",
+        "panel_hint": _build_tui_panel_hint("activity"),
+        "status": "cold-start",
+        "mode": "dry-run",
+        "provider": "auto",
+        "model": "gpt-5.4-mini",
+        "usable_targets": [],
+        "configured_providers": [],
+        "namespace": "default",
+        "ssh_target": "",
+        "prometheus_url": "",
+        "session_turns": 0,
+        "timeline_entries": [],
+        "recent_commands": [],
+        "recent_activity": [],
+        "recent_activity_commands": [],
+        "recommended_commands": [],
+        "shortcuts": ["/activity", "/panel next"],
+    }
+
+    joined = "\n".join(_build_tui_sidebar_lines(snapshot, width=32))
+
+    assert "暂无活动" in joined
 
 
 def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:

@@ -8390,6 +8390,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "recent_activity": recent_activity,
         "recent_activity_commands": recent_activity_context.get("commands", []),
         "sidebar_panel": _normalize_tui_panel_name(str(options.get("tui_panel", "overview"))),
+        "panel_hint": _build_tui_panel_hint(_normalize_tui_panel_name(str(options.get("tui_panel", "overview")))),
         "provider_report": provider_report,
         "timeline_entries": timeline_entries,
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
@@ -8437,9 +8438,11 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     recent_commands = snapshot.get("recent_commands", [])
     if not isinstance(recent_commands, list):
         recent_commands = []
+    panel_hint = str(snapshot.get("panel_hint", "")).strip()
     lines = [
         "╭─ LazySRE Fullscreen TUI ─────────────────────────────────────────╮",
         f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
+        f"│ panel={snapshot.get('sidebar_panel', 'overview')} hint={panel_hint or '-'}",
         "├─ Brief ─────────────────────────────────────────────────────────┤",
         f"│ status={snapshot.get('status', '-')}",
         f"│ headline={snapshot.get('headline', '-')}",
@@ -8605,7 +8608,7 @@ def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, s
             stdscr.addch(y, sidebar_w, "|")
     side_width = max(12, sidebar_w - 2)
     side_lines = _build_tui_sidebar_lines(snapshot, width=side_width)
-    for idx, line in enumerate(side_lines[: max(0, height - 5)], 1):
+    for idx, line in enumerate(side_lines[: max(0, height - 6)], 1):
         stdscr.addnstr(idx, 1, line, side_width)
 
     content_w = max(10, width - sidebar_w - 3)
@@ -8615,9 +8618,11 @@ def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, s
         for raw in str(text).splitlines() or [""]:
             rows.extend(textwrap.wrap(raw, width=content_w) or [""])
         rows.append("")
-    visible = rows[-max(1, height - 6) :]
+    visible = rows[-max(1, height - 7) :]
     for idx, line in enumerate(visible, 1):
         stdscr.addnstr(idx, sidebar_w + 2, line, content_w)
+    hint_line = _build_tui_status_hint_line(snapshot)
+    stdscr.addnstr(height - 4, 0, hint_line.ljust(width), width - 1)
     footer = _build_tui_footer_line(snapshot=snapshot, status=status, history=history)
     stdscr.addnstr(height - 3, 0, footer.ljust(width), width - 1)
     prompt = f"lsre> {input_text}"
@@ -8657,6 +8662,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         *_build_tui_panel_tabs(panel, width=width),
         "",
         f"panel: {panel}",
+        f"hint: {snapshot.get('panel_hint', '-')}",
         f"status: {snapshot.get('status', '-')}",
         f"mode: {snapshot.get('mode', '-')}",
         f"provider: {snapshot.get('provider', '-')}",
@@ -8669,6 +8675,8 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         f"turns: {snapshot.get('session_turns', 0)}",
     ]
     if panel == "activity":
+        if not recent_activity and not recent_activity_commands:
+            lines.extend(["", "Recent Activity:", "- 暂无活动，先运行 /scan、/brief 或 /activity"])
         if recent_activity:
             lines.extend(["", "Recent Activity:"])
             for item in recent_activity[:5]:
@@ -8684,6 +8692,8 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         lines.extend(["", "F2: next panel"])
         return lines
     if panel == "timeline":
+        if not recent_commands and not timeline_entries:
+            lines.extend(["", "Execution Timeline:", "- 暂无执行轨迹，先运行 /timeline、/scan 或 /remediate"])
         if recent_commands:
             lines.extend(["", "Command Trail:"])
             for item in recent_commands[-4:]:
@@ -8781,6 +8791,22 @@ def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history:
     if last_you:
         parts.append(f"last={last_you[:48]}")
     return " | ".join(parts)
+
+
+def _build_tui_panel_hint(panel: str) -> str:
+    normalized = _normalize_tui_panel_name(panel)
+    hints = {
+        "overview": "总览环境与下一步，试试 /brief /scan /panel activity",
+        "activity": "聚焦异常与建议动作，试试 /activity /remediate /panel timeline",
+        "timeline": "聚焦执行轨迹，试试 /timeline /panel providers",
+        "providers": "聚焦模型与网关状态，试试 /providers /provider <name>",
+    }
+    return hints.get(normalized, hints["overview"])
+
+
+def _build_tui_status_hint_line(snapshot: dict[str, object]) -> str:
+    panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
+    return f"hint> {_build_tui_panel_hint(panel)}"
 
 
 def _build_tui_panel_tabs(active_panel: str, *, width: int) -> list[str]:
