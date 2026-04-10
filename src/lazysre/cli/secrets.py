@@ -62,6 +62,46 @@ class SecretStore:
             return "***"
         return f"{raw[:4]}...{raw[-4:]}"
 
+    def get_provider_base_url(self, provider: str) -> str:
+        payload = self.load()
+        return str(payload.get(f"{provider.strip().lower()}_base_url", "")).strip()
+
+    def set_provider_base_url(self, provider: str, base_url: str) -> None:
+        payload = self.load()
+        key = f"{provider.strip().lower()}_base_url"
+        value = str(base_url).strip()
+        if value:
+            payload[key] = value
+        else:
+            payload.pop(key, None)
+        self.save(payload)
+
+    def get_provider_model(self, provider: str) -> str:
+        payload = self.load()
+        return str(payload.get(f"{provider.strip().lower()}_model", "")).strip()
+
+    def set_provider_model(self, provider: str, model: str) -> None:
+        payload = self.load()
+        key = f"{provider.strip().lower()}_model"
+        value = str(model).strip()
+        if value:
+            payload[key] = value
+        else:
+            payload.pop(key, None)
+        self.save(payload)
+
+    def clear_provider_runtime_config(self, provider: str) -> bool:
+        payload = self.load()
+        normalized = provider.strip().lower()
+        removed = False
+        for key in (f"{normalized}_base_url", f"{normalized}_model"):
+            if key in payload:
+                payload.pop(key, None)
+                removed = True
+        if removed:
+            self.save(payload)
+        return removed
+
     def get_openai_api_key(self) -> str:
         return self.get_api_key("openai")
 

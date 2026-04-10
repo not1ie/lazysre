@@ -294,10 +294,14 @@ def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
     store = SecretStore(tmp_path / "secrets.json")
     store.set_api_key("anthropic", "sk-ant-1234567890")
     store.set_api_key("gemini", "gem-key-1234567890")
+    store.set_provider_base_url("compatible", "https://oneapi.example.com/v1")
+    store.set_provider_model("compatible", "gpt-4o-mini")
 
     assert store.get_api_key("anthropic") == "sk-ant-1234567890"
     assert store.get_api_key("gemini") == "gem-key-1234567890"
     assert store.masked_api_key("anthropic").startswith("sk-a")
+    assert store.get_provider_base_url("compatible") == "https://oneapi.example.com/v1"
+    assert store.get_provider_model("compatible") == "gpt-4o-mini"
     assert store.clear_api_key("gemini") is True
     assert store.get_api_key("gemini") == ""
 
@@ -325,6 +329,9 @@ def test_build_cli_llm_supports_anthropic_and_gemini(tmp_path: Path, monkeypatch
     store.set_api_key("anthropic", "ant-key-123")
     store.set_api_key("gemini", "gem-key-123")
     store.set_api_key("deepseek", "ds-key-123")
+    store.set_api_key("compatible", "compat-key-123")
+    store.set_provider_base_url("compatible", "https://oneapi.example.com/v1")
+    store.set_provider_model("compatible", "gpt-4o-mini")
 
     monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
     monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
@@ -360,12 +367,24 @@ def test_build_cli_llm_supports_anthropic_and_gemini(tmp_path: Path, monkeypatch
     assert model3 == "deepseek-chat"
     assert isinstance(llm3, OpenAICompatibleFunctionCallingLLM)
 
+    provider4, model4, llm4 = _build_cli_llm(
+        provider="compatible",
+        model="gpt-5.4-mini",
+        secrets_file=secrets_path,
+    )
+    assert provider4 == "compatible"
+    assert model4 == "gpt-4o-mini"
+    assert isinstance(llm4, OpenAICompatibleFunctionCallingLLM)
+
 
 def test_build_provider_setup_checks_reports_multiple_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     secrets_path = tmp_path / "secrets.json"
     store = SecretStore(secrets_path)
     store.set_api_key("gemini", "gem-key-123")
     store.set_api_key("kimi", "kimi-key-123")
+    store.set_api_key("compatible", "compat-key-123")
+    store.set_provider_base_url("compatible", "https://oneapi.example.com/v1")
+    store.set_provider_model("compatible", "gpt-4o-mini")
 
     monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
     monkeypatch.setattr(settings, "anthropic_api_key", "ant-key-456", raising=False)
@@ -380,7 +399,28 @@ def test_build_provider_setup_checks_reports_multiple_sources(tmp_path: Path, mo
     assert checks["gemini"]["ok"] is True
     assert "secrets" in str(checks["gemini"]["detail"])
     assert checks["kimi"]["ok"] is True
+    assert checks["compatible"]["ok"] is True
+    assert "base_url=https://oneapi.example.com/v1" in str(checks["compatible"]["detail"])
+    assert "model=gpt-4o-mini" in str(checks["compatible"]["detail"])
     assert checks["openai"]["ok"] is False
+
+
+def test_build_provider_setup_checks_marks_compatible_missing_base_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets_path = tmp_path / "secrets.json"
+    store = SecretStore(secrets_path)
+    store.set_api_key("compatible", "compat-key-123")
+
+    monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "deepseek_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "qwen_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "kimi_api_key", "", raising=False)
+
+    checks = _build_provider_setup_checks(secrets_file=secrets_path)
+
+    assert checks["compatible"]["ok"] is False
+    assert "缺少 base_url" in str(checks["compatible"]["hint"])
 
 
 def test_detect_fix_and_apply_intent() -> None:

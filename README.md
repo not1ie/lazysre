@@ -102,9 +102,21 @@ lazysre --provider gemini chat
 lazysre --provider deepseek chat
 lazysre --provider qwen chat
 lazysre --provider kimi chat
+lazysre --provider compatible chat
 ```
 
-可用环境变量：`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY`、`GOOGLE_API_KEY`、`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`QWEN_API_KEY`、`MOONSHOT_API_KEY`、`KIMI_API_KEY`。
+可用环境变量：`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY`、`GOOGLE_API_KEY`、`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`QWEN_API_KEY`、`MOONSHOT_API_KEY`、`KIMI_API_KEY`、`OPENAI_COMPATIBLE_API_KEY`。
+
+接任意 OpenAI-compatible 网关：
+
+```bash
+lazysre login --provider compatible \
+  --api-key <token> \
+  --base-url https://oneapi.example.com/v1 \
+  --model gpt-4o-mini
+
+lazysre --provider compatible
+```
 
 ## npm 发布（维护者）
 

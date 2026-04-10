@@ -740,6 +740,8 @@ def install_doctor(
 def login(
     provider: Annotated[str, typer.Option("--provider", help=f"Provider: {provider_mode_help_text()}")] = "openai",
     api_key: Annotated[str, typer.Option("--api-key", help="Provider API Key. If empty, prompt securely.")] = "",
+    base_url: Annotated[str, typer.Option("--base-url", help="Optional API base URL for this provider. Useful for OpenAI-compatible gateways.")] = "",
+    model_name: Annotated[str, typer.Option("--model", help="Optional default model name for this provider.")] = "",
     secrets_file: Annotated[str, typer.Option("--secrets-file", help="Secrets JSON file path.")] = "",
 ) -> None:
     mode = str(provider or "openai").strip().lower()
@@ -747,19 +749,31 @@ def login(
         raise typer.BadParameter(provider_mode_error_text())
     store = SecretStore(Path(secrets_file).expanduser() if secrets_file.strip() else None)
     key = api_key.strip()
-    if not key:
+    if (not key) and (not base_url.strip()) and (not model_name.strip()):
         key = typer.prompt(f"请输入 {PROVIDER_SPECS[mode].label} API Key", hide_input=True).strip()
-    if not key:
+    changed: list[str] = []
+    if key:
+        store.set_api_key(mode, key)
+        masked = store.masked_api_key(mode) or "***"
+        changed.append(f"API Key={masked}")
+    elif (not store.get_api_key(mode)) and (not base_url.strip()) and (not model_name.strip()):
         raise typer.BadParameter("API Key 不能为空")
-    store.set_api_key(mode, key)
-    masked = store.masked_api_key(mode) or "***"
-    typer.echo(f"{PROVIDER_SPECS[mode].label} API Key 已保存: {masked} ({store.path})")
+    if base_url.strip():
+        store.set_provider_base_url(mode, base_url.strip())
+        changed.append(f"base_url={base_url.strip()}")
+    if model_name.strip():
+        store.set_provider_model(mode, model_name.strip())
+        changed.append(f"model={model_name.strip()}")
+    if not changed:
+        raise typer.BadParameter("至少提供 --api-key、--base-url 或 --model 之一")
+    typer.echo(f"{PROVIDER_SPECS[mode].label} 配置已保存: {', '.join(changed)} ({store.path})")
     typer.echo("现在可直接运行：lazysre")
 
 
 @app.command("logout")
 def logout(
     provider: Annotated[str, typer.Option("--provider", help=f"Provider: {provider_mode_help_text()}")] = "openai",
+    clear_config: Annotated[bool, typer.Option("--clear-config/--no-clear-config", help="Also clear saved base_url/model for this provider.")] = True,
     secrets_file: Annotated[str, typer.Option("--secrets-file", help="Secrets JSON file path.")] = "",
 ) -> None:
     mode = str(provider or "openai").strip().lower()
@@ -767,8 +781,14 @@ def logout(
         raise typer.BadParameter(provider_mode_error_text())
     store = SecretStore(Path(secrets_file).expanduser() if secrets_file.strip() else None)
     removed = store.clear_api_key(mode)
-    if removed:
-        typer.echo(f"已清除本地 {PROVIDER_SPECS[mode].label} API Key。")
+    config_removed = store.clear_provider_runtime_config(mode) if clear_config else False
+    if removed or config_removed:
+        cleared_items: list[str] = []
+        if removed:
+            cleared_items.append("API Key")
+        if config_removed:
+            cleared_items.append("runtime config")
+        typer.echo(f"已清除本地 {PROVIDER_SPECS[mode].label} {' + '.join(cleared_items)}。")
         return
     typer.echo(f"本地未找到可清除的 {PROVIDER_SPECS[mode].label} API Key。")
 
@@ -6965,15 +6985,33 @@ def _build_provider_setup_checks(*, secrets_file: Path | None = None) -> dict[st
             env_present = bool(str(settings.qwen_api_key or "").strip())
         elif provider == "kimi":
             env_present = bool(str(settings.kimi_api_key or "").strip())
+        elif provider == "compatible":
+            env_present = bool(str(os.getenv("OPENAI_COMPATIBLE_API_KEY", "")).strip())
         source = "env" if env_present else ("secrets" if raw else "unset")
+        extras: list[str] = []
+        base_url = _resolve_provider_base_url(provider, secrets_file=secrets_file)
+        default_model = _resolve_provider_default_model(provider, secrets_file=secrets_file)
+        if base_url:
+            extras.append(f"base_url={base_url}")
+        if default_model:
+            extras.append(f"model={default_model}")
+        detail = f"{masked or '(unset)'} ({source})"
+        if extras:
+            detail = detail + "; " + "; ".join(extras)
+        provider_ready = bool(raw)
+        hint = f"执行 lsre login --provider {provider} 保存 API Key（或设置 {' / '.join(spec.env_names)}）"
+        if provider == "compatible":
+            provider_ready = bool(raw and base_url)
+            if raw and (not base_url):
+                hint = "compatible provider 还缺少 base_url，请执行 lsre login --provider compatible --base-url <url>"
         checks[provider] = {
             "name": f"runtime.{spec.secret_key}",
             "provider": provider,
             "label": spec.label,
-            "ok": bool(raw),
-            "severity": "pass" if raw else "error",
-            "detail": f"{masked or '(unset)'} ({source})",
-            "hint": "" if raw else f"执行 lsre login --provider {provider} 保存 API Key（或设置 {' / '.join(spec.env_names)}）",
+            "ok": provider_ready,
+            "severity": "pass" if provider_ready else "error",
+            "detail": detail,
+            "hint": "" if provider_ready else hint,
         }
     return checks
 
@@ -7171,6 +7209,10 @@ def _maybe_offer_one_click_env_fix(options: dict[str, object]) -> None:
 
 def _resolve_provider_api_key(provider: str, *, secrets_file: Path | None = None) -> str:
     normalized = str(provider or "").strip().lower()
+    if normalized == "compatible":
+        env_key = str(os.getenv("OPENAI_COMPATIBLE_API_KEY", "")).strip()
+        if env_key:
+            return env_key
     if normalized == "openai":
         env_key = str(settings.openai_api_key or "").strip()
         if env_key:
@@ -7201,6 +7243,42 @@ def _resolve_provider_api_key(provider: str, *, secrets_file: Path | None = None
     if normalized not in PROVIDER_SPECS:
         return ""
     return SecretStore(secrets_file).get_api_key(normalized)
+
+
+def _resolve_provider_base_url(provider: str, *, secrets_file: Path | None = None) -> str:
+    normalized = str(provider or "").strip().lower()
+    if normalized == "openai":
+        env_url = str(os.getenv("OPENAI_BASE_URL", "")).strip()
+        if env_url:
+            return env_url
+    env_url = str(os.getenv(f"LAZYSRE_{normalized.upper()}_BASE_URL", "")).strip()
+    if env_url:
+        return env_url
+    if normalized == "compatible":
+        compat_env = str(os.getenv("OPENAI_COMPATIBLE_BASE_URL", "")).strip()
+        if compat_env:
+            return compat_env
+    if normalized not in PROVIDER_SPECS:
+        return ""
+    stored = SecretStore(secrets_file).get_provider_base_url(normalized)
+    if stored:
+        return stored
+    spec = PROVIDER_SPECS[normalized]
+    return str(spec.base_url or "").strip()
+
+
+def _resolve_provider_default_model(provider: str, *, secrets_file: Path | None = None) -> str:
+    normalized = str(provider or "").strip().lower()
+    env_model = str(os.getenv(f"LAZYSRE_{normalized.upper()}_MODEL", "")).strip()
+    if env_model:
+        return env_model
+    if normalized == "compatible":
+        compat_model = str(os.getenv("OPENAI_COMPATIBLE_MODEL", "")).strip()
+        if compat_model:
+            return compat_model
+    if normalized not in PROVIDER_SPECS:
+        return ""
+    return SecretStore(secrets_file).get_provider_model(normalized)
 
 
 def _resolve_openai_api_key(*, secrets_file: Path | None = None) -> str:
@@ -7235,8 +7313,24 @@ def _build_cli_llm(
             f"（或设置 {' / '.join(spec.env_names)}）",
         )
 
-    resolved_model = resolve_model_name(mode, model)
+    stored_model = _resolve_provider_default_model(mode, secrets_file=secrets_file)
+    requested_model = str(model or "").strip()
+    if stored_model and ((not requested_model) or (requested_model == settings.model_name)):
+        resolved_model = stored_model
+    else:
+        resolved_model = resolve_model_name(mode, model)
     if mode == "openai":
+        base_url = _resolve_provider_base_url(mode, secrets_file=secrets_file)
+        if base_url:
+            return (
+                mode,
+                resolved_model,
+                OpenAICompatibleFunctionCallingLLM(
+                    api_key=api_key,
+                    provider=mode,
+                    base_url=base_url,
+                ),
+            )
         return mode, resolved_model, OpenAIResponsesLLM(api_key)
     if mode == "anthropic":
         return mode, resolved_model, AnthropicMessagesLLM(api_key)
@@ -7244,13 +7338,18 @@ def _build_cli_llm(
         return mode, resolved_model, GeminiFunctionCallingLLM(api_key)
     spec = get_provider_spec(mode)
     if spec.compatible:
+        base_url = _resolve_provider_base_url(mode, secrets_file=secrets_file)
+        if not base_url:
+            raise typer.BadParameter(
+                f"{spec.label} 缺少 base_url。请执行：lsre login --provider {mode} --base-url <url>"
+            )
         return (
             mode,
             resolved_model,
             OpenAICompatibleFunctionCallingLLM(
                 api_key=api_key,
                 provider=mode,
-                base_url=spec.base_url or "",
+                base_url=base_url,
             ),
         )
     raise typer.BadParameter(provider_mode_error_text())

@@ -63,6 +63,14 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
         base_url="https://api.moonshot.ai/v1",
         compatible=True,
     ),
+    "compatible": ProviderSpec(
+        name="compatible",
+        label="OpenAI-Compatible",
+        secret_key="compatible_api_key",
+        default_model="gpt-5.4-mini",
+        env_names=("OPENAI_COMPATIBLE_API_KEY",),
+        compatible=True,
+    ),
 }
 
 SUPPORTED_PROVIDER_NAMES: tuple[str, ...] = ("mock", *tuple(PROVIDER_SPECS.keys()))
@@ -74,7 +82,7 @@ def get_provider_spec(name: str) -> ProviderSpec:
 
 
 def provider_mode_help_text() -> str:
-    return "auto|mock|openai|anthropic|gemini|deepseek|qwen|kimi"
+    return "auto|mock|openai|anthropic|gemini|deepseek|qwen|kimi|compatible"
 
 
 def provider_mode_error_text() -> str:
