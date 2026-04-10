@@ -136,6 +136,7 @@ from lazysre.cli.main import (
     _build_tui_footer_line,
     _build_tui_panel_hint,
     _build_tui_status_hint_line,
+    _build_tui_panel_counts,
     _build_tui_panel_tabs,
     _build_tui_sidebar_lines,
     _normalize_tui_panel_name,
@@ -2016,14 +2017,45 @@ def test_switch_tui_panel_updates_options() -> None:
     assert options["tui_panel"] == "providers"
     assert "providers" in msg2
 
+    msg3 = _switch_tui_panel(options, "2")
+    assert options["tui_panel"] == "activity"
+    assert "activity" in msg3
+
+
+def test_build_tui_panel_counts_summarizes_snapshot() -> None:
+    counts = _build_tui_panel_counts(
+        {
+            "recent_activity": ["a1", "a2"],
+            "timeline_entries": ["t1"],
+            "recommended_commands": ["r1", "r2", "r3"],
+            "configured_providers": ["openai", "compatible"],
+            "provider_report": {"providers": {"openai": {}, "compatible": {}, "gemini": {}}},
+        }
+    )
+
+    assert counts["overview"] == "3"
+    assert counts["activity"] == "2"
+    assert counts["timeline"] == "1"
+    assert counts["providers"] == "2/3"
+
 
 def test_build_tui_panel_tabs_marks_active_panel() -> None:
-    lines = _build_tui_panel_tabs("timeline", width=80)
+    lines = _build_tui_panel_tabs(
+        "timeline",
+        width=80,
+        snapshot={
+            "recent_activity": ["a1", "a2"],
+            "timeline_entries": ["t1"],
+            "recommended_commands": ["r1"],
+            "configured_providers": ["openai"],
+            "provider_report": {"providers": {"openai": {}, "compatible": {}}},
+        },
+    )
     joined = "\n".join(lines)
 
-    assert "[timeline]" in joined
-    assert "overview" in joined
-    assert "providers" in joined
+    assert "[3:timeline(1)]" in joined
+    assert "1:overview(1)" in joined
+    assert "4:providers(1/2)" in joined
 
 
 def test_build_tui_panel_hint_changes_by_panel() -> None:
@@ -2064,7 +2096,7 @@ def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
     joined = "\n".join(lines)
 
     assert "Panels:" in joined
-    assert "[timeline]" in joined
+    assert "[3:timeline(1)]" in joined
     assert "hint:" in joined
     assert "panel: timeline" in joined
     assert "Execution Timeline:" in joined

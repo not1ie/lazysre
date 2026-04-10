@@ -8230,7 +8230,7 @@ def _render_chat_short_help() -> None:
         "- /help: 查看帮助",
         "- /activity: 查看最近巡检、修复计划和审计轨迹，并给出建议下一步",
         "- /timeline: 查看最近执行时间线（命令、状态、dry-run/exec）",
-        "- /panel [overview|activity|timeline|providers|next]: 切换 TUI 左侧面板",
+        "- /panel [overview|activity|timeline|providers|next|1-4]: 切换 TUI 左侧面板",
         "- /brief [user@host]: 汇总本机 scan 和可选远程目标，直接给一份 AI 总览简报",
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
         "- /swarm [--logs]: 检查 Docker Swarm 服务、副本、任务失败证据",
@@ -8286,7 +8286,7 @@ def _render_chat_short_help() -> None:
         "- 自然语言策略：先只跑只读步骤再执行写操作 / 解释第2步为什么执行",
         "- /memory: 查看最近故障记忆",
         "- /memory <query>: 检索相似历史案例",
-        "- TUI 里可用 Up/Down 浏览输入历史，Ctrl-L 或 /clear 清空屏幕",
+        "- TUI 里可用 Up/Down 浏览输入历史，Ctrl-L 或 /clear 清空屏幕，1-4/F2 切换面板",
         "- exit / quit: 退出",
     ]
     text = "\n".join(lines)
@@ -8558,6 +8558,12 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 continue
             if key == "\x1b":
                 break
+            if (not input_text) and key in {"1", "2", "3", "4"}:
+                options["tui_panel"] = _panel_name_from_shortcut(key)
+                snapshot.update(_build_tui_dashboard_snapshot(options))
+                history.append(("LazySRE", f"左侧面板已切换到 {snapshot.get('sidebar_panel', 'overview')}。"))
+                status = f"panel:{snapshot.get('sidebar_panel', 'overview')}"
+                continue
             if key.isprintable():
                 input_text += key
                 completion_index = -1
@@ -8600,7 +8606,7 @@ def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, s
     sidebar_w = min(max(28, width // 3), 46)
     title = (
         f" LazySRE {snapshot.get('version', '-')} | {status} | panel={snapshot.get('sidebar_panel', 'overview')} "
-        "| Tab autocomplete | Up/Down history | Ctrl-L clear | F2 cycle panel | Esc quit "
+        "| Tab autocomplete | Up/Down history | Ctrl-L clear | 1-4/F2 panel | Esc quit "
     )
     stdscr.addnstr(0, 0, title.ljust(width), width - 1)
     for y in range(1, height - 2):
@@ -8659,7 +8665,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         recent_commands = []
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     lines = [
-        *_build_tui_panel_tabs(panel, width=width),
+        *_build_tui_panel_tabs(panel, width=width, snapshot=snapshot),
         "",
         f"panel: {panel}",
         f"hint: {snapshot.get('panel_hint', '-')}",
@@ -8689,7 +8695,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
             lines.extend(["", "Recommended:"])
             for item in recommended[:4]:
                 lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
-        lines.extend(["", "F2: next panel"])
+        lines.extend(["", "1-4/F2: switch panel"])
         return lines
     if panel == "timeline":
         if not recent_commands and not timeline_entries:
@@ -8702,7 +8708,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
             lines.extend(["", "Execution Timeline:"])
             for item in timeline_entries[:5]:
                 lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
-        lines.extend(["", "Commands:", "- /timeline", "- /activity", "- /panel next"])
+        lines.extend(["", "Commands:", "- /timeline", "- /activity", "- /panel next", "- 1-4/F2 切换"])
         return lines
     if panel == "providers":
         report = snapshot.get("provider_report", {})
@@ -8730,7 +8736,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
                     label = str(row.get("label", name))
                     ready = "PASS" if bool(row.get("ok")) else "FAIL"
                     lines.extend(_wrap_tui_text_lines(f"- {label}: {ready}", width=width))
-        lines.extend(["", "Commands:", "- /providers", "- /provider <name>", "- /panel next"])
+        lines.extend(["", "Commands:", "- /providers", "- /provider <name>", "- /panel next", "- 1-4/F2 切换"])
         return lines
     headline = str(snapshot.get("headline", "")).strip()
     if headline:
@@ -8763,7 +8769,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     lines.extend(["", "Shortcuts:"])
     for item in shortcuts[:6]:
         lines.extend(_wrap_tui_text_lines(str(item), width=width))
-    lines.extend(["", "Tab: autocomplete", "F2: next panel"])
+    lines.extend(["", "Tab: autocomplete", "1-4/F2: switch panel"])
     return lines
 
 
@@ -8809,11 +8815,16 @@ def _build_tui_status_hint_line(snapshot: dict[str, object]) -> str:
     return f"hint> {_build_tui_panel_hint(panel)}"
 
 
-def _build_tui_panel_tabs(active_panel: str, *, width: int) -> list[str]:
+def _build_tui_panel_tabs(active_panel: str, *, width: int, snapshot: dict[str, object] | None = None) -> list[str]:
     normalized = _normalize_tui_panel_name(active_panel)
+    counts = _build_tui_panel_counts(snapshot or {})
     labels = []
-    for name in ["overview", "activity", "timeline", "providers"]:
-        labels.append(f"[{name}]" if name == normalized else name)
+    ordered = ["overview", "activity", "timeline", "providers"]
+    for index, name in enumerate(ordered, 1):
+        badge = counts.get(name, "")
+        suffix = f"({badge})" if badge else ""
+        label = f"{index}:{name}{suffix}"
+        labels.append(f"[{label}]" if name == normalized else label)
     return textwrap.wrap("Panels: " + " | ".join(labels), width=max(20, width)) or ["Panels: " + " | ".join(labels)]
 
 
@@ -8840,6 +8851,38 @@ def _normalize_tui_panel_name(value: str) -> str:
     return aliases.get(raw, "overview")
 
 
+def _panel_name_from_shortcut(value: str) -> str:
+    return {
+        "1": "overview",
+        "2": "activity",
+        "3": "timeline",
+        "4": "providers",
+    }.get(str(value or "").strip(), "overview")
+
+
+def _build_tui_panel_counts(snapshot: dict[str, object]) -> dict[str, str]:
+    recent_activity = snapshot.get("recent_activity", [])
+    timeline_entries = snapshot.get("timeline_entries", [])
+    recommended = snapshot.get("recommended_commands", [])
+    configured = snapshot.get("configured_providers", [])
+    provider_report = snapshot.get("provider_report", {})
+    provider_total = 0
+    if isinstance(provider_report, dict):
+        providers = provider_report.get("providers", {})
+        if isinstance(providers, dict):
+            provider_total = len(providers)
+    return {
+        "overview": str(len(recommended)) if isinstance(recommended, list) and recommended else "",
+        "activity": str(len(recent_activity)) if isinstance(recent_activity, list) and recent_activity else "",
+        "timeline": str(len(timeline_entries)) if isinstance(timeline_entries, list) and timeline_entries else "",
+        "providers": (
+            f"{len(configured)}/{provider_total or len(configured)}"
+            if isinstance(configured, list) and configured
+            else ""
+        ),
+    }
+
+
 def _next_tui_panel(current: str) -> str:
     ordered = ["overview", "activity", "timeline", "providers"]
     panel = _normalize_tui_panel_name(current)
@@ -8858,6 +8901,9 @@ def _switch_tui_panel(options: dict[str, object], requested: str) -> str:
     if raw in {"next", "cycle"}:
         options["tui_panel"] = _next_tui_panel(str(options.get("tui_panel", "overview")))
         return f"已切换左侧面板: {options['tui_panel']}"
+    if raw in {"1", "2", "3", "4"}:
+        options["tui_panel"] = _panel_name_from_shortcut(raw)
+        return f"已切换左侧面板: {options['tui_panel']}"
     panel = _normalize_tui_panel_name(raw)
     if panel == "overview" and raw not in {"overview", "summary", "home"}:
         return "用法：/panel overview|activity|timeline|providers|next"
@@ -8866,7 +8912,7 @@ def _switch_tui_panel(options: dict[str, object], requested: str) -> str:
 
 
 def _tui_welcome_message() -> str:
-    return "全屏 TUI 已启动。输入自然语言，或使用 /activity /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate。"
+    return "全屏 TUI 已启动。输入自然语言，或使用 /activity /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板。"
 
 
 def _cycle_tui_input_history(
