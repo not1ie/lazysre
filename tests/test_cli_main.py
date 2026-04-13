@@ -132,11 +132,13 @@ from lazysre.cli.main import (
     _build_tui_dashboard_snapshot,
     _render_tui_demo_text,
     _render_recent_activity_text,
+    _render_trace_text,
     _render_timeline_text,
     _build_tui_footer_line,
     _build_tui_panel_hint,
     _build_tui_status_hint_line,
     _build_tui_panel_counts,
+    _build_recent_trace_summary,
     _build_tui_panel_tabs,
     _build_tui_sidebar_lines,
     _normalize_tui_panel_name,
@@ -819,10 +821,12 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/refresh" in rendered
     assert "/providers" in rendered
     assert "/activity" in rendered
+    assert "/trace" in rendered
     assert "/timeline" in rendered
     assert "/panel next" in rendered
     assert "Recent Activity" in rendered
     assert "Command Trail" in rendered
+    assert "Trace Summary" in rendered
     assert "panel=overview" in rendered
     assert "hint=" in rendered
     assert "Up/Down 浏览历史" in rendered
@@ -1970,8 +1974,35 @@ def test_render_timeline_text_includes_audit_entries(tmp_path: Path) -> None:
     rendered = _render_timeline_text({"audit_log": str(audit_log)})
 
     assert "Execution Timeline" in rendered
+    assert "Trace Summary" in rendered
     assert "08:30 [ok/exec] docker service ls" in rendered
     assert "08:31 [fail/dry-run] root@10.0.0.8 :: kubectl get pods" in rendered
+
+
+def test_render_trace_text_summarizes_recent_operations(tmp_path: Path) -> None:
+    audit_log = tmp_path / "audit.jsonl"
+    audit_log.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {"timestamp": "2026-04-10T08:30:00+00:00", "ok": True, "dry_run": False, "command": ["docker", "service", "ls"]},
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {"timestamp": "2026-04-10T08:31:00+00:00", "ok": False, "dry_run": True, "command": ["kubectl", "get", "pods"]},
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rendered = _render_trace_text({"audit_log": str(audit_log)})
+
+    assert rendered.startswith("Operation Trace")
+    assert "steps=2 ok=1 fail=1 dry-run=1 exec=1" in rendered
+    assert "top-tools=" in rendered
 
 
 def test_build_tui_footer_line_includes_last_user_command() -> None:
@@ -2037,6 +2068,19 @@ def test_build_tui_panel_counts_summarizes_snapshot() -> None:
     assert counts["activity"] == "2"
     assert counts["timeline"] == "1"
     assert counts["providers"] == "2/3"
+
+
+def test_build_recent_trace_summary_handles_empty_and_counts() -> None:
+    assert "暂无 trace" in _build_recent_trace_summary([])[0]
+
+    summary = _build_recent_trace_summary(
+        [
+            {"status": "ok", "mode": "exec", "summary": "docker service ls"},
+            {"status": "fail", "mode": "dry-run", "summary": "kubectl get pods"},
+        ]
+    )
+
+    assert "steps=2 ok=1 fail=1 dry-run=1 exec=1" in summary[0]
 
 
 def test_build_tui_panel_tabs_marks_active_panel() -> None:

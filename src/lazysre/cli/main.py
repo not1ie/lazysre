@@ -6568,6 +6568,45 @@ def _read_recent_audit_timeline(path: Path, *, limit: int = 5) -> list[dict[str,
     return list(reversed(items))
 
 
+def _build_recent_trace_summary(timeline: list[dict[str, str]]) -> list[str]:
+    if not timeline:
+        return ["暂无 trace，先运行 /scan、/timeline 或一次自然语言操作。"]
+    ok_count = 0
+    fail_count = 0
+    dry_run_count = 0
+    exec_count = 0
+    tool_counts: dict[str, int] = {}
+    for item in timeline:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "")).strip().lower()
+        mode = str(item.get("mode", "")).strip().lower()
+        summary = str(item.get("summary", "")).strip()
+        if status == "ok":
+            ok_count += 1
+        elif status == "fail":
+            fail_count += 1
+        if mode == "dry-run":
+            dry_run_count += 1
+        elif mode == "exec":
+            exec_count += 1
+        first = summary.split("::")[-1].strip().split(" ", 1)[0].strip().lower() if summary else ""
+        if first:
+            tool_counts[first] = tool_counts.get(first, 0) + 1
+    top_tools = sorted(tool_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+    latest = timeline[-1]
+    latest_summary = str(latest.get("summary", "")).strip()
+    latest_status = str(latest.get("status", "info")).strip()
+    latest_mode = str(latest.get("mode", "-")).strip()
+    lines = [
+        f"steps={len(timeline)} ok={ok_count} fail={fail_count} dry-run={dry_run_count} exec={exec_count}",
+        f"latest=[{latest_status}/{latest_mode}] {latest_summary[:96]}",
+    ]
+    if top_tools:
+        lines.append("top-tools=" + ", ".join(f"{name}x{count}" for name, count in top_tools))
+    return lines
+
+
 def _build_tui_recent_activity_context(options: dict[str, object]) -> dict[str, object]:
     items: list[str] = []
     commands: list[str] = []
@@ -6630,12 +6669,21 @@ def _render_timeline_text(options: dict[str, object]) -> str:
     timeline = _read_recent_audit_timeline(audit_log, limit=6)
     if not timeline:
         return "Execution Timeline\n- 还没有执行轨迹，先运行 /scan、/brief、/remediate 或其它命令。"
-    lines = ["Execution Timeline"]
+    lines = ["Execution Timeline", "", "Trace Summary"]
+    lines.extend(f"- {line}" for line in _build_recent_trace_summary(timeline))
+    lines.append("")
+    lines.append("Entries")
     for item in timeline:
         lines.append(
             f"- {item.get('time', '--:--')} [{item.get('status', 'info')}/{item.get('mode', '-')}] {item.get('summary', '')}"
         )
     return "\n".join(lines)
+
+
+def _render_trace_text(options: dict[str, object]) -> str:
+    audit_log = Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))).expanduser()
+    timeline = _read_recent_audit_timeline(audit_log, limit=8)
+    return "Operation Trace\n" + "\n".join(f"- {line}" for line in _build_recent_trace_summary(timeline))
 
 
 def _render_status_snapshot(snapshot: dict[str, object]) -> None:
@@ -8230,6 +8278,7 @@ def _render_chat_short_help() -> None:
         "- /help: 查看帮助",
         "- /activity: 查看最近巡检、修复计划和审计轨迹，并给出建议下一步",
         "- /timeline: 查看最近执行时间线（命令、状态、dry-run/exec）",
+        "- /trace: 查看最近一次操作链路的摘要（成功/失败、dry-run/exec、top tools）",
         "- /panel [overview|activity|timeline|providers|next|1-4]: 切换 TUI 左侧面板",
         "- /brief [user@host]: 汇总本机 scan 和可选远程目标，直接给一份 AI 总览简报",
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
@@ -8369,6 +8418,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         for item in timeline_entries_raw
         if isinstance(item, dict)
     ]
+    trace_summary = _build_recent_trace_summary(timeline_entries_raw)
     return {
         "title": "LazySRE TUI",
         "version": __version__,
@@ -8393,6 +8443,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "panel_hint": _build_tui_panel_hint(_normalize_tui_panel_name(str(options.get("tui_panel", "overview")))),
         "provider_report": provider_report,
         "timeline_entries": timeline_entries,
+        "trace_summary": trace_summary,
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
         "active_provider": _resolve_runtime_provider_label(str(options.get("provider", "auto"))),
         "shortcuts": [
@@ -8400,6 +8451,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
             "/scan",
             "/activity",
             "/timeline",
+            "/trace",
             "/panel next",
             "/refresh",
             "/providers",
@@ -8435,6 +8487,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     timeline_entries = snapshot.get("timeline_entries", [])
     if not isinstance(timeline_entries, list):
         timeline_entries = []
+    trace_summary = snapshot.get("trace_summary", [])
+    if not isinstance(trace_summary, list):
+        trace_summary = []
     recent_commands = snapshot.get("recent_commands", [])
     if not isinstance(recent_commands, list):
         recent_commands = []
@@ -8461,6 +8516,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         "├─ Recommended ───────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in recommended[:4]],
         *([ "├─ Command Trail ─────────────────────────────────────────────────┤"] + [f"│ {item}" for item in recent_commands[-3:]] if recent_commands else []),
+        *([ "├─ Trace Summary ────────────────────────────────────────────────┤"] + [f"│ {item}" for item in trace_summary[:3]] if trace_summary else []),
         *([ "├─ Execution Timeline ────────────────────────────────────────────┤"] + [f"│ {item}" for item in timeline_entries[:3]] if timeline_entries else []),
         "├─ Shortcuts ─────────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in shortcuts],
@@ -8660,6 +8716,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     timeline_entries = snapshot.get("timeline_entries", [])
     if not isinstance(timeline_entries, list):
         timeline_entries = []
+    trace_summary = snapshot.get("trace_summary", [])
+    if not isinstance(trace_summary, list):
+        trace_summary = []
     recent_commands = snapshot.get("recent_commands", [])
     if not isinstance(recent_commands, list):
         recent_commands = []
@@ -8700,6 +8759,10 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     if panel == "timeline":
         if not recent_commands and not timeline_entries:
             lines.extend(["", "Execution Timeline:", "- 暂无执行轨迹，先运行 /timeline、/scan 或 /remediate"])
+        if trace_summary:
+            lines.extend(["", "Trace Summary:"])
+            for item in trace_summary[:3]:
+                lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
         if recent_commands:
             lines.extend(["", "Command Trail:"])
             for item in recent_commands[-4:]:
@@ -8708,7 +8771,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
             lines.extend(["", "Execution Timeline:"])
             for item in timeline_entries[:5]:
                 lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
-        lines.extend(["", "Commands:", "- /timeline", "- /activity", "- /panel next", "- 1-4/F2 切换"])
+        lines.extend(["", "Commands:", "- /trace", "- /timeline", "- /activity", "- /panel next", "- 1-4/F2 切换"])
         return lines
     if panel == "providers":
         report = snapshot.get("provider_report", {})
@@ -8765,6 +8828,10 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     if timeline_entries:
         lines.extend(["", "Execution Timeline:"])
         for item in timeline_entries[:3]:
+            lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
+    if trace_summary:
+        lines.extend(["", "Trace Summary:"])
+        for item in trace_summary[:2]:
             lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
     lines.extend(["", "Shortcuts:"])
     for item in shortcuts[:6]:
@@ -8912,7 +8979,7 @@ def _switch_tui_panel(options: dict[str, object], requested: str) -> str:
 
 
 def _tui_welcome_message() -> str:
-    return "全屏 TUI 已启动。输入自然语言，或使用 /activity /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板。"
+    return "全屏 TUI 已启动。输入自然语言，或使用 /activity /trace /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板。"
 
 
 def _cycle_tui_input_history(
@@ -8978,6 +9045,7 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/provider mock",
             "/activity",
             "/timeline",
+            "/trace",
             "/panel overview",
             "/panel activity",
             "/panel timeline",
@@ -9112,6 +9180,8 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
         return _render_recent_activity_text(options)
     if lowered.startswith("/timeline"):
         return _render_timeline_text(options)
+    if lowered.startswith("/trace"):
+        return _render_trace_text(options)
     if lowered in {"/panel", "/panel show"}:
         return _switch_tui_panel(options, "show")
     if lowered.startswith("/panel "):
@@ -9403,6 +9473,9 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower().startswith("/timeline"):
             typer.echo(_render_timeline_text({**options, "execute": runtime_execute}))
+            continue
+        if text.lower().startswith("/trace"):
+            typer.echo(_render_trace_text({**options, "execute": runtime_execute}))
             continue
         if text.lower() in {"/panel", "/panel show"}:
             typer.echo(_switch_tui_panel(options, "show"))
