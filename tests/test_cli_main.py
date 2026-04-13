@@ -2212,6 +2212,14 @@ def test_build_tui_status_hint_line_uses_panel() -> None:
     assert "执行轨迹" in line
 
 
+def test_build_tui_status_hint_line_prioritizes_failed_quick_action() -> None:
+    line = _build_tui_status_hint_line(
+        {"sidebar_panel": "overview", "latest_quick_action": {"status": "fail", "command": "/swarm --logs"}}
+    )
+    assert "/trace" in line
+    assert "/timeline" in line
+
+
 def test_build_tui_action_bar_changes_by_panel() -> None:
     overview_bar = _build_tui_action_bar({"sidebar_panel": "overview"})
     activity_bar = _build_tui_action_bar({"sidebar_panel": "activity"})
@@ -2224,6 +2232,13 @@ def test_build_tui_action_bar_changes_by_panel() -> None:
     assert "/trace" in timeline_bar
     assert "/providers" in provider_bar
     assert "1 overview" in timeline_bar
+
+
+def test_build_tui_action_bar_prioritizes_trace_after_failed_quick_action() -> None:
+    bar = _build_tui_action_bar({"sidebar_panel": "overview", "latest_quick_action": {"status": "fail", "command": "/do 1"}})
+    assert "/trace" in bar
+    assert "/timeline" in bar
+    assert "/do 1" in bar
 
 
 def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
@@ -2298,6 +2313,7 @@ def test_build_tui_sidebar_lines_overview_shows_focus_section() -> None:
     joined = "\n".join(_build_tui_sidebar_lines(snapshot, width=36))
 
     assert "focus: Active Alert" in joined
+    assert "quick: ok:/activity" in joined
     assert "Focus:" in joined
     assert "Focus Actions:" in joined
     assert "Quick Actions:" in joined
@@ -2409,6 +2425,37 @@ def test_handle_tui_input_do_runs_quick_action(monkeypatch: pytest.MonkeyPatch) 
     assert "Focus Now" in out
     assert calls[0]["command_text"] == "/trace"
     assert calls[0]["execute_mode"] is False
+
+
+def test_handle_tui_input_do_failed_action_prioritizes_trace(monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshots = [
+        {
+            "quick_action_items": [
+                {"id": "1", "title": "Focus", "source": "focus", "command": "/swarm --logs"}
+            ]
+        },
+        {
+            "focus_title": "Recent Failure",
+            "focus_body": "swarm check failed",
+            "quick_action_items": [
+                {"id": "1", "title": "Focus", "source": "focus", "command": "/swarm --logs"}
+            ],
+            "latest_quick_action": {"status": "fail", "command": "/swarm --logs"},
+        },
+    ]
+
+    monkeypatch.setattr(cli_main, "_build_tui_dashboard_snapshot", lambda options: snapshots.pop(0))
+    monkeypatch.setattr(
+        cli_main,
+        "_run_suggested_command",
+        lambda command_text, *, options, execute_mode: (False, "error: swarm service unhealthy"),
+    )
+
+    out = _handle_tui_input("/do 1", {"execute": False})
+
+    assert "Status: failed" in out
+    assert "/trace: 查看最近执行链路" in out
+    assert "/timeline: 查看完整时间线" in out
 
 
 def test_cycle_tui_input_history_roundtrip() -> None:

@@ -7009,10 +7009,16 @@ def _render_quick_action_result(
     items = snapshot.get("quick_action_items", [])
     if isinstance(items, list) and items:
         lines.extend(["", "Next Quick Actions"])
+        if not ok:
+            lines.append("- /trace: 查看最近执行链路")
+            lines.append("- /timeline: 查看完整时间线")
         for raw in items[:3]:
             if not isinstance(raw, dict):
                 continue
-            lines.append(f"- /do {raw.get('id', '?')}: {raw.get('command', '')}")
+            command_text = str(raw.get("command", "")).strip()
+            if (not ok) and command_text in {"/trace", "/timeline"}:
+                continue
+            lines.append(f"- /do {raw.get('id', '?')}: {command_text}")
     return "\n".join(lines)
 
 
@@ -8888,6 +8894,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
         f"│ panel={snapshot.get('sidebar_panel', 'overview')} hint={panel_hint or '-'}",
         f"│ action_bar={action_bar}",
+        f"│ quick_state={_build_latest_quick_action_badge(snapshot)}",
         "├─ Brief ─────────────────────────────────────────────────────────┤",
         f"│ status={snapshot.get('status', '-')}",
         f"│ headline={snapshot.get('headline', '-')}",
@@ -9154,6 +9161,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         f"hint: {snapshot.get('panel_hint', '-')}",
         f"status: {snapshot.get('status', '-')}",
         f"focus: {snapshot.get('focus_title', '-')}",
+        f"quick: {_build_latest_quick_action_badge(snapshot)}",
         f"mode: {snapshot.get('mode', '-')}",
         f"provider: {snapshot.get('provider', '-')}",
         f"model: {snapshot.get('model', '-')}",
@@ -9335,7 +9343,27 @@ def _build_tui_panel_hint(panel: str) -> str:
     return hints.get(normalized, hints["overview"])
 
 
+def _build_latest_quick_action_badge(snapshot: dict[str, object]) -> str:
+    latest = snapshot.get("latest_quick_action", {})
+    if not isinstance(latest, dict):
+        return "-"
+    command = str(latest.get("command", "")).strip()
+    status = str(latest.get("status", "")).strip()
+    if not command:
+        return "-"
+    short = command[:36]
+    return f"{status or 'unknown'}:{short}"
+
+
 def _build_tui_status_hint_line(snapshot: dict[str, object]) -> str:
+    latest = snapshot.get("latest_quick_action", {})
+    if isinstance(latest, dict):
+        status = str(latest.get("status", "")).strip().lower()
+        command = str(latest.get("command", "")).strip()
+        if status == "fail" and command:
+            return f"hint> 最近 quick action 失败，先看 /trace /timeline，再决定是否重试 {command[:36]}"
+        if status == "ok" and command:
+            return f"hint> 最近 quick action 成功，可继续 /focus、/activity 或重跑 {command[:36]}"
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     return f"hint> {_build_tui_panel_hint(panel)}"
 
@@ -9343,6 +9371,10 @@ def _build_tui_status_hint_line(snapshot: dict[str, object]) -> str:
 def _build_tui_action_bar(snapshot: dict[str, object]) -> str:
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     base = "actions> 1 overview | 2 activity | 3 timeline | 4 providers"
+    latest = snapshot.get("latest_quick_action", {})
+    latest_status = str(latest.get("status", "")).strip().lower() if isinstance(latest, dict) else ""
+    if latest_status == "fail":
+        return f"{base} || /trace | /timeline | /do 1"
     panel_actions = {
         "overview": "/do 1 | /focus | /scan",
         "activity": "/do 1 | /activity | /swarm --logs",
