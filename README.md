@@ -169,7 +169,7 @@ lsre "检查 k8s pod 状态"
 lsre tui
 lsre remediate "修复当前巡检发现的问题"
 # chat 快捷命令
-# /help /activity /focus /trace /timeline /panel [overview|activity|timeline|providers|next|1-4] /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /providers /provider <name> /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /remediate /tui /doctor [/doctor fix] [/doctor strict]
+# /help /activity /focus /do [n] /trace /timeline /panel [overview|activity|timeline|providers|next|1-4] /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /providers /provider <name> /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /remediate /tui /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7

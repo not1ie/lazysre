@@ -133,6 +133,7 @@ from lazysre.cli.main import (
     _render_tui_demo_text,
     _render_recent_activity_text,
     _render_focus_text,
+    _render_quick_actions_text,
     _render_trace_text,
     _render_timeline_text,
     _build_tui_footer_line,
@@ -151,6 +152,7 @@ from lazysre.cli.main import (
     _build_provider_runtime_report,
     _switch_runtime_provider,
     _tui_completion_candidates,
+    _handle_tui_input,
     _derive_closed_loop_plan,
     _infer_verification_commands,
     _looks_like_remediate_request,
@@ -825,10 +827,12 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/providers" in rendered
     assert "/activity" in rendered
     assert "/focus" in rendered
+    assert "/do 1" in rendered
     assert "/trace" in rendered
     assert "/timeline" in rendered
     assert "/panel next" in rendered
     assert "Focus" in rendered
+    assert "Quick Actions" in rendered
     assert "Recent Activity" in rendered
     assert "Command Trail" in rendered
     assert "Trace Summary" in rendered
@@ -1915,6 +1919,9 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert any("08:30 [observe/ok/exec] docker service ls" in item for item in snapshot["timeline_entries"])
     assert snapshot["focus_title"] == "Active Alert"
     assert "/activity" in snapshot["focus_actions"]
+    assert isinstance(snapshot["quick_action_items"], list)
+    assert snapshot["quick_action_items"]
+    assert snapshot["quick_action_items"][0]["id"] == "1"
 
 
 def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1980,6 +1987,26 @@ def test_render_focus_text_prefers_recent_failure(tmp_path: Path) -> None:
     assert "Recent Failure" in rendered
     assert "/trace" in rendered
     assert "/timeline" in rendered
+
+
+def test_render_quick_actions_text_lists_numbered_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {
+            "quick_action_items": [
+                {"id": "1", "title": "Focus", "source": "focus", "command": "/trace"},
+                {"id": "2", "title": "Recommended", "source": "recommended", "command": "lazysre scan"},
+            ]
+        },
+    )
+
+    rendered = _render_quick_actions_text({})
+
+    assert "Quick Actions" in rendered
+    assert "1. [focus] Focus: /trace" in rendered
+    assert "2. [recommended] Recommended: lazysre scan" in rendered
+    assert "/do 1" in rendered
 
 
 def test_render_timeline_text_includes_audit_entries(tmp_path: Path) -> None:
@@ -2167,10 +2194,13 @@ def test_build_tui_status_hint_line_uses_panel() -> None:
 
 def test_build_tui_action_bar_changes_by_panel() -> None:
     overview_bar = _build_tui_action_bar({"sidebar_panel": "overview"})
+    activity_bar = _build_tui_action_bar({"sidebar_panel": "activity"})
     timeline_bar = _build_tui_action_bar({"sidebar_panel": "timeline"})
     provider_bar = _build_tui_action_bar({"sidebar_panel": "providers"})
 
     assert "/focus" in overview_bar
+    assert "/do 1" in overview_bar
+    assert "/do 1" in activity_bar
     assert "/trace" in timeline_bar
     assert "/providers" in provider_bar
     assert "1 overview" in timeline_bar
@@ -2223,6 +2253,10 @@ def test_build_tui_sidebar_lines_overview_shows_focus_section() -> None:
         "focus_title": "Active Alert",
         "focus_body": "watch attention alerts=1 cycle=2",
         "focus_actions": ["/activity", "/scan"],
+        "quick_action_items": [
+            {"id": "1", "title": "Active Alert", "source": "focus", "command": "/activity"},
+            {"id": "2", "title": "Recommended", "source": "recommended", "command": "/scan"},
+        ],
         "usable_targets": ["docker"],
         "configured_providers": ["mock"],
         "namespace": "default",
@@ -2245,6 +2279,7 @@ def test_build_tui_sidebar_lines_overview_shows_focus_section() -> None:
     assert "focus: Active Alert" in joined
     assert "Focus:" in joined
     assert "Focus Actions:" in joined
+    assert "Quick Actions:" in joined
     assert "/activity" in joined
 
 
@@ -2306,7 +2341,7 @@ def test_build_tui_sidebar_lines_shows_empty_state_for_activity_panel() -> None:
 
 def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:
     snapshot = {
-        "shortcuts": ["/brief", "/scan", "/refresh", "/providers"],
+        "shortcuts": ["/brief", "/scan", "/refresh", "/providers", "/do 1"],
         "recommended_commands": ["lazysre swarm --logs", "lazysre autopilot"],
     }
 
@@ -2314,6 +2349,32 @@ def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:
 
     assert "/refresh" in candidates
     assert "/scan" not in candidates
+
+
+def test_handle_tui_input_do_runs_quick_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {
+            "quick_action_items": [
+                {"id": "1", "title": "Focus", "source": "focus", "command": "/trace"}
+            ]
+        },
+    )
+
+    def fake_run(command_text: str, *, options: dict[str, object], execute_mode: bool) -> bool:
+        calls.append({"command_text": command_text, "options": options, "execute_mode": execute_mode})
+        return True
+
+    monkeypatch.setattr(cli_main, "_run_suggested_command", fake_run)
+
+    out = _handle_tui_input("/do 1", {"execute": False})
+
+    assert out == ""
+    assert calls[0]["command_text"] == "/trace"
+    assert calls[0]["execute_mode"] is False
 
 
 def test_cycle_tui_input_history_roundtrip() -> None:

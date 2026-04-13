@@ -6062,6 +6062,50 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
     return False
 
 
+def _find_quick_action_item(options: dict[str, object], action_id: int) -> dict[str, str] | None:
+    if action_id <= 0:
+        return None
+    snapshot = _build_tui_dashboard_snapshot(options)
+    items = snapshot.get("quick_action_items", [])
+    if not isinstance(items, list):
+        return None
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            current = int(raw.get("id", 0))
+        except Exception:
+            current = 0
+        if current == action_id:
+            return {str(k): str(v) for k, v in raw.items()}
+    return None
+
+
+def _run_suggested_command(command_text: str, *, options: dict[str, object], execute_mode: bool) -> bool:
+    command = str(command_text or "").strip()
+    if not command:
+        typer.echo("建议动作为空。")
+        return False
+    if command.startswith("/"):
+        result = _handle_tui_input(command, {**options, "execute": execute_mode})
+        if str(result).strip():
+            typer.echo(str(result))
+        return True
+    return _run_action_command(command, options=options, execute_mode=execute_mode)
+
+
+def _run_quick_action_item(*, options: dict[str, object], action_id: int, execute_mode: bool) -> bool:
+    item = _find_quick_action_item(options, action_id)
+    if not item:
+        typer.echo(f"Quick action not found: {action_id}")
+        return False
+    command = str(item.get("command", "")).strip()
+    title = str(item.get("title", command)).strip() or command
+    source = str(item.get("source", "suggested")).strip() or "suggested"
+    typer.echo(f"Running quick action {action_id} [{source}]: {title}")
+    return _run_suggested_command(command, options=options, execute_mode=execute_mode)
+
+
 def _latest_autopilot_file() -> Path:
     return Path(settings.data_dir) / "lsre-autopilot-last.json"
 
@@ -6665,6 +6709,58 @@ def _build_tui_focus_card(
     }
 
 
+def _build_quick_action_catalog(
+    *,
+    focus_title: str,
+    focus_actions: list[str],
+    recent_activity_commands: list[str],
+    recommended_commands: list[str],
+    watch_snapshot: dict[str, object],
+) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(command: str, *, title: str, source: str) -> None:
+        cmd = str(command or "").strip()
+        if not cmd:
+            return
+        key = cmd.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        items.append(
+            {
+                "id": str(len(items) + 1),
+                "title": str(title or cmd).strip()[:80],
+                "source": str(source or "suggested").strip(),
+                "command": cmd,
+            }
+        )
+
+    for cmd in focus_actions[:3]:
+        _add(str(cmd), title=f"{focus_title or 'Focus'}", source="focus")
+
+    watch_inbox = _build_action_inbox_from_watch(watch_snapshot if isinstance(watch_snapshot, dict) else {})
+    actions = watch_inbox.get("actions", [])
+    if isinstance(actions, list):
+        for raw in actions[:3]:
+            if not isinstance(raw, dict):
+                continue
+            _add(
+                str(raw.get("command", "")),
+                title=str(raw.get("title", "Watch action")).strip() or "Watch action",
+                source=f"watch/{str(raw.get('severity', 'info')).strip() or 'info'}",
+            )
+
+    for cmd in recent_activity_commands[:4]:
+        _add(str(cmd), title="Recent Activity", source="activity")
+
+    for cmd in recommended_commands[:6]:
+        _add(str(cmd), title="Recommended", source="recommended")
+
+    return items[:8]
+
+
 def _infer_trace_stage(summary: str) -> str:
     text = str(summary or "").strip().lower()
     command = text.split("::")[-1].strip()
@@ -6780,6 +6876,25 @@ def _render_focus_text(options: dict[str, object]) -> str:
     lines = ["Focus", f"- {focus_title}: {focus_body}"]
     if focus_actions:
         lines.extend(["", "Suggested Next Commands", *[f"- {item}" for item in focus_actions]])
+    return "\n".join(lines)
+
+
+def _render_quick_actions_text(options: dict[str, object]) -> str:
+    snapshot = _build_tui_dashboard_snapshot(options)
+    items = snapshot.get("quick_action_items", [])
+    if not isinstance(items, list):
+        items = []
+    if not items:
+        return "Quick Actions\n- 暂无快捷建议，先运行 /focus、/activity 或 /scan。"
+    lines = ["Quick Actions"]
+    for raw in items[:8]:
+        item = raw if isinstance(raw, dict) else {}
+        command = str(item.get("command", "")).strip()
+        title = str(item.get("title", command)).strip() or command
+        source = str(item.get("source", "suggested")).strip() or "suggested"
+        action_id = str(item.get("id", "?")).strip() or "?"
+        lines.append(f"- {action_id}. [{source}] {title}: {command}")
+    lines.extend(["", "Usage", "- /do 1", "- /do 2"])
     return "\n".join(lines)
 
 
@@ -8397,6 +8512,7 @@ def _render_chat_short_help() -> None:
         "- /help: 查看帮助",
         "- /activity: 查看最近巡检、修复计划和审计轨迹，并给出建议下一步",
         "- /focus: 查看当前最值得关注的异常/阻塞与建议动作",
+        "- /do [n]: 查看快捷建议；/do 1 直接执行第1条建议",
         "- /timeline: 查看最近执行时间线（命令、状态、dry-run/exec）",
         "- /trace: 查看最近一次操作链路的摘要（成功/失败、dry-run/exec、top tools）",
         "- /panel [overview|activity|timeline|providers|next|1-4]: 切换 TUI 左侧面板",
@@ -8404,7 +8520,7 @@ def _render_chat_short_help() -> None:
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
         "- /swarm [--logs]: 检查 Docker Swarm 服务、副本、任务失败证据",
         "- /watch [--count N]: 持续巡检并输出异常摘要",
-        "- /actions [id]: 把最近一次巡检结果整理成编号行动清单，可直接执行某个建议",
+        "- /actions [id]: 兼容旧入口，等价于 /do 或 /do 1",
         "- /autopilot [目标]: 自动扫描 -> 巡检 -> 行动清单，可加 --fix 生成修复计划",
         "- /connect [user@host]: 远程连接体检；SSH 连通后自动保存为默认远程目标",
         "- /remote [user@host] [--logs]: 通过 SSH 只读诊断远程 Docker/Swarm；已保存 ssh_target 时可省略主机",
@@ -8539,6 +8655,13 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         provider_report=provider_report,
         timeline=timeline_entries_raw,
     )
+    quick_action_items = _build_quick_action_catalog(
+        focus_title=str(focus_card.get("title", "")),
+        focus_actions=list(focus_card.get("actions", [])) if isinstance(focus_card.get("actions", []), list) else [],
+        recent_activity_commands=list(recent_activity_context.get("commands", [])),
+        recommended_commands=[str(item) for item in recommended_commands if str(item).strip()],
+        watch_snapshot=recent_activity_context.get("watch", {}) if isinstance(recent_activity_context.get("watch", {}), dict) else {},
+    )
     timeline_entries = [
         f"{item.get('time', '--:--')} [{item.get('stage', 'other')}/{item.get('status', 'info')}/{item.get('mode', '-')}] {item.get('summary', '')}"
         for item in timeline_entries_raw
@@ -8573,6 +8696,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "focus_title": str(focus_card.get("title", "")),
         "focus_body": str(focus_card.get("body", "")),
         "focus_actions": list(focus_card.get("actions", []))[:3] if isinstance(focus_card.get("actions", []), list) else [],
+        "quick_action_items": quick_action_items,
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
         "active_provider": _resolve_runtime_provider_label(str(options.get("provider", "auto"))),
         "shortcuts": [
@@ -8580,6 +8704,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
             "/scan",
             "/activity",
             "/focus",
+            "/do 1",
             "/timeline",
             "/trace",
             "/panel next",
@@ -8617,6 +8742,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     focus_actions = snapshot.get("focus_actions", [])
     if not isinstance(focus_actions, list):
         focus_actions = []
+    quick_action_items = snapshot.get("quick_action_items", [])
+    if not isinstance(quick_action_items, list):
+        quick_action_items = []
     timeline_entries = snapshot.get("timeline_entries", [])
     if not isinstance(timeline_entries, list):
         timeline_entries = []
@@ -8651,6 +8779,12 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         *[f"│ {item}" for item in recent_activity[:4]],
         *([ "├─ Focus Actions ────────────────────────────────────────────────┤"] + [f"│ {item}" for item in focus_actions[:2]] if focus_actions else []),
         *([ "├─ Activity Actions ──────────────────────────────────────────────┤"] + [f"│ {item}" for item in recent_activity_commands[:3]] if recent_activity_commands else []),
+        *(
+            ["├─ Quick Actions ───────────────────────────────────────────────┤"]
+            + [f"│ {item.get('id', '?')}. {item.get('command', '')}" for item in quick_action_items[:3] if isinstance(item, dict)]
+            if quick_action_items
+            else []
+        ),
         "├─ Recommended ───────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in recommended[:4]],
         *([ "├─ Command Trail ─────────────────────────────────────────────────┤"] + [f"│ {item}" for item in recent_commands[-3:]] if recent_commands else []),
@@ -8856,6 +8990,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     focus_actions = snapshot.get("focus_actions", [])
     if not isinstance(focus_actions, list):
         focus_actions = []
+    quick_action_items = snapshot.get("quick_action_items", [])
+    if not isinstance(quick_action_items, list):
+        quick_action_items = []
     timeline_entries = snapshot.get("timeline_entries", [])
     if not isinstance(timeline_entries, list):
         timeline_entries = []
@@ -8959,6 +9096,17 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         lines.extend(["", "Focus Actions:"])
         for item in focus_actions[:3]:
             lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
+    if quick_action_items:
+        lines.extend(["", "Quick Actions:"])
+        for raw in quick_action_items[:3]:
+            if not isinstance(raw, dict):
+                continue
+            lines.extend(
+                _wrap_tui_text_lines(
+                    f"- {raw.get('id', '?')}. {raw.get('command', '')}",
+                    width=width,
+                )
+            )
     last_user = str(snapshot.get("last_user", "")).strip()
     if last_user:
         lines.extend(["", "Last Input:"])
@@ -9040,8 +9188,8 @@ def _build_tui_action_bar(snapshot: dict[str, object]) -> str:
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     base = "actions> 1 overview | 2 activity | 3 timeline | 4 providers"
     panel_actions = {
-        "overview": "/focus | /brief | /scan",
-        "activity": "/activity | /remediate | /swarm --logs",
+        "overview": "/do 1 | /focus | /scan",
+        "activity": "/do 1 | /activity | /swarm --logs",
         "timeline": "/trace | /timeline | /panel next",
         "providers": "/providers | /provider <name> | /panel next",
     }
@@ -9145,7 +9293,7 @@ def _switch_tui_panel(options: dict[str, object], requested: str) -> str:
 
 
 def _tui_welcome_message() -> str:
-    return "全屏 TUI 已启动。输入自然语言，或使用 /focus /activity /trace /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板。"
+    return "全屏 TUI 已启动。输入自然语言，或使用 /do 1 /focus /activity /trace /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板。"
 
 
 def _cycle_tui_input_history(
@@ -9211,6 +9359,8 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/provider mock",
             "/activity",
             "/focus",
+            "/do",
+            "/do 1",
             "/timeline",
             "/trace",
             "/panel overview",
@@ -9343,6 +9493,22 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
     lowered = normalized.lower()
     if lowered in {"/help", "help", "?"}:
         return _render_tui_demo_text(_build_tui_dashboard_snapshot(options))
+    if lowered in {"/actions", "/actions show"}:
+        return _render_quick_actions_text(options)
+    if lowered.startswith("/actions "):
+        action_id = _safe_int(normalized[len("/actions ") :].strip())
+        if action_id <= 0:
+            return "用法：/actions 1"
+        _run_quick_action_item(options=options, action_id=action_id, execute_mode=bool(options.get("execute", False)))
+        return ""
+    if lowered in {"/do", "/do show"}:
+        return _render_quick_actions_text(options)
+    if lowered.startswith("/do "):
+        action_id = _safe_int(normalized[len("/do ") :].strip())
+        if action_id <= 0:
+            return "用法：/do 1"
+        _run_quick_action_item(options=options, action_id=action_id, execute_mode=bool(options.get("execute", False)))
+        return ""
     if lowered.startswith("/activity"):
         return _render_recent_activity_text(options)
     if lowered.startswith("/focus"):
@@ -9573,6 +9739,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "apply",
         "activity",
         "focus",
+        "do",
         "timeline",
     ]
     corrected = aliases.get(command, "")
@@ -9637,6 +9804,34 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower() in {"/help", "/h"}:
             _render_chat_short_help()
+            continue
+        if text.lower() in {"/actions", "/actions show"}:
+            typer.echo(_render_quick_actions_text({**options, "execute": runtime_execute}))
+            continue
+        if text.lower().startswith("/actions "):
+            action_id = _safe_int(text[len("/actions ") :].strip())
+            if action_id <= 0:
+                typer.echo("用法：/actions 1")
+            else:
+                _run_quick_action_item(
+                    options={**options, "execute": runtime_execute},
+                    action_id=action_id,
+                    execute_mode=runtime_execute,
+                )
+            continue
+        if text.lower() in {"/do", "/do show"}:
+            typer.echo(_render_quick_actions_text({**options, "execute": runtime_execute}))
+            continue
+        if text.lower().startswith("/do "):
+            action_id = _safe_int(text[len("/do ") :].strip())
+            if action_id <= 0:
+                typer.echo("用法：/do 1")
+            else:
+                _run_quick_action_item(
+                    options={**options, "execute": runtime_execute},
+                    action_id=action_id,
+                    execute_mode=runtime_execute,
+                )
             continue
         if text.lower().startswith("/activity"):
             typer.echo(_render_recent_activity_text({**options, "execute": runtime_execute}))
@@ -10534,26 +10729,22 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             )
         return True
     if _looks_like_action_run_request(text):
-        snapshot = _load_latest_watch_snapshot(None)
-        inbox = _build_action_inbox_from_watch(snapshot)
         action_id = _extract_action_id_from_text(text)
         if action_id <= 0:
             typer.echo("请指定要执行的行动编号，例如：执行第1个建议")
             return True
-        _run_action_inbox_item(
-            inbox=inbox,
-            action_id=action_id,
-            options=options,
-            execute_mode=execute_mode,
-        )
+        if not _run_quick_action_item(options=options, action_id=action_id, execute_mode=execute_mode):
+            snapshot = _load_latest_watch_snapshot(None)
+            inbox = _build_action_inbox_from_watch(snapshot)
+            _run_action_inbox_item(
+                inbox=inbox,
+                action_id=action_id,
+                options=options,
+                execute_mode=execute_mode,
+            )
         return True
     if _looks_like_actions_request(text):
-        snapshot = _load_latest_watch_snapshot(None)
-        inbox = _build_action_inbox_from_watch(snapshot)
-        if _console:
-            _render_action_inbox(inbox)
-        else:
-            typer.echo(json.dumps(inbox, ensure_ascii=False, indent=2))
+        typer.echo(_render_quick_actions_text({**options, "execute": execute_mode}))
         return True
     if _looks_like_brief_request(text):
         report = _build_overview_brief_report(
