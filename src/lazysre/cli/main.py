@@ -6555,11 +6555,13 @@ def _read_recent_audit_timeline(path: Path, *, limit: int = 5) -> list[dict[str,
         summary = command_text[:96]
         if target:
             summary = f"{target} :: {summary}"[:110]
+        stage = _infer_trace_stage(summary)
         items.append(
             {
                 "time": time_label or "--:--",
                 "status": status,
                 "mode": mode,
+                "stage": stage,
                 "summary": summary,
             }
         )
@@ -6576,12 +6578,14 @@ def _build_recent_trace_summary(timeline: list[dict[str, str]]) -> list[str]:
     dry_run_count = 0
     exec_count = 0
     tool_counts: dict[str, int] = {}
+    stage_counts: dict[str, int] = {}
     for item in timeline:
         if not isinstance(item, dict):
             continue
         status = str(item.get("status", "")).strip().lower()
         mode = str(item.get("mode", "")).strip().lower()
         summary = str(item.get("summary", "")).strip()
+        stage = str(item.get("stage", "")).strip().lower() or _infer_trace_stage(summary)
         if status == "ok":
             ok_count += 1
         elif status == "fail":
@@ -6593,6 +6597,8 @@ def _build_recent_trace_summary(timeline: list[dict[str, str]]) -> list[str]:
         first = summary.split("::")[-1].strip().split(" ", 1)[0].strip().lower() if summary else ""
         if first:
             tool_counts[first] = tool_counts.get(first, 0) + 1
+        if stage:
+            stage_counts[stage] = stage_counts.get(stage, 0) + 1
     top_tools = sorted(tool_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
     latest = timeline[-1]
     latest_summary = str(latest.get("summary", "")).strip()
@@ -6604,7 +6610,60 @@ def _build_recent_trace_summary(timeline: list[dict[str, str]]) -> list[str]:
     ]
     if top_tools:
         lines.append("top-tools=" + ", ".join(f"{name}x{count}" for name, count in top_tools))
+    if stage_counts:
+        ordered_stages = ["observe", "plan", "apply", "verify", "other"]
+        parts = [f"{name}x{stage_counts[name]}" for name in ordered_stages if stage_counts.get(name)]
+        if parts:
+            lines.append("stage-flow=" + " -> ".join(parts))
     return lines
+
+
+def _infer_trace_stage(summary: str) -> str:
+    text = str(summary or "").strip().lower()
+    command = text.split("::")[-1].strip()
+    if not command:
+        return "other"
+    if any(token in command for token in ["fix plan", "runbook", "template ", "report ", "brief"]):
+        return "plan"
+    if any(
+        token in command
+        for token in [
+            " apply ",
+            " patch ",
+            " delete ",
+            " scale ",
+            " update ",
+            " rollout restart",
+            " rollout undo",
+            " service update",
+            " service rollback",
+            " restart ",
+            " remediate",
+        ]
+    ):
+        return "apply"
+    if any(token in command for token in [" wait ", " rollout status", " health", "/health", " verify", " status "]):
+        return "verify"
+    if any(
+        token in command
+        for token in [
+            " get ",
+            " describe ",
+            " logs",
+            " top ",
+            " service ls",
+            " service ps",
+            " service inspect",
+            " node ls",
+            " docker info",
+            " kubectl ",
+            " curl ",
+            " journalctl",
+            " tail ",
+        ]
+    ):
+        return "observe"
+    return "other"
 
 
 def _build_tui_recent_activity_context(options: dict[str, object]) -> dict[str, object]:
@@ -6675,7 +6734,7 @@ def _render_timeline_text(options: dict[str, object]) -> str:
     lines.append("Entries")
     for item in timeline:
         lines.append(
-            f"- {item.get('time', '--:--')} [{item.get('status', 'info')}/{item.get('mode', '-')}] {item.get('summary', '')}"
+            f"- {item.get('time', '--:--')} [{item.get('stage', 'other')}/{item.get('status', 'info')}/{item.get('mode', '-')}] {item.get('summary', '')}"
         )
     return "\n".join(lines)
 
@@ -8414,7 +8473,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         limit=4,
     )
     timeline_entries = [
-        f"{item.get('time', '--:--')} [{item.get('status', 'info')}/{item.get('mode', '-')}] {item.get('summary', '')}"
+        f"{item.get('time', '--:--')} [{item.get('stage', 'other')}/{item.get('status', 'info')}/{item.get('mode', '-')}] {item.get('summary', '')}"
         for item in timeline_entries_raw
         if isinstance(item, dict)
     ]

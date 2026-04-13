@@ -139,6 +139,7 @@ from lazysre.cli.main import (
     _build_tui_status_hint_line,
     _build_tui_panel_counts,
     _build_recent_trace_summary,
+    _infer_trace_stage,
     _build_tui_panel_tabs,
     _build_tui_sidebar_lines,
     _normalize_tui_panel_name,
@@ -1906,7 +1907,7 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert any("docker service ls" in item for item in snapshot["recent_activity"])
     assert "/activity" in snapshot["recent_activity_commands"]
     assert "/swarm --service api --logs" in snapshot["recent_activity_commands"]
-    assert any("08:30 [ok/exec] docker service ls" in item for item in snapshot["timeline_entries"])
+    assert any("08:30 [observe/ok/exec] docker service ls" in item for item in snapshot["timeline_entries"])
 
 
 def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1975,8 +1976,8 @@ def test_render_timeline_text_includes_audit_entries(tmp_path: Path) -> None:
 
     assert "Execution Timeline" in rendered
     assert "Trace Summary" in rendered
-    assert "08:30 [ok/exec] docker service ls" in rendered
-    assert "08:31 [fail/dry-run] root@10.0.0.8 :: kubectl get pods" in rendered
+    assert "08:30 [observe/ok/exec] docker service ls" in rendered
+    assert "08:31 [observe/fail/dry-run] root@10.0.0.8 :: kubectl get pods" in rendered
 
 
 def test_render_trace_text_summarizes_recent_operations(tmp_path: Path) -> None:
@@ -2003,6 +2004,7 @@ def test_render_trace_text_summarizes_recent_operations(tmp_path: Path) -> None:
     assert rendered.startswith("Operation Trace")
     assert "steps=2 ok=1 fail=1 dry-run=1 exec=1" in rendered
     assert "top-tools=" in rendered
+    assert "stage-flow=observex2" in rendered
 
 
 def test_build_tui_footer_line_includes_last_user_command() -> None:
@@ -2075,12 +2077,20 @@ def test_build_recent_trace_summary_handles_empty_and_counts() -> None:
 
     summary = _build_recent_trace_summary(
         [
-            {"status": "ok", "mode": "exec", "summary": "docker service ls"},
-            {"status": "fail", "mode": "dry-run", "summary": "kubectl get pods"},
+            {"status": "ok", "mode": "exec", "stage": "observe", "summary": "docker service ls"},
+            {"status": "fail", "mode": "dry-run", "stage": "apply", "summary": "kubectl apply -f x.yaml"},
         ]
     )
 
     assert "steps=2 ok=1 fail=1 dry-run=1 exec=1" in summary[0]
+    assert "stage-flow=observex1 -> applyx1" in summary[-1]
+
+
+def test_infer_trace_stage_recognizes_common_phases() -> None:
+    assert _infer_trace_stage("docker service ls") == "observe"
+    assert _infer_trace_stage("kubectl apply -f k.yaml") == "apply"
+    assert _infer_trace_stage("kubectl rollout status deploy/api") == "verify"
+    assert _infer_trace_stage("fix plan for payment") == "plan"
 
 
 def test_build_tui_panel_tabs_marks_active_panel() -> None:
