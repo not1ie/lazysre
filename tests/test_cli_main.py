@@ -832,6 +832,7 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/timeline" in rendered
     assert "/panel next" in rendered
     assert "Focus" in rendered
+    assert "State Card" in rendered
     assert "Quick Actions" in rendered
     assert "Recent Activity" in rendered
     assert "Command Trail" in rendered
@@ -2314,11 +2315,48 @@ def test_build_tui_sidebar_lines_overview_shows_focus_section() -> None:
 
     assert "focus: Active Alert" in joined
     assert "quick: ok:/activity" in joined
+    assert "next: /do 1 -> /activity" in joined
     assert "Focus:" in joined
     assert "Focus Actions:" in joined
     assert "Quick Actions:" in joined
     assert "Last Quick Action:" in joined
     assert "/activity" in joined
+
+
+def test_tui_demo_state_card_prioritizes_debug_after_failure() -> None:
+    rendered = _render_tui_demo_text(
+        {
+            "version": "0.1.1",
+            "mode": "dry-run",
+            "provider": "mock",
+            "model": "gpt-5.4-mini",
+            "sidebar_panel": "overview",
+            "panel_hint": "hint",
+            "status": "attention",
+            "headline": "headline",
+            "focus_title": "Recent Failure",
+            "focus_body": "payment remediation failed",
+            "active_provider": "mock",
+            "usable_targets": ["docker"],
+            "configured_providers": ["mock"],
+            "namespace": "default",
+            "ssh_target": "",
+            "prometheus_url": "",
+            "session_turns": 1,
+            "last_user": "修复 payment",
+            "recent_activity": [],
+            "recent_activity_commands": [],
+            "focus_actions": ["/trace", "/timeline"],
+            "quick_action_items": [{"id": "1", "command": "/swarm --logs", "last_status": "fail"}],
+            "latest_quick_action": {"status": "fail", "command": "/swarm --logs"},
+            "recommended_commands": ["/trace"],
+            "recent_commands": [],
+            "trace_summary": [],
+            "timeline_entries": [],
+            "shortcuts": ["/do 1", "/trace"],
+        }
+    )
+    assert "next=/trace -> /timeline -> /do 1" in rendered
 
 
 def test_build_tui_sidebar_lines_shows_empty_state_for_provider_panel() -> None:

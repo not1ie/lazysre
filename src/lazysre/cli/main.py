@@ -7022,6 +7022,41 @@ def _render_quick_action_result(
     return "\n".join(lines)
 
 
+def _build_tui_state_card(snapshot: dict[str, object]) -> dict[str, str]:
+    focus_title = str(snapshot.get("focus_title", "")).strip() or "Focus"
+    focus_body = str(snapshot.get("focus_body", "")).strip() or "-"
+    latest = snapshot.get("latest_quick_action", {})
+    if not isinstance(latest, dict):
+        latest = {}
+    latest_status = str(latest.get("status", "")).strip() or "idle"
+    latest_command = str(latest.get("command", "")).strip() or "-"
+    quick_line = f"{latest_status}: {latest_command[:72]}"
+
+    next_line = "-"
+    if latest_status == "fail":
+        next_line = "/trace -> /timeline -> /do 1"
+    else:
+        quick_actions = snapshot.get("quick_action_items", [])
+        if isinstance(quick_actions, list):
+            for raw in quick_actions:
+                if not isinstance(raw, dict):
+                    continue
+                command = str(raw.get("command", "")).strip()
+                action_id = str(raw.get("id", "")).strip()
+                if command and action_id:
+                    next_line = f"/do {action_id} -> {command[:56]}"
+                    break
+        if next_line == "-":
+            focus_actions = snapshot.get("focus_actions", [])
+            if isinstance(focus_actions, list) and focus_actions:
+                next_line = str(focus_actions[0])[:64]
+    return {
+        "focus": f"{focus_title}: {focus_body[:96]}",
+        "quick": quick_line,
+        "next": next_line,
+    }
+
+
 def _render_timeline_text(options: dict[str, object]) -> str:
     audit_log = Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))).expanduser()
     timeline = _read_recent_audit_timeline(audit_log, limit=6)
@@ -8889,12 +8924,17 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         recent_commands = []
     action_bar = _build_tui_action_bar(snapshot)
     panel_hint = str(snapshot.get("panel_hint", "")).strip()
+    state_card = _build_tui_state_card(snapshot)
     lines = [
         "╭─ LazySRE Fullscreen TUI ─────────────────────────────────────────╮",
         f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
         f"│ panel={snapshot.get('sidebar_panel', 'overview')} hint={panel_hint or '-'}",
         f"│ action_bar={action_bar}",
         f"│ quick_state={_build_latest_quick_action_badge(snapshot)}",
+        "├─ State Card ────────────────────────────────────────────────────┤",
+        f"│ focus={state_card.get('focus', '-')}",
+        f"│ quick={state_card.get('quick', '-')}",
+        f"│ next={state_card.get('next', '-')}",
         "├─ Brief ─────────────────────────────────────────────────────────┤",
         f"│ status={snapshot.get('status', '-')}",
         f"│ headline={snapshot.get('headline', '-')}",
@@ -9154,6 +9194,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     if not isinstance(recent_commands, list):
         recent_commands = []
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
+    state_card = _build_tui_state_card(snapshot)
     lines = [
         *_build_tui_panel_tabs(panel, width=width, snapshot=snapshot),
         "",
@@ -9162,6 +9203,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         f"status: {snapshot.get('status', '-')}",
         f"focus: {snapshot.get('focus_title', '-')}",
         f"quick: {_build_latest_quick_action_badge(snapshot)}",
+        f"next: {state_card.get('next', '-')}",
         f"mode: {snapshot.get('mode', '-')}",
         f"provider: {snapshot.get('provider', '-')}",
         f"model: {snapshot.get('model', '-')}",
