@@ -6955,13 +6955,7 @@ def _render_quick_actions_text(options: dict[str, object]) -> str:
     lines = ["Quick Actions"]
     for raw in items[:8]:
         item = raw if isinstance(raw, dict) else {}
-        command = str(item.get("command", "")).strip()
-        title = str(item.get("title", command)).strip() or command
-        source = str(item.get("source", "suggested")).strip() or "suggested"
-        action_id = str(item.get("id", "?")).strip() or "?"
-        status = str(item.get("last_status", "")).strip()
-        suffix = f" [last={status}]" if status else ""
-        lines.append(f"- {action_id}. [{source}] {title}: {command}{suffix}")
+        lines.append(f"- {_format_quick_action_line(item)}")
         output_preview = str(item.get("last_output_preview", "")).strip()
         if output_preview:
             lines.append(f"  last-output: {output_preview}")
@@ -7055,6 +7049,16 @@ def _build_tui_state_card(snapshot: dict[str, object]) -> dict[str, str]:
         "quick": quick_line,
         "next": next_line,
     }
+
+
+def _format_quick_action_line(item: dict[str, object]) -> str:
+    action_id = str(item.get("id", "?")).strip() or "?"
+    command = str(item.get("command", "")).strip() or "-"
+    title = str(item.get("title", command)).strip() or command
+    source = str(item.get("source", "suggested")).strip() or "suggested"
+    status = str(item.get("last_status", "")).strip()
+    suffix = f" [last={status}]" if status else ""
+    return f"{action_id}. [{source}] {title} => {command}{suffix}"
 
 
 def _render_timeline_text(options: dict[str, object]) -> str:
@@ -8956,8 +8960,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         *(
             ["├─ Quick Actions ───────────────────────────────────────────────┤"]
             + [
-                f"│ {item.get('id', '?')}. {item.get('command', '')}"
-                + (f" [last={item.get('last_status', '')}]" if str(item.get('last_status', '')).strip() else "")
+                f"│ {_format_quick_action_line(item)}"
                 for item in quick_action_items[:3]
                 if isinstance(item, dict)
             ]
@@ -9297,8 +9300,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
                 continue
             lines.extend(
                 _wrap_tui_text_lines(
-                    f"- {raw.get('id', '?')}. {raw.get('command', '')}"
-                    + (f" [last={raw.get('last_status', '')}]" if str(raw.get('last_status', '')).strip() else ""),
+                    f"- {_format_quick_action_line(raw)}",
                     width=width,
                 )
             )
