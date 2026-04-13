@@ -2023,9 +2023,11 @@ def test_render_quick_actions_text_lists_numbered_items(monkeypatch: pytest.Monk
     rendered = _render_quick_actions_text({})
 
     assert "Quick Actions" in rendered
-    assert "1. [focus] Focus => /trace [last=ok]" in rendered
+    assert "1. [focus] Focus [last=ok]" in rendered
+    assert "cmd: /trace" in rendered
     assert "last-output: Trace Summary ready" in rendered
-    assert "2. [recommended] Recommended => lazysre scan" in rendered
+    assert "2. [recommended] Recommended" in rendered
+    assert "cmd: lazysre scan" in rendered
     assert "Last Run" in rendered
     assert "/do 1" in rendered
 
@@ -2320,8 +2322,8 @@ def test_build_tui_sidebar_lines_overview_shows_focus_section() -> None:
     assert "Focus Actions:" in joined
     assert "Quick Actions:" in joined
     assert "Last Quick Action:" in joined
-    assert "[focus] Active Alert =>" in joined
-    assert "/activity [last=ok]" in joined
+    assert "[focus] Active Alert [last=ok]" in joined
+    assert "cmd: /activity" in joined
     assert "/activity" in joined
 
 

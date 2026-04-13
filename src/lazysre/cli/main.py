@@ -6956,6 +6956,7 @@ def _render_quick_actions_text(options: dict[str, object]) -> str:
     for raw in items[:8]:
         item = raw if isinstance(raw, dict) else {}
         lines.append(f"- {_format_quick_action_line(item)}")
+        lines.append(f"  {_format_quick_action_command(item)}")
         output_preview = str(item.get("last_output_preview", "")).strip()
         if output_preview:
             lines.append(f"  last-output: {output_preview}")
@@ -7058,7 +7059,12 @@ def _format_quick_action_line(item: dict[str, object]) -> str:
     source = str(item.get("source", "suggested")).strip() or "suggested"
     status = str(item.get("last_status", "")).strip()
     suffix = f" [last={status}]" if status else ""
-    return f"{action_id}. [{source}] {title} => {command}{suffix}"
+    return f"{action_id}. [{source}] {title}{suffix}"
+
+
+def _format_quick_action_command(item: dict[str, object]) -> str:
+    command = str(item.get("command", "")).strip() or "-"
+    return f"cmd: {command}"
 
 
 def _render_timeline_text(options: dict[str, object]) -> str:
@@ -8960,9 +8966,13 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         *(
             ["├─ Quick Actions ───────────────────────────────────────────────┤"]
             + [
-                f"│ {_format_quick_action_line(item)}"
+                line
                 for item in quick_action_items[:3]
                 if isinstance(item, dict)
+                for line in [
+                    f"│ {_format_quick_action_line(item)}",
+                    f"│   {_format_quick_action_command(item)}",
+                ]
             ]
             if quick_action_items
             else []
@@ -9301,6 +9311,12 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
             lines.extend(
                 _wrap_tui_text_lines(
                     f"- {_format_quick_action_line(raw)}",
+                    width=width,
+                )
+            )
+            lines.extend(
+                _wrap_tui_text_lines(
+                    f"  {_format_quick_action_command(raw)}",
                     width=width,
                 )
             )
