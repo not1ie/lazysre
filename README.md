@@ -21,7 +21,7 @@ lazysre
 # 首次启动会自动生成只读 LazySRE Brief，并给出下一步命令
 lazysre tui
 lazysre tui --demo
-# TUI 内支持 Tab 自动补全、Up/Down 历史、Ctrl-L 清屏、F2/1-4 面板切换、/refresh 刷新总览、/providers 查看模型配置，并显示左侧面板标签条、面板上下文提示、最近活动时间线、阶段化 Trace Summary、执行时间线、建议动作、命令轨迹和底部状态栏
+# TUI 内支持 Tab 自动补全、Up/Down 历史、Ctrl-L 清屏、F2/1-4 面板切换、/refresh 刷新总览、/providers 查看模型配置，并显示左侧面板标签条、面板上下文提示、Action Bar、最近活动时间线、阶段化 Trace Summary、执行时间线、建议动作、命令轨迹和底部状态栏
 # 兼容短命令
 lsre
 # 或 python 模块方式

@@ -135,6 +135,7 @@ from lazysre.cli.main import (
     _render_trace_text,
     _render_timeline_text,
     _build_tui_footer_line,
+    _build_tui_action_bar,
     _build_tui_panel_hint,
     _build_tui_status_hint_line,
     _build_tui_panel_counts,
@@ -830,6 +831,7 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "Trace Summary" in rendered
     assert "panel=overview" in rendered
     assert "hint=" in rendered
+    assert "action_bar=" in rendered
     assert "Up/Down 浏览历史" in rendered
 
 
@@ -2125,6 +2127,15 @@ def test_build_tui_status_hint_line_uses_panel() -> None:
     assert "执行轨迹" in line
 
 
+def test_build_tui_action_bar_changes_by_panel() -> None:
+    timeline_bar = _build_tui_action_bar({"sidebar_panel": "timeline"})
+    provider_bar = _build_tui_action_bar({"sidebar_panel": "providers"})
+
+    assert "/trace" in timeline_bar
+    assert "/providers" in provider_bar
+    assert "1 overview" in timeline_bar
+
+
 def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
     snapshot = {
         "sidebar_panel": "timeline",
@@ -2156,6 +2167,35 @@ def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
     assert "Execution Timeline:" in joined
     assert "Command Trail:" in joined
     assert "Recent Activity:" not in joined
+
+
+def test_build_tui_sidebar_lines_shows_empty_state_for_provider_panel() -> None:
+    snapshot = {
+        "sidebar_panel": "providers",
+        "panel_hint": _build_tui_panel_hint("providers"),
+        "status": "cold-start",
+        "mode": "dry-run",
+        "provider": "auto",
+        "model": "gpt-5.4-mini",
+        "usable_targets": [],
+        "configured_providers": [],
+        "namespace": "default",
+        "ssh_target": "",
+        "prometheus_url": "",
+        "session_turns": 0,
+        "timeline_entries": [],
+        "trace_summary": [],
+        "recent_commands": [],
+        "recent_activity": [],
+        "recent_activity_commands": [],
+        "recommended_commands": [],
+        "provider_report": {"providers": {}, "active_ready": False, "active_detail": ""},
+        "shortcuts": ["/providers", "/panel next"],
+    }
+
+    joined = "\n".join(_build_tui_sidebar_lines(snapshot, width=32))
+
+    assert "暂无可用 provider" in joined
 
 
 def test_build_tui_sidebar_lines_shows_empty_state_for_activity_panel() -> None:

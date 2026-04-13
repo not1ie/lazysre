@@ -8552,11 +8552,13 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     recent_commands = snapshot.get("recent_commands", [])
     if not isinstance(recent_commands, list):
         recent_commands = []
+    action_bar = _build_tui_action_bar(snapshot)
     panel_hint = str(snapshot.get("panel_hint", "")).strip()
     lines = [
         "╭─ LazySRE Fullscreen TUI ─────────────────────────────────────────╮",
         f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
         f"│ panel={snapshot.get('sidebar_panel', 'overview')} hint={panel_hint or '-'}",
+        f"│ action_bar={action_bar}",
         "├─ Brief ─────────────────────────────────────────────────────────┤",
         f"│ status={snapshot.get('status', '-')}",
         f"│ headline={snapshot.get('headline', '-')}",
@@ -8729,7 +8731,7 @@ def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, s
             stdscr.addch(y, sidebar_w, "|")
     side_width = max(12, sidebar_w - 2)
     side_lines = _build_tui_sidebar_lines(snapshot, width=side_width)
-    for idx, line in enumerate(side_lines[: max(0, height - 6)], 1):
+    for idx, line in enumerate(side_lines[: max(0, height - 7)], 1):
         stdscr.addnstr(idx, 1, line, side_width)
 
     content_w = max(10, width - sidebar_w - 3)
@@ -8739,9 +8741,11 @@ def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, s
         for raw in str(text).splitlines() or [""]:
             rows.extend(textwrap.wrap(raw, width=content_w) or [""])
         rows.append("")
-    visible = rows[-max(1, height - 7) :]
+    visible = rows[-max(1, height - 8) :]
     for idx, line in enumerate(visible, 1):
         stdscr.addnstr(idx, sidebar_w + 2, line, content_w)
+    action_line = _build_tui_action_bar(snapshot)
+    stdscr.addnstr(height - 5, 0, action_line.ljust(width), width - 1)
     hint_line = _build_tui_status_hint_line(snapshot)
     stdscr.addnstr(height - 4, 0, hint_line.ljust(width), width - 1)
     footer = _build_tui_footer_line(snapshot=snapshot, status=status, history=history)
@@ -8834,6 +8838,8 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         return lines
     if panel == "providers":
         report = snapshot.get("provider_report", {})
+        if not configured:
+            lines.extend(["", "Providers:", "- 暂无可用 provider，先运行 /providers 或 /login --provider openai"])
         if isinstance(report, dict):
             lines.extend(
                 [
@@ -8939,6 +8945,18 @@ def _build_tui_panel_hint(panel: str) -> str:
 def _build_tui_status_hint_line(snapshot: dict[str, object]) -> str:
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     return f"hint> {_build_tui_panel_hint(panel)}"
+
+
+def _build_tui_action_bar(snapshot: dict[str, object]) -> str:
+    panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
+    base = "actions> 1 overview | 2 activity | 3 timeline | 4 providers"
+    panel_actions = {
+        "overview": "/brief | /scan | /panel next",
+        "activity": "/activity | /remediate | /swarm --logs",
+        "timeline": "/trace | /timeline | /panel next",
+        "providers": "/providers | /provider <name> | /panel next",
+    }
+    return f"{base} || {panel_actions.get(panel, panel_actions['overview'])}"
 
 
 def _build_tui_panel_tabs(active_panel: str, *, width: int, snapshot: dict[str, object] | None = None) -> list[str]:
