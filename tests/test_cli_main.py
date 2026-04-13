@@ -1870,6 +1870,21 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
         ),
         encoding="utf-8",
     )
+    (tmp_path / "lsre-quick-action-last.json").write_text(
+        json.dumps(
+            {
+                "executed_at_utc": "2026-04-10T08:35:00+00:00",
+                "action_id": "1",
+                "title": "Active Alert",
+                "source": "focus",
+                "command": "/activity",
+                "status": "ok",
+                "output_preview": "Recent Activity | watch attention alerts=1 cycle=3",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     audit_log.write_text(
         "\n".join(
             [
@@ -1922,6 +1937,8 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert isinstance(snapshot["quick_action_items"], list)
     assert snapshot["quick_action_items"]
     assert snapshot["quick_action_items"][0]["id"] == "1"
+    assert snapshot["latest_quick_action"]["command"] == "/activity"
+    assert snapshot["quick_action_items"][0]["last_status"] == "ok"
 
 
 def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1995,17 +2012,20 @@ def test_render_quick_actions_text_lists_numbered_items(monkeypatch: pytest.Monk
         "_build_tui_dashboard_snapshot",
         lambda options: {
             "quick_action_items": [
-                {"id": "1", "title": "Focus", "source": "focus", "command": "/trace"},
+                {"id": "1", "title": "Focus", "source": "focus", "command": "/trace", "last_status": "ok", "last_output_preview": "Trace Summary ready"},
                 {"id": "2", "title": "Recommended", "source": "recommended", "command": "lazysre scan"},
-            ]
+            ],
+            "latest_quick_action": {"status": "ok", "command": "/trace"},
         },
     )
 
     rendered = _render_quick_actions_text({})
 
     assert "Quick Actions" in rendered
-    assert "1. [focus] Focus: /trace" in rendered
+    assert "1. [focus] Focus: /trace [last=ok]" in rendered
+    assert "last-output: Trace Summary ready" in rendered
     assert "2. [recommended] Recommended: lazysre scan" in rendered
+    assert "Last Run" in rendered
     assert "/do 1" in rendered
 
 
@@ -2254,9 +2274,10 @@ def test_build_tui_sidebar_lines_overview_shows_focus_section() -> None:
         "focus_body": "watch attention alerts=1 cycle=2",
         "focus_actions": ["/activity", "/scan"],
         "quick_action_items": [
-            {"id": "1", "title": "Active Alert", "source": "focus", "command": "/activity"},
+            {"id": "1", "title": "Active Alert", "source": "focus", "command": "/activity", "last_status": "ok"},
             {"id": "2", "title": "Recommended", "source": "recommended", "command": "/scan"},
         ],
+        "latest_quick_action": {"status": "ok", "command": "/activity", "output_preview": "Recent Activity ready"},
         "usable_targets": ["docker"],
         "configured_providers": ["mock"],
         "namespace": "default",
@@ -2280,6 +2301,7 @@ def test_build_tui_sidebar_lines_overview_shows_focus_section() -> None:
     assert "Focus:" in joined
     assert "Focus Actions:" in joined
     assert "Quick Actions:" in joined
+    assert "Last Quick Action:" in joined
     assert "/activity" in joined
 
 

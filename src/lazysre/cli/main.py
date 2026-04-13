@@ -5319,6 +5319,27 @@ def _load_latest_watch_snapshot(path: Path | None = None) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _latest_quick_action_file() -> Path:
+    return Path(settings.data_dir) / "lsre-quick-action-last.json"
+
+
+def _write_latest_quick_action_result(payload: dict[str, object]) -> Path:
+    path = _latest_quick_action_file()
+    _write_json_file(path, payload)
+    return path
+
+
+def _load_latest_quick_action_result(path: Path | None = None) -> dict[str, object]:
+    candidate = path or _latest_quick_action_file()
+    if not candidate.exists():
+        return {}
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _collect_watch_snapshot(
     *,
     cycle: int,
@@ -6105,6 +6126,17 @@ def _run_quick_action_item(*, options: dict[str, object], action_id: int, execut
     title = str(item.get("title", command)).strip() or command
     source = str(item.get("source", "suggested")).strip() or "suggested"
     ok, output = _run_suggested_command(command, options=options, execute_mode=execute_mode)
+    output_lines = [line.strip() for line in str(output or "").splitlines() if line.strip()]
+    payload = {
+        "executed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "action_id": str(action_id),
+        "title": title,
+        "source": source,
+        "command": command,
+        "status": "ok" if ok else "fail",
+        "output_preview": " | ".join(output_lines[:2])[:240],
+    }
+    _write_latest_quick_action_result(payload)
     snapshot = _build_tui_dashboard_snapshot(options)
     rendered = _render_quick_action_result(
         action_id=action_id,
@@ -6771,6 +6803,30 @@ def _build_quick_action_catalog(
     return items[:8]
 
 
+def _annotate_quick_action_catalog(
+    items: list[dict[str, str]],
+    *,
+    latest_result: dict[str, object],
+) -> list[dict[str, str]]:
+    annotated: list[dict[str, str]] = []
+    latest_command = str(latest_result.get("command", "")).strip()
+    latest_status = str(latest_result.get("status", "")).strip()
+    latest_summary = str(latest_result.get("output_preview", "")).strip()
+    latest_when = str(latest_result.get("executed_at_utc", "")).strip()
+    for raw in items:
+        item = dict(raw)
+        command = str(item.get("command", "")).strip()
+        if latest_command and command == latest_command:
+            if latest_status:
+                item["last_status"] = latest_status
+            if latest_summary:
+                item["last_output_preview"] = latest_summary[:120]
+            if latest_when:
+                item["last_executed_at_utc"] = latest_when
+        annotated.append({str(k): str(v) for k, v in item.items()})
+    return annotated
+
+
 def _infer_trace_stage(summary: str) -> str:
     text = str(summary or "").strip().lower()
     command = text.split("::")[-1].strip()
@@ -6903,7 +6959,21 @@ def _render_quick_actions_text(options: dict[str, object]) -> str:
         title = str(item.get("title", command)).strip() or command
         source = str(item.get("source", "suggested")).strip() or "suggested"
         action_id = str(item.get("id", "?")).strip() or "?"
-        lines.append(f"- {action_id}. [{source}] {title}: {command}")
+        status = str(item.get("last_status", "")).strip()
+        suffix = f" [last={status}]" if status else ""
+        lines.append(f"- {action_id}. [{source}] {title}: {command}{suffix}")
+        output_preview = str(item.get("last_output_preview", "")).strip()
+        if output_preview:
+            lines.append(f"  last-output: {output_preview}")
+    latest = snapshot.get("latest_quick_action", {})
+    if isinstance(latest, dict) and str(latest.get("command", "")).strip():
+        lines.extend(
+            [
+                "",
+                "Last Run",
+                f"- {latest.get('status', 'unknown')}: {latest.get('command', '')}",
+            ]
+        )
     lines.extend(["", "Usage", "- /do 1", "- /do 2"])
     return "\n".join(lines)
 
@@ -8710,6 +8780,11 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         recommended_commands=[str(item) for item in recommended_commands if str(item).strip()],
         watch_snapshot=recent_activity_context.get("watch", {}) if isinstance(recent_activity_context.get("watch", {}), dict) else {},
     )
+    latest_quick_action = _load_latest_quick_action_result()
+    quick_action_items = _annotate_quick_action_catalog(
+        quick_action_items,
+        latest_result=latest_quick_action,
+    )
     timeline_entries = [
         f"{item.get('time', '--:--')} [{item.get('stage', 'other')}/{item.get('status', 'info')}/{item.get('mode', '-')}] {item.get('summary', '')}"
         for item in timeline_entries_raw
@@ -8745,6 +8820,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "focus_body": str(focus_card.get("body", "")),
         "focus_actions": list(focus_card.get("actions", []))[:3] if isinstance(focus_card.get("actions", []), list) else [],
         "quick_action_items": quick_action_items,
+        "latest_quick_action": latest_quick_action,
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
         "active_provider": _resolve_runtime_provider_label(str(options.get("provider", "auto"))),
         "shortcuts": [
@@ -8793,6 +8869,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     quick_action_items = snapshot.get("quick_action_items", [])
     if not isinstance(quick_action_items, list):
         quick_action_items = []
+    latest_quick_action = snapshot.get("latest_quick_action", {})
+    if not isinstance(latest_quick_action, dict):
+        latest_quick_action = {}
     timeline_entries = snapshot.get("timeline_entries", [])
     if not isinstance(timeline_entries, list):
         timeline_entries = []
@@ -8829,8 +8908,22 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         *([ "├─ Activity Actions ──────────────────────────────────────────────┤"] + [f"│ {item}" for item in recent_activity_commands[:3]] if recent_activity_commands else []),
         *(
             ["├─ Quick Actions ───────────────────────────────────────────────┤"]
-            + [f"│ {item.get('id', '?')}. {item.get('command', '')}" for item in quick_action_items[:3] if isinstance(item, dict)]
+            + [
+                f"│ {item.get('id', '?')}. {item.get('command', '')}"
+                + (f" [last={item.get('last_status', '')}]" if str(item.get('last_status', '')).strip() else "")
+                for item in quick_action_items[:3]
+                if isinstance(item, dict)
+            ]
             if quick_action_items
+            else []
+        ),
+        *(
+            ["├─ Last Quick Action ───────────────────────────────────────────┤"]
+            + [
+                f"│ {latest_quick_action.get('status', 'unknown')}: {latest_quick_action.get('command', '')}",
+                f"│ {latest_quick_action.get('output_preview', '')}",
+            ]
+            if str(latest_quick_action.get("command", "")).strip()
             else []
         ),
         "├─ Recommended ───────────────────────────────────────────────────┤",
@@ -9041,6 +9134,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     quick_action_items = snapshot.get("quick_action_items", [])
     if not isinstance(quick_action_items, list):
         quick_action_items = []
+    latest_quick_action = snapshot.get("latest_quick_action", {})
+    if not isinstance(latest_quick_action, dict):
+        latest_quick_action = {}
     timeline_entries = snapshot.get("timeline_entries", [])
     if not isinstance(timeline_entries, list):
         timeline_entries = []
@@ -9151,10 +9247,22 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
                 continue
             lines.extend(
                 _wrap_tui_text_lines(
-                    f"- {raw.get('id', '?')}. {raw.get('command', '')}",
+                    f"- {raw.get('id', '?')}. {raw.get('command', '')}"
+                    + (f" [last={raw.get('last_status', '')}]" if str(raw.get('last_status', '')).strip() else ""),
                     width=width,
                 )
             )
+    if str(latest_quick_action.get("command", "")).strip():
+        lines.extend(["", "Last Quick Action:"])
+        lines.extend(
+            _wrap_tui_text_lines(
+                f"{latest_quick_action.get('status', 'unknown')}: {latest_quick_action.get('command', '')}",
+                width=width,
+            )
+        )
+        preview = str(latest_quick_action.get("output_preview", "")).strip()
+        if preview:
+            lines.extend(_wrap_tui_text_lines(preview, width=width))
     last_user = str(snapshot.get("last_user", "")).strip()
     if last_user:
         lines.extend(["", "Last Input:"])
