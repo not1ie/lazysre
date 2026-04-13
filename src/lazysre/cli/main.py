@@ -6081,29 +6081,39 @@ def _find_quick_action_item(options: dict[str, object], action_id: int) -> dict[
     return None
 
 
-def _run_suggested_command(command_text: str, *, options: dict[str, object], execute_mode: bool) -> bool:
+def _run_suggested_command(command_text: str, *, options: dict[str, object], execute_mode: bool) -> tuple[bool, str]:
     command = str(command_text or "").strip()
     if not command:
-        typer.echo("建议动作为空。")
-        return False
+        return False, "建议动作为空。"
     if command.startswith("/"):
         result = _handle_tui_input(command, {**options, "execute": execute_mode})
-        if str(result).strip():
-            typer.echo(str(result))
-        return True
-    return _run_action_command(command, options=options, execute_mode=execute_mode)
+        return True, str(result).strip()
+    state = {"ok": False}
+
+    def _callback() -> None:
+        state["ok"] = _run_action_command(command, options=options, execute_mode=execute_mode)
+
+    output = _capture_plain_output(_callback)
+    return bool(state["ok"]), output
 
 
-def _run_quick_action_item(*, options: dict[str, object], action_id: int, execute_mode: bool) -> bool:
+def _run_quick_action_item(*, options: dict[str, object], action_id: int, execute_mode: bool) -> tuple[bool, str]:
     item = _find_quick_action_item(options, action_id)
     if not item:
-        typer.echo(f"Quick action not found: {action_id}")
-        return False
+        return False, f"Quick action not found: {action_id}"
     command = str(item.get("command", "")).strip()
     title = str(item.get("title", command)).strip() or command
     source = str(item.get("source", "suggested")).strip() or "suggested"
-    typer.echo(f"Running quick action {action_id} [{source}]: {title}")
-    return _run_suggested_command(command, options=options, execute_mode=execute_mode)
+    ok, output = _run_suggested_command(command, options=options, execute_mode=execute_mode)
+    snapshot = _build_tui_dashboard_snapshot(options)
+    rendered = _render_quick_action_result(
+        action_id=action_id,
+        item={**item, "title": title, "source": source, "command": command},
+        ok=ok,
+        output=output,
+        snapshot=snapshot,
+    )
+    return ok, rendered
 
 
 def _latest_autopilot_file() -> Path:
@@ -6895,6 +6905,44 @@ def _render_quick_actions_text(options: dict[str, object]) -> str:
         action_id = str(item.get("id", "?")).strip() or "?"
         lines.append(f"- {action_id}. [{source}] {title}: {command}")
     lines.extend(["", "Usage", "- /do 1", "- /do 2"])
+    return "\n".join(lines)
+
+
+def _render_quick_action_result(
+    *,
+    action_id: int,
+    item: dict[str, str],
+    ok: bool,
+    output: str,
+    snapshot: dict[str, object],
+) -> str:
+    title = str(item.get("title", item.get("command", ""))).strip() or str(item.get("command", "")).strip()
+    source = str(item.get("source", "suggested")).strip() or "suggested"
+    command = str(item.get("command", "")).strip()
+    lines = [
+        "Quick Action Result",
+        f"- Action: {action_id}. [{source}] {title}",
+        f"- Command: {command or '-'}",
+        f"- Status: {'success' if ok else 'failed'}",
+    ]
+    output_lines = [line for line in str(output or "").splitlines() if str(line).strip()]
+    if output_lines:
+        lines.extend(["", "Output"])
+        preview = output_lines[:10]
+        lines.extend(f"- {line}" for line in preview)
+        if len(output_lines) > len(preview):
+            lines.append(f"- ... ({len(output_lines) - len(preview)} more lines)")
+    focus_title = str(snapshot.get("focus_title", "")).strip()
+    focus_body = str(snapshot.get("focus_body", "")).strip()
+    if focus_title or focus_body:
+        lines.extend(["", "Focus Now", f"- {focus_title or 'Focus'}: {focus_body or '-'}"])
+    items = snapshot.get("quick_action_items", [])
+    if isinstance(items, list) and items:
+        lines.extend(["", "Next Quick Actions"])
+        for raw in items[:3]:
+            if not isinstance(raw, dict):
+                continue
+            lines.append(f"- /do {raw.get('id', '?')}: {raw.get('command', '')}")
     return "\n".join(lines)
 
 
@@ -9499,16 +9547,16 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
         action_id = _safe_int(normalized[len("/actions ") :].strip())
         if action_id <= 0:
             return "用法：/actions 1"
-        _run_quick_action_item(options=options, action_id=action_id, execute_mode=bool(options.get("execute", False)))
-        return ""
+        _, rendered = _run_quick_action_item(options=options, action_id=action_id, execute_mode=bool(options.get("execute", False)))
+        return rendered
     if lowered in {"/do", "/do show"}:
         return _render_quick_actions_text(options)
     if lowered.startswith("/do "):
         action_id = _safe_int(normalized[len("/do ") :].strip())
         if action_id <= 0:
             return "用法：/do 1"
-        _run_quick_action_item(options=options, action_id=action_id, execute_mode=bool(options.get("execute", False)))
-        return ""
+        _, rendered = _run_quick_action_item(options=options, action_id=action_id, execute_mode=bool(options.get("execute", False)))
+        return rendered
     if lowered.startswith("/activity"):
         return _render_recent_activity_text(options)
     if lowered.startswith("/focus"):
@@ -9813,11 +9861,12 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             if action_id <= 0:
                 typer.echo("用法：/actions 1")
             else:
-                _run_quick_action_item(
+                _, rendered = _run_quick_action_item(
                     options={**options, "execute": runtime_execute},
                     action_id=action_id,
                     execute_mode=runtime_execute,
                 )
+                typer.echo(rendered)
             continue
         if text.lower() in {"/do", "/do show"}:
             typer.echo(_render_quick_actions_text({**options, "execute": runtime_execute}))
@@ -9827,11 +9876,12 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             if action_id <= 0:
                 typer.echo("用法：/do 1")
             else:
-                _run_quick_action_item(
+                _, rendered = _run_quick_action_item(
                     options={**options, "execute": runtime_execute},
                     action_id=action_id,
                     execute_mode=runtime_execute,
                 )
+                typer.echo(rendered)
             continue
         if text.lower().startswith("/activity"):
             typer.echo(_render_recent_activity_text({**options, "execute": runtime_execute}))
@@ -10733,7 +10783,10 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
         if action_id <= 0:
             typer.echo("请指定要执行的行动编号，例如：执行第1个建议")
             return True
-        if not _run_quick_action_item(options=options, action_id=action_id, execute_mode=execute_mode):
+        ok, rendered = _run_quick_action_item(options=options, action_id=action_id, execute_mode=execute_mode)
+        if ok:
+            typer.echo(rendered)
+        else:
             snapshot = _load_latest_watch_snapshot(None)
             inbox = _build_action_inbox_from_watch(snapshot)
             _run_action_inbox_item(

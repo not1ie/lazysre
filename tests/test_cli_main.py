@@ -2353,26 +2353,38 @@ def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:
 
 def test_handle_tui_input_do_runs_quick_action(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, object]] = []
-
-    monkeypatch.setattr(
-        cli_main,
-        "_build_tui_dashboard_snapshot",
-        lambda options: {
+    snapshots = [
+        {
             "quick_action_items": [
                 {"id": "1", "title": "Focus", "source": "focus", "command": "/trace"}
             ]
         },
+        {
+            "focus_title": "Recent Failure",
+            "focus_body": "08:31 [apply/exec] docker service update --force api",
+            "quick_action_items": [
+                {"id": "1", "title": "Trace", "source": "focus", "command": "/trace"}
+            ],
+        },
+    ]
+
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: snapshots.pop(0),
     )
 
-    def fake_run(command_text: str, *, options: dict[str, object], execute_mode: bool) -> bool:
+    def fake_run(command_text: str, *, options: dict[str, object], execute_mode: bool) -> tuple[bool, str]:
         calls.append({"command_text": command_text, "options": options, "execute_mode": execute_mode})
-        return True
+        return True, "Trace Summary\n- steps=3 ok=3 fail=0"
 
     monkeypatch.setattr(cli_main, "_run_suggested_command", fake_run)
 
     out = _handle_tui_input("/do 1", {"execute": False})
 
-    assert out == ""
+    assert "Quick Action Result" in out
+    assert "Trace Summary" in out
+    assert "Focus Now" in out
     assert calls[0]["command_text"] == "/trace"
     assert calls[0]["execute_mode"] is False
 
