@@ -6618,6 +6618,53 @@ def _build_recent_trace_summary(timeline: list[dict[str, str]]) -> list[str]:
     return lines
 
 
+def _build_tui_focus_card(
+    *,
+    recent_activity: list[str],
+    recent_activity_commands: list[str],
+    provider_report: dict[str, object],
+    timeline: list[dict[str, str]],
+) -> dict[str, object]:
+    latest_failure = next(
+        (
+            item
+            for item in reversed(timeline)
+            if isinstance(item, dict) and str(item.get("status", "")).strip().lower() == "fail"
+        ),
+        None,
+    )
+    if isinstance(latest_failure, dict):
+        return {
+            "title": "Recent Failure",
+            "body": (
+                f"{latest_failure.get('time', '--:--')} "
+                f"[{latest_failure.get('stage', 'other')}/{latest_failure.get('mode', '-')}] "
+                f"{str(latest_failure.get('summary', ''))[:120]}"
+            ).strip(),
+            "actions": ["/trace", "/timeline"],
+        }
+    alert = next((item for item in recent_activity if "attention" in str(item).lower()), "")
+    if str(alert).strip():
+        actions = [cmd for cmd in recent_activity_commands[:2] if str(cmd).strip()] or ["/activity", "/scan"]
+        return {
+            "title": "Active Alert",
+            "body": str(alert).strip()[:140],
+            "actions": actions,
+        }
+    if isinstance(provider_report, dict) and not bool(provider_report.get("active_ready")):
+        detail = str(provider_report.get("active_detail", "") or provider_report.get("active_hint", "")).strip()
+        return {
+            "title": "Provider Needs Setup",
+            "body": detail[:140] or "当前 active provider 尚未就绪，先检查 provider/runtime 配置。",
+            "actions": ["/providers", "/provider auto"],
+        }
+    return {
+        "title": "Ready",
+        "body": "当前没有明显阻塞，建议从 /brief、/scan 或 /activity 开始下一轮检查。",
+        "actions": ["/brief", "/scan"],
+    }
+
+
 def _infer_trace_stage(summary: str) -> str:
     text = str(summary or "").strip().lower()
     command = text.split("::")[-1].strip()
@@ -6720,6 +6767,19 @@ def _render_recent_activity_text(options: dict[str, object]) -> str:
     lines = ["Recent Activity", *[f"- {item}" for item in items]]
     if commands:
         lines.extend(["", "Suggested Next Commands", *[f"- {item}" for item in commands]])
+    return "\n".join(lines)
+
+
+def _render_focus_text(options: dict[str, object]) -> str:
+    snapshot = _build_tui_dashboard_snapshot(options)
+    focus_title = str(snapshot.get("focus_title", "")).strip() or "Focus"
+    focus_body = str(snapshot.get("focus_body", "")).strip() or "当前没有明显阻塞。"
+    focus_actions = snapshot.get("focus_actions", [])
+    if not isinstance(focus_actions, list):
+        focus_actions = []
+    lines = ["Focus", f"- {focus_title}: {focus_body}"]
+    if focus_actions:
+        lines.extend(["", "Suggested Next Commands", *[f"- {item}" for item in focus_actions]])
     return "\n".join(lines)
 
 
@@ -8336,6 +8396,7 @@ def _render_chat_short_help() -> None:
         "LazySRE Chat 快捷命令",
         "- /help: 查看帮助",
         "- /activity: 查看最近巡检、修复计划和审计轨迹，并给出建议下一步",
+        "- /focus: 查看当前最值得关注的异常/阻塞与建议动作",
         "- /timeline: 查看最近执行时间线（命令、状态、dry-run/exec）",
         "- /trace: 查看最近一次操作链路的摘要（成功/失败、dry-run/exec、top tools）",
         "- /panel [overview|activity|timeline|providers|next|1-4]: 切换 TUI 左侧面板",
@@ -8472,6 +8533,12 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))).expanduser(),
         limit=4,
     )
+    focus_card = _build_tui_focus_card(
+        recent_activity=recent_activity,
+        recent_activity_commands=list(recent_activity_context.get("commands", [])),
+        provider_report=provider_report,
+        timeline=timeline_entries_raw,
+    )
     timeline_entries = [
         f"{item.get('time', '--:--')} [{item.get('stage', 'other')}/{item.get('status', 'info')}/{item.get('mode', '-')}] {item.get('summary', '')}"
         for item in timeline_entries_raw
@@ -8503,12 +8570,16 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "provider_report": provider_report,
         "timeline_entries": timeline_entries,
         "trace_summary": trace_summary,
+        "focus_title": str(focus_card.get("title", "")),
+        "focus_body": str(focus_card.get("body", "")),
+        "focus_actions": list(focus_card.get("actions", []))[:3] if isinstance(focus_card.get("actions", []), list) else [],
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
         "active_provider": _resolve_runtime_provider_label(str(options.get("provider", "auto"))),
         "shortcuts": [
             "/brief",
             "/scan",
             "/activity",
+            "/focus",
             "/timeline",
             "/trace",
             "/panel next",
@@ -8543,6 +8614,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     recent_activity_commands = snapshot.get("recent_activity_commands", [])
     if not isinstance(recent_activity_commands, list):
         recent_activity_commands = []
+    focus_actions = snapshot.get("focus_actions", [])
+    if not isinstance(focus_actions, list):
+        focus_actions = []
     timeline_entries = snapshot.get("timeline_entries", [])
     if not isinstance(timeline_entries, list):
         timeline_entries = []
@@ -8562,6 +8636,8 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         "├─ Brief ─────────────────────────────────────────────────────────┤",
         f"│ status={snapshot.get('status', '-')}",
         f"│ headline={snapshot.get('headline', '-')}",
+        "├─ Focus ─────────────────────────────────────────────────────────┤",
+        f"│ {snapshot.get('focus_title', 'Focus')}: {snapshot.get('focus_body', '-')}",
         "├─ Target ────────────────────────────────────────────────────────┤",
         f"│ active_provider={snapshot.get('active_provider', '-')}",
         f"│ usable_targets={', '.join(str(x) for x in usable_targets) or '(none)'}",
@@ -8573,6 +8649,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         f"│ last_user={snapshot.get('last_user', '-') or '-'}",
         "├─ Recent Activity ───────────────────────────────────────────────┤",
         *[f"│ {item}" for item in recent_activity[:4]],
+        *([ "├─ Focus Actions ────────────────────────────────────────────────┤"] + [f"│ {item}" for item in focus_actions[:2]] if focus_actions else []),
         *([ "├─ Activity Actions ──────────────────────────────────────────────┤"] + [f"│ {item}" for item in recent_activity_commands[:3]] if recent_activity_commands else []),
         "├─ Recommended ───────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in recommended[:4]],
@@ -8776,6 +8853,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     recent_activity_commands = snapshot.get("recent_activity_commands", [])
     if not isinstance(recent_activity_commands, list):
         recent_activity_commands = []
+    focus_actions = snapshot.get("focus_actions", [])
+    if not isinstance(focus_actions, list):
+        focus_actions = []
     timeline_entries = snapshot.get("timeline_entries", [])
     if not isinstance(timeline_entries, list):
         timeline_entries = []
@@ -8792,6 +8872,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         f"panel: {panel}",
         f"hint: {snapshot.get('panel_hint', '-')}",
         f"status: {snapshot.get('status', '-')}",
+        f"focus: {snapshot.get('focus_title', '-')}",
         f"mode: {snapshot.get('mode', '-')}",
         f"provider: {snapshot.get('provider', '-')}",
         f"model: {snapshot.get('model', '-')}",
@@ -8870,6 +8951,14 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     if headline:
         lines.extend(["", "Brief:"])
         lines.extend(_wrap_tui_text_lines(headline, width=width))
+    focus_body = str(snapshot.get("focus_body", "")).strip()
+    if focus_body:
+        lines.extend(["", "Focus:"])
+        lines.extend(_wrap_tui_text_lines(focus_body, width=width))
+    if focus_actions:
+        lines.extend(["", "Focus Actions:"])
+        for item in focus_actions[:3]:
+            lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
     last_user = str(snapshot.get("last_user", "")).strip()
     if last_user:
         lines.extend(["", "Last Input:"])
@@ -8951,7 +9040,7 @@ def _build_tui_action_bar(snapshot: dict[str, object]) -> str:
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     base = "actions> 1 overview | 2 activity | 3 timeline | 4 providers"
     panel_actions = {
-        "overview": "/brief | /scan | /panel next",
+        "overview": "/focus | /brief | /scan",
         "activity": "/activity | /remediate | /swarm --logs",
         "timeline": "/trace | /timeline | /panel next",
         "providers": "/providers | /provider <name> | /panel next",
@@ -9056,7 +9145,7 @@ def _switch_tui_panel(options: dict[str, object], requested: str) -> str:
 
 
 def _tui_welcome_message() -> str:
-    return "全屏 TUI 已启动。输入自然语言，或使用 /activity /trace /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板。"
+    return "全屏 TUI 已启动。输入自然语言，或使用 /focus /activity /trace /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板。"
 
 
 def _cycle_tui_input_history(
@@ -9121,6 +9210,7 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/provider auto",
             "/provider mock",
             "/activity",
+            "/focus",
             "/timeline",
             "/trace",
             "/panel overview",
@@ -9255,6 +9345,8 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
         return _render_tui_demo_text(_build_tui_dashboard_snapshot(options))
     if lowered.startswith("/activity"):
         return _render_recent_activity_text(options)
+    if lowered.startswith("/focus"):
+        return _render_focus_text(options)
     if lowered.startswith("/timeline"):
         return _render_timeline_text(options)
     if lowered.startswith("/trace"):
@@ -9480,6 +9572,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "memory",
         "apply",
         "activity",
+        "focus",
         "timeline",
     ]
     corrected = aliases.get(command, "")
@@ -9547,6 +9640,9 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower().startswith("/activity"):
             typer.echo(_render_recent_activity_text({**options, "execute": runtime_execute}))
+            continue
+        if text.lower().startswith("/focus"):
+            typer.echo(_render_focus_text({**options, "execute": runtime_execute}))
             continue
         if text.lower().startswith("/timeline"):
             typer.echo(_render_timeline_text({**options, "execute": runtime_execute}))

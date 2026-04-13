@@ -132,6 +132,7 @@ from lazysre.cli.main import (
     _build_tui_dashboard_snapshot,
     _render_tui_demo_text,
     _render_recent_activity_text,
+    _render_focus_text,
     _render_trace_text,
     _render_timeline_text,
     _build_tui_footer_line,
@@ -823,9 +824,11 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/refresh" in rendered
     assert "/providers" in rendered
     assert "/activity" in rendered
+    assert "/focus" in rendered
     assert "/trace" in rendered
     assert "/timeline" in rendered
     assert "/panel next" in rendered
+    assert "Focus" in rendered
     assert "Recent Activity" in rendered
     assert "Command Trail" in rendered
     assert "Trace Summary" in rendered
@@ -1910,6 +1913,8 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert "/activity" in snapshot["recent_activity_commands"]
     assert "/swarm --service api --logs" in snapshot["recent_activity_commands"]
     assert any("08:30 [observe/ok/exec] docker service ls" in item for item in snapshot["timeline_entries"])
+    assert snapshot["focus_title"] == "Active Alert"
+    assert "/activity" in snapshot["focus_actions"]
 
 
 def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1941,7 +1946,40 @@ def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monk
     assert "watch attention alerts=1 cycle=2" in rendered
     assert "Suggested Next Commands" in rendered
     assert "/activity" in rendered
-    assert "/swarm --service payment --logs" in rendered
+
+
+def test_render_focus_text_prefers_recent_failure(tmp_path: Path) -> None:
+    audit_log = tmp_path / "audit.jsonl"
+    audit_log.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-10T08:30:00+00:00",
+                        "status": "ok",
+                        "command": ["docker", "service", "ls"],
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-10T08:31:00+00:00",
+                        "status": "fail",
+                        "command": ["docker", "service", "update", "--force", "api"],
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rendered = _render_focus_text({"audit_log": str(audit_log), "provider": "mock"})
+
+    assert "Recent Failure" in rendered
+    assert "/trace" in rendered
+    assert "/timeline" in rendered
 
 
 def test_render_timeline_text_includes_audit_entries(tmp_path: Path) -> None:
@@ -2128,9 +2166,11 @@ def test_build_tui_status_hint_line_uses_panel() -> None:
 
 
 def test_build_tui_action_bar_changes_by_panel() -> None:
+    overview_bar = _build_tui_action_bar({"sidebar_panel": "overview"})
     timeline_bar = _build_tui_action_bar({"sidebar_panel": "timeline"})
     provider_bar = _build_tui_action_bar({"sidebar_panel": "providers"})
 
+    assert "/focus" in overview_bar
     assert "/trace" in timeline_bar
     assert "/providers" in provider_bar
     assert "1 overview" in timeline_bar
@@ -2143,6 +2183,9 @@ def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
         "mode": "dry-run",
         "provider": "auto",
         "model": "gpt-5.4-mini",
+        "focus_title": "Recent Failure",
+        "focus_body": "08:31 [apply/exec] docker service update --force api",
+        "focus_actions": ["/trace", "/timeline"],
         "usable_targets": ["docker", "kubernetes"],
         "configured_providers": ["openai", "compatible"],
         "namespace": "ops",
@@ -2167,6 +2210,42 @@ def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
     assert "Execution Timeline:" in joined
     assert "Command Trail:" in joined
     assert "Recent Activity:" not in joined
+
+
+def test_build_tui_sidebar_lines_overview_shows_focus_section() -> None:
+    snapshot = {
+        "sidebar_panel": "overview",
+        "panel_hint": _build_tui_panel_hint("overview"),
+        "status": "attention",
+        "mode": "dry-run",
+        "provider": "auto",
+        "model": "gpt-5.4-mini",
+        "focus_title": "Active Alert",
+        "focus_body": "watch attention alerts=1 cycle=2",
+        "focus_actions": ["/activity", "/scan"],
+        "usable_targets": ["docker"],
+        "configured_providers": ["mock"],
+        "namespace": "default",
+        "ssh_target": "",
+        "prometheus_url": "",
+        "session_turns": 1,
+        "timeline_entries": [],
+        "trace_summary": [],
+        "recent_commands": [],
+        "recent_activity": [],
+        "recent_activity_commands": [],
+        "recommended_commands": ["/scan"],
+        "shortcuts": ["/focus", "/brief", "/scan"],
+        "headline": "当前环境可直接巡检",
+        "last_user": "检查当前环境",
+    }
+
+    joined = "\n".join(_build_tui_sidebar_lines(snapshot, width=36))
+
+    assert "focus: Active Alert" in joined
+    assert "Focus:" in joined
+    assert "Focus Actions:" in joined
+    assert "/activity" in joined
 
 
 def test_build_tui_sidebar_lines_shows_empty_state_for_provider_panel() -> None:
