@@ -4045,6 +4045,100 @@ def _build_environment_landscape(report: dict[str, object]) -> dict[str, object]
     }
 
 
+def _infer_runtime_targets(target: TargetEnvironment) -> list[str]:
+    inferred_targets: list[str] = []
+    if shutil.which("docker"):
+        inferred_targets.append("docker")
+    if str(target.ssh_target or settings.target_ssh_target or "").strip():
+        inferred_targets.append("remote-ssh")
+    if str(target.k8s_context or "").strip() or str(target.k8s_api_url or "").strip():
+        inferred_targets.append("kubernetes")
+    if str(target.prometheus_url or settings.target_prometheus_url or "").strip():
+        inferred_targets.append("prometheus")
+    watch_snapshot = _load_latest_watch_snapshot(None)
+    if isinstance(watch_snapshot, dict):
+        watch_targets = watch_snapshot.get("usable_targets", [])
+        if isinstance(watch_targets, list):
+            inferred_targets.extend(str(item).strip() for item in watch_targets if str(item).strip())
+    return _dedupe_strings(inferred_targets)
+
+
+def _build_environment_drift(marker: dict[str, object], current_targets: list[str]) -> dict[str, object]:
+    if not isinstance(marker, dict) or not marker:
+        return {"exists": False, "status": "unknown", "headline": "", "signals": [], "top_actions": []}
+    baseline_raw = marker.get("usable_targets", [])
+    baseline = [str(item).strip() for item in baseline_raw] if isinstance(baseline_raw, list) else []
+    current = [str(item).strip() for item in current_targets if str(item).strip()]
+
+    def _normalize_targets(items: list[str]) -> set[str]:
+        normalized: set[str] = set()
+        for item in items:
+            text = str(item).strip().lower()
+            if not text:
+                continue
+            normalized.add("docker" if text == "docker-swarm" else text)
+        return normalized
+
+    baseline_set = _normalize_targets(baseline)
+    current_set = _normalize_targets(current)
+    added = sorted(item for item in current_set if item not in baseline_set)
+    removed = sorted(item for item in baseline_set if item not in current_set)
+
+    generated_raw = str(marker.get("generated_at_utc", "")).strip()
+    age_hours = 0.0
+    if generated_raw:
+        try:
+            generated_dt = datetime.fromisoformat(generated_raw.replace("Z", "+00:00"))
+            age_hours = max(0.0, (datetime.now(timezone.utc) - generated_dt).total_seconds() / 3600.0)
+        except Exception:
+            age_hours = 0.0
+
+    signals: list[str] = [
+        f"baseline={','.join(sorted(baseline_set)) or '(none)'}",
+        f"current={','.join(sorted(current_set)) or '(none)'}",
+    ]
+    if added:
+        signals.append(f"added={','.join(added)}")
+    if removed:
+        signals.append(f"removed={','.join(removed)}")
+    if age_hours >= 24:
+        signals.append(f"baseline_age_hours={age_hours:.1f}")
+
+    top_actions = ["lazysre scan", "lazysre brief"]
+    if "docker" in removed:
+        top_actions.append("docker info")
+    if "kubernetes" in removed:
+        top_actions.append("kubectl config current-context")
+    if "remote-ssh" in removed:
+        top_actions.append("lazysre connect root@host")
+
+    if added or removed:
+        headline = (
+            "环境基线发生漂移："
+            + (f"新增 {','.join(added)} " if added else "")
+            + (f"缺失 {','.join(removed)}" if removed else "")
+        ).strip()
+        status = "changed"
+    elif age_hours >= 24:
+        headline = f"环境基线已过期（{age_hours:.1f}h），建议刷新扫描。"
+        status = "stale"
+    else:
+        headline = "环境基线稳定，当前运行时目标与基线一致。"
+        status = "stable"
+
+    return {
+        "exists": True,
+        "status": status,
+        "headline": headline,
+        "signals": _dedupe_strings(signals)[:6],
+        "top_actions": _dedupe_strings(top_actions)[:4],
+        "baseline_targets": sorted(baseline_set),
+        "current_targets": sorted(current_set),
+        "added_targets": added,
+        "removed_targets": removed,
+    }
+
+
 def _non_empty_lines(text: str) -> list[str]:
     return [line.strip() for line in str(text or "").splitlines() if line.strip()]
 
@@ -7108,6 +7202,7 @@ def _build_tui_focus_card(
     recent_activity_commands: list[str],
     provider_report: dict[str, object],
     timeline: list[dict[str, str]],
+    environment_drift: dict[str, object] | None = None,
     incident_session: dict[str, object] | None = None,
     watch_snapshot: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -7148,6 +7243,14 @@ def _build_tui_focus_card(
                 f"{str(posture.get('summary', '')).strip()}"
             ).strip()[:140],
             "actions": normalized_actions[:2] or ["/activity", "/swarm --logs"],
+        }
+    if isinstance(environment_drift, dict) and str(environment_drift.get("status", "")).strip() in {"changed", "stale"}:
+        actions = environment_drift.get("top_actions", [])
+        normalized_actions = [str(item).strip() for item in actions if str(item).strip()] if isinstance(actions, list) else []
+        return {
+            "title": "Environment Drift",
+            "body": str(environment_drift.get("headline", "")).strip()[:140],
+            "actions": normalized_actions[:2] or ["/drift", "/scan"],
         }
     if isinstance(incident_session, dict) and bool(incident_session.get("exists")):
         headline = str(incident_session.get("headline", "")).strip()
@@ -7256,6 +7359,7 @@ def _annotate_quick_action_catalog(
                 item["last_executed_at_utc"] = latest_when
         item["kind"] = _classify_quick_action_kind(command)
         item["risk"] = _classify_quick_action_risk(command)
+        item["confidence"] = _classify_quick_action_confidence(item)
         annotated.append({str(k): str(v) for k, v in item.items()})
     return annotated
 
@@ -7463,6 +7567,25 @@ def _render_focus_text(options: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _render_environment_drift_text(options: dict[str, object]) -> str:
+    snapshot = _build_tui_dashboard_snapshot(options)
+    drift = snapshot.get("environment_drift", {})
+    if not isinstance(drift, dict) or not bool(drift.get("exists")):
+        return "Environment Drift\n- 暂无基线信息。先运行 /scan 或 /brief 建立环境基线。"
+    lines = [
+        "Environment Drift",
+        f"- Status: {drift.get('status', '-')}",
+        f"- Headline: {drift.get('headline', '-')}",
+    ]
+    signals = drift.get("signals", [])
+    if isinstance(signals, list) and signals:
+        lines.extend(["", "Signals", *[f"- {str(item)}" for item in signals[:5]]])
+    actions = drift.get("top_actions", [])
+    if isinstance(actions, list) and actions:
+        lines.extend(["", "Suggested Next Commands", *[f"- {str(item)}" for item in actions[:4]]])
+    return "\n".join(lines)
+
+
 def _render_quick_actions_text(options: dict[str, object]) -> str:
     snapshot = _build_tui_dashboard_snapshot(options)
     items = snapshot.get("quick_action_items", [])
@@ -7541,6 +7664,9 @@ def _build_tui_state_card(snapshot: dict[str, object]) -> dict[str, str]:
     incident_session = snapshot.get("incident_session", {})
     if not isinstance(incident_session, dict):
         incident_session = {}
+    environment_drift = snapshot.get("environment_drift", {})
+    if not isinstance(environment_drift, dict):
+        environment_drift = {}
     latest = snapshot.get("latest_quick_action", {})
     if not isinstance(latest, dict):
         latest = {}
@@ -7557,6 +7683,12 @@ def _build_tui_state_card(snapshot: dict[str, object]) -> dict[str, str]:
             next_line = str(incident_commands[0])[:72]
         else:
             next_line = str(incident_session.get("next_step", "")).strip()[:72] or "-"
+    elif str(environment_drift.get("status", "")).strip() in {"changed", "stale"}:
+        drift_actions = environment_drift.get("top_actions", [])
+        if isinstance(drift_actions, list) and drift_actions:
+            next_line = str(drift_actions[0])[:72]
+        else:
+            next_line = "/drift"
     else:
         quick_actions = snapshot.get("quick_action_items", [])
         if isinstance(quick_actions, list):
@@ -7640,6 +7772,28 @@ def _classify_quick_action_risk(command_text: str) -> str:
     return str(assess_command(tokens).risk_level or "unknown")
 
 
+def _classify_quick_action_confidence(item: dict[str, object]) -> str:
+    source = str(item.get("source", "")).strip().lower()
+    kind = str(item.get("kind", "")).strip().lower()
+    risk = str(item.get("risk", "")).strip().lower()
+    command = str(item.get("command", "")).strip().lower()
+    if risk in {"high", "critical"}:
+        return "low"
+    if source.startswith("watch/") and risk == "low":
+        return "high"
+    if source == "focus" and risk == "low":
+        return "high"
+    if kind == "inspect" and risk == "low":
+        return "high"
+    if kind in {"inspect", "remote"} and risk in {"medium"}:
+        return "medium"
+    if command.startswith("/do"):
+        return "medium"
+    if risk in {"unknown"}:
+        return "low"
+    return "medium"
+
+
 def _format_quick_action_line(item: dict[str, object]) -> str:
     action_id = str(item.get("id", "?")).strip() or "?"
     command = str(item.get("command", "")).strip() or "-"
@@ -7647,9 +7801,10 @@ def _format_quick_action_line(item: dict[str, object]) -> str:
     source = str(item.get("source", "suggested")).strip() or "suggested"
     kind = str(item.get("kind", "")).strip() or _classify_quick_action_kind(command)
     risk = str(item.get("risk", "")).strip() or _classify_quick_action_risk(command)
+    confidence = str(item.get("confidence", "")).strip() or _classify_quick_action_confidence(item)
     status = str(item.get("last_status", "")).strip()
     suffix = f" [last={status}]" if status else ""
-    return f"{action_id}. [{kind}][{risk}][{source}] {title}{suffix}"
+    return f"{action_id}. [{kind}][{risk}][{source}] {title}{suffix} [conf={confidence}]"
 
 
 def _format_quick_action_command(item: dict[str, object]) -> str:
@@ -9364,6 +9519,8 @@ def _render_chat_short_help() -> None:
 def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, object]:
     target = TargetEnvStore().load()
     marker = _load_onboarding_marker()
+    runtime_targets = _infer_runtime_targets(target)
+    environment_drift = _build_environment_drift(marker if isinstance(marker, dict) else {}, runtime_targets)
     briefing = marker.get("briefing", {}) if isinstance(marker, dict) else {}
     if not isinstance(briefing, dict):
         briefing = {}
@@ -9399,16 +9556,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
             }
         )
     if not usable_targets:
-        inferred_targets: list[str] = []
-        if shutil.which("docker"):
-            inferred_targets.append("docker")
-        if str(target.ssh_target or settings.target_ssh_target or "").strip():
-            inferred_targets.append("remote-ssh")
-        if str(target.k8s_context or "").strip() or str(target.k8s_api_url or "").strip():
-            inferred_targets.append("kubernetes")
-        if str(target.prometheus_url or settings.target_prometheus_url or "").strip():
-            inferred_targets.append("prometheus")
-        usable_targets = inferred_targets
+        usable_targets = list(runtime_targets)
     recommended_commands = []
     next_step = str(briefing.get("next", "")).strip()
     if next_step:
@@ -9434,6 +9582,19 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     recent_activity = recent_activity_context.get("items", [])
     if not isinstance(recent_activity, list):
         recent_activity = []
+    recent_activity_commands = recent_activity_context.get("commands", [])
+    if not isinstance(recent_activity_commands, list):
+        recent_activity_commands = []
+    if str(environment_drift.get("status", "")).strip() in {"changed", "stale"}:
+        drift_headline = str(environment_drift.get("headline", "")).strip()
+        if drift_headline:
+            recent_activity = [f"env drift | {drift_headline[:92]}", *recent_activity]
+        drift_actions = environment_drift.get("top_actions", [])
+        if isinstance(drift_actions, list):
+            recent_activity_commands = _dedupe_strings(
+                [str(item).strip() for item in drift_actions if str(item).strip()] + [str(item).strip() for item in recent_activity_commands if str(item).strip()]
+            )[:4]
+            recommended_commands.extend(str(item).strip() for item in drift_actions if str(item).strip())
     incident_session = recent_activity_context.get("incident_session", {})
     if not isinstance(incident_session, dict):
         incident_session = {}
@@ -9444,16 +9605,17 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     )
     focus_card = _build_tui_focus_card(
         recent_activity=recent_activity,
-        recent_activity_commands=list(recent_activity_context.get("commands", [])),
+        recent_activity_commands=recent_activity_commands,
         provider_report=provider_report,
         timeline=timeline_entries_raw,
+        environment_drift=environment_drift,
         incident_session=incident_session,
         watch_snapshot=recent_activity_context.get("watch", {}) if isinstance(recent_activity_context.get("watch", {}), dict) else {},
     )
     quick_action_items = _build_quick_action_catalog(
         focus_title=str(focus_card.get("title", "")),
         focus_actions=list(focus_card.get("actions", [])) if isinstance(focus_card.get("actions", []), list) else [],
-        recent_activity_commands=list(recent_activity_context.get("commands", [])),
+        recent_activity_commands=recent_activity_commands,
         recommended_commands=[str(item) for item in recommended_commands if str(item).strip()],
         watch_snapshot=recent_activity_context.get("watch", {}) if isinstance(recent_activity_context.get("watch", {}), dict) else {},
     )
@@ -9498,9 +9660,10 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "last_user": last_user[:120],
         "recent_commands": recent_commands[-3:],
         "recent_activity": recent_activity,
-        "recent_activity_commands": recent_activity_context.get("commands", []),
+        "recent_activity_commands": recent_activity_commands,
         "swarm_posture": recent_activity_context.get("swarm_posture", {}) if isinstance(recent_activity_context.get("swarm_posture", {}), dict) else {},
         "incident_session": incident_session,
+        "environment_drift": environment_drift,
         "sidebar_panel": _normalize_tui_panel_name(str(options.get("tui_panel", "overview"))),
         "panel_hint": _build_tui_panel_hint(_normalize_tui_panel_name(str(options.get("tui_panel", "overview")))),
         "provider_report": provider_report,
@@ -9516,6 +9679,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "shortcuts": [
             "/brief",
             "/scan",
+            "/drift",
             "/activity",
             "/focus",
             "/do 1",
@@ -9577,6 +9741,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     swarm_posture = snapshot.get("swarm_posture", {})
     if not isinstance(swarm_posture, dict):
         swarm_posture = {}
+    environment_drift = snapshot.get("environment_drift", {})
+    if not isinstance(environment_drift, dict):
+        environment_drift = {}
     incident_session = snapshot.get("incident_session", {})
     if not isinstance(incident_session, dict):
         incident_session = {}
@@ -9616,6 +9783,13 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
             + ([f"│ {incident_session.get('stage_flow', '')}"] if str(incident_session.get("stage_flow", "")).strip() else [])
             + ([f"│ next={incident_session.get('next_step', '')}"] if str(incident_session.get("next_step", "")).strip() else [])
             if bool(incident_session.get("exists"))
+            else []
+        ),
+        *(
+            ["├─ Environment Drift ───────────────────────────────────────────┤"]
+            + [f"│ status={environment_drift.get('status', '-')}", f"│ {environment_drift.get('headline', '-')}"]
+            + [f"│ {str(item)}" for item in list(environment_drift.get("signals", []))[:3]]
+            if str(environment_drift.get("status", "")).strip() in {"changed", "stale"}
             else []
         ),
         "├─ Target ────────────────────────────────────────────────────────┤",
@@ -9911,6 +10085,7 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
         "- 直接输入自然语言，例如：检查当前服务器 / 修复 swarm 副本不足",
         "- /do 1 执行当前最优先建议，/focus /activity /trace /timeline 查看上下文",
         "- /scan 零配置探测本机 Docker/Swarm/K8s/Prometheus",
+        "- /drift 查看环境基线漂移（新增/缺失目标、基线过期）",
         "",
         "Keys",
         "- Tab 自动补全，Up/Down 浏览输入历史",
@@ -9927,6 +10102,7 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
         "- /activity",
         "- /trace",
         "- /timeline",
+        "- /drift",
         "- /providers",
         "- /scan",
         "",
@@ -10019,6 +10195,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     swarm_posture = snapshot.get("swarm_posture", {})
     if not isinstance(swarm_posture, dict):
         swarm_posture = {}
+    environment_drift = snapshot.get("environment_drift", {})
+    if not isinstance(environment_drift, dict):
+        environment_drift = {}
     incident_session = snapshot.get("incident_session", {})
     if not isinstance(incident_session, dict):
         incident_session = {}
@@ -10120,6 +10299,13 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         lines.extend(["", "Signals:"])
         for item in environment_signals[:3]:
             lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
+    if str(environment_drift.get("status", "")).strip() in {"changed", "stale"}:
+        lines.extend(["", "Environment Drift:"])
+        lines.extend(_wrap_tui_text_lines(str(environment_drift.get("headline", "")).strip(), width=width))
+        for item in list(environment_drift.get("signals", []))[:3]:
+            lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
+        for item in list(environment_drift.get("top_actions", []))[:2]:
+            lines.extend(_wrap_tui_text_lines(f"- action: {item}", width=width))
     if str(swarm_posture.get("headline", "")).strip():
         lines.extend(["", "Swarm Posture:"])
         lines.extend(_wrap_tui_text_lines(str(swarm_posture.get("headline", "")).strip(), width=width))
@@ -10269,6 +10455,9 @@ def _build_tui_idle_content_rows(snapshot: dict[str, object], *, width: int) -> 
     swarm_posture = snapshot.get("swarm_posture", {})
     if not isinstance(swarm_posture, dict):
         swarm_posture = {}
+    environment_drift = snapshot.get("environment_drift", {})
+    if not isinstance(environment_drift, dict):
+        environment_drift = {}
     incident_session = snapshot.get("incident_session", {})
     if not isinstance(incident_session, dict):
         incident_session = {}
@@ -10277,6 +10466,7 @@ def _build_tui_idle_content_rows(snapshot: dict[str, object], *, width: int) -> 
         f"- profile: {profile}",
         f"- summary: {summary}",
         *([f"- swarm: {str(swarm_posture.get('headline', '')).strip()}"] if str(swarm_posture.get("headline", "")).strip() else []),
+        *([f"- drift: {str(environment_drift.get('headline', '')).strip()}"] if str(environment_drift.get("status", "")).strip() in {"changed", "stale"} else []),
         *([f"- incident: {str(incident_session.get('headline', '')).strip()}"] if bool(incident_session.get("exists")) and str(incident_session.get("headline", "")).strip() else []),
         f"- next: {state_card.get('next', '-')}",
         f"- quick: {quick_state}",
@@ -10312,6 +10502,8 @@ def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history:
     target_count = len(targets) if isinstance(targets, list) else 0
     incident_session = snapshot.get("incident_session", {})
     incident_status = str(incident_session.get("status", "")).strip() if isinstance(incident_session, dict) else ""
+    environment_drift = snapshot.get("environment_drift", {})
+    drift_status = str(environment_drift.get("status", "")).strip() if isinstance(environment_drift, dict) else ""
     last_you = ""
     for speaker, text in reversed(history):
         if speaker == "You":
@@ -10328,6 +10520,8 @@ def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history:
     ]
     if incident_status:
         parts.append(f"incident={incident_status}")
+    if drift_status in {"changed", "stale"}:
+        parts.append(f"drift={drift_status}")
     if last_you:
         parts.append(f"last={last_you[:48]}")
     return " | ".join(parts)
@@ -10336,7 +10530,7 @@ def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history:
 def _build_tui_panel_hint(panel: str) -> str:
     normalized = _normalize_tui_panel_name(panel)
     hints = {
-        "overview": "总览环境与下一步，试试 /brief /scan /panel activity",
+        "overview": "总览环境与下一步，试试 /brief /scan /drift /panel activity",
         "activity": "聚焦异常与建议动作，试试 /activity /remediate /panel timeline",
         "timeline": "聚焦执行轨迹，试试 /timeline /panel providers",
         "providers": "聚焦模型与网关状态，试试 /providers /provider <name>",
@@ -10373,6 +10567,11 @@ def _build_tui_status_hint_line(snapshot: dict[str, object]) -> str:
             return f"hint> 最近闭环会话仍需处理，先看 /trace /timeline。{stage_flow[:72]}"
         if next_step:
             return f"hint> 最近闭环会话下一步: {next_step[:72]}"
+    environment_drift = snapshot.get("environment_drift", {})
+    if isinstance(environment_drift, dict):
+        drift_status = str(environment_drift.get("status", "")).strip()
+        if drift_status in {"changed", "stale"}:
+            return f"hint> 检测到环境基线漂移，先看 /drift。{str(environment_drift.get('headline', ''))[:72]}"
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     return f"hint> {_build_tui_panel_hint(panel)}"
 
@@ -10385,7 +10584,7 @@ def _build_tui_action_bar(snapshot: dict[str, object]) -> str:
     if latest_status == "fail":
         return f"{base} || /trace | /timeline | /do 1"
     panel_actions = {
-        "overview": "/do 1 | /focus | /scan",
+        "overview": "/do 1 | /focus | /drift",
         "activity": "/do 1 | /activity | /swarm --logs",
         "timeline": "/trace | /timeline | /panel next",
         "providers": "/providers | /provider <name> | /panel next",
@@ -10490,7 +10689,7 @@ def _switch_tui_panel(options: dict[str, object], requested: str) -> str:
 
 
 def _tui_welcome_message() -> str:
-    return "全屏 TUI 已启动。输入自然语言，或使用 /do 1 /focus /activity /trace /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板，按 F1 或 ? 查看帮助。"
+    return "全屏 TUI 已启动。输入自然语言，或使用 /do 1 /focus /activity /trace /timeline /drift /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板，按 F1 或 ? 查看帮助。"
 
 
 def _cycle_tui_input_history(
@@ -10560,6 +10759,7 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/do 1",
             "/timeline",
             "/trace",
+            "/drift",
             "/panel overview",
             "/panel activity",
             "/panel timeline",
@@ -10714,6 +10914,8 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
         return _render_timeline_text(options)
     if lowered.startswith("/trace"):
         return _render_trace_text(options)
+    if lowered.startswith("/drift"):
+        return _render_environment_drift_text(options)
     if lowered in {"/panel", "/panel show"}:
         return _switch_tui_panel(options, "show")
     if lowered.startswith("/panel "):

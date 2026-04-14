@@ -14,6 +14,7 @@ from lazysre.cli.main import (
     _build_provider_setup_checks,
     _build_doctor_gate,
     _build_discovery_target_updates,
+    _build_environment_drift,
     _build_environment_landscape,
     _build_incident_report_payload,
     _compute_doctor_autofix,
@@ -135,6 +136,7 @@ from lazysre.cli.main import (
     _render_tui_demo_text,
     _render_recent_activity_text,
     _render_focus_text,
+    _render_environment_drift_text,
     _render_quick_actions_text,
     _render_trace_text,
     _render_timeline_text,
@@ -160,6 +162,7 @@ from lazysre.cli.main import (
     _switch_runtime_provider,
     _tui_completion_candidates,
     _handle_tui_input,
+    _classify_quick_action_confidence,
     _derive_closed_loop_plan,
     _infer_verification_commands,
     _looks_like_remediate_request,
@@ -1804,6 +1807,36 @@ def test_build_environment_landscape_detects_hybrid_runtime() -> None:
     assert any("Prometheus ready" in item for item in landscape["signals"])
 
 
+def test_build_environment_drift_detects_target_changes() -> None:
+    drift = _build_environment_drift(
+        {
+            "generated_at_utc": "2026-04-10T00:00:00+00:00",
+            "usable_targets": ["docker-swarm", "kubernetes"],
+        },
+        ["docker", "prometheus"],
+    )
+
+    assert drift["exists"] is True
+    assert drift["status"] == "changed"
+    assert "新增 prometheus" in drift["headline"]
+    assert "缺失 kubernetes" in drift["headline"]
+    assert "kubernetes" in drift["removed_targets"]
+    assert "prometheus" in drift["added_targets"]
+
+
+def test_build_environment_drift_stable_when_targets_match() -> None:
+    drift = _build_environment_drift(
+        {
+            "generated_at_utc": "2026-04-14T00:00:00+00:00",
+            "usable_targets": ["docker", "kubernetes", "prometheus"],
+        },
+        ["docker", "kubernetes", "prometheus"],
+    )
+
+    assert drift["status"] == "stable"
+    assert "稳定" in drift["headline"]
+
+
 def test_build_environment_scan_briefing_includes_profile_and_signals() -> None:
     report = {
         "summary": {"pass": 6, "warn": 2, "error": 0},
@@ -2227,6 +2260,29 @@ def test_render_focus_text_prefers_recent_failure(tmp_path: Path) -> None:
     assert "/timeline" in rendered
 
 
+def test_render_environment_drift_text_uses_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {
+            "environment_drift": {
+                "exists": True,
+                "status": "changed",
+                "headline": "环境基线发生漂移：新增 prometheus 缺失 kubernetes",
+                "signals": ["baseline=docker,kubernetes", "current=docker,prometheus"],
+                "top_actions": ["lazysre scan", "kubectl config current-context"],
+            }
+        },
+    )
+
+    rendered = _render_environment_drift_text({})
+
+    assert "Environment Drift" in rendered
+    assert "changed" in rendered
+    assert "新增 prometheus" in rendered
+    assert "lazysre scan" in rendered
+
+
 def test_render_quick_actions_text_lists_numbered_items(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli_main,
@@ -2250,6 +2306,12 @@ def test_render_quick_actions_text_lists_numbered_items(monkeypatch: pytest.Monk
     assert "cmd: lazysre scan" in rendered
     assert "Last Run" in rendered
     assert "/do 1" in rendered
+
+
+def test_classify_quick_action_confidence_levels() -> None:
+    assert _classify_quick_action_confidence({"source": "focus", "kind": "inspect", "risk": "low"}) == "high"
+    assert _classify_quick_action_confidence({"source": "recommended", "kind": "write", "risk": "high"}) == "low"
+    assert _classify_quick_action_confidence({"source": "recommended", "kind": "inspect", "risk": "medium"}) == "medium"
 
 
 def test_render_timeline_text_includes_audit_entries(tmp_path: Path) -> None:
@@ -2903,6 +2965,28 @@ def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:
     assert "/scan" not in candidates
 
 
+def test_handle_tui_input_drift_renders_drift_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {
+            "environment_drift": {
+                "exists": True,
+                "status": "changed",
+                "headline": "环境基线发生漂移：新增 prometheus 缺失 kubernetes",
+                "signals": ["baseline=docker,kubernetes", "current=docker,prometheus"],
+                "top_actions": ["lazysre scan"],
+            }
+        },
+    )
+
+    out = _handle_tui_input("/drift", {"execute": False})
+
+    assert "Environment Drift" in out
+    assert "新增 prometheus" in out
+    assert "lazysre scan" in out
+
+
 def test_handle_tui_input_do_runs_quick_action(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, object]] = []
     snapshots = [
@@ -3240,6 +3324,26 @@ def test_build_tui_focus_card_prefers_swarm_posture_after_watch_alerts() -> None
     assert card["title"] == "Swarm Posture"
     assert "api" in card["body"]
     assert card["actions"][0] == "lazysre template run swarm-image-pull-failed --var service=api --apply"
+
+
+def test_build_tui_focus_card_uses_environment_drift_when_changed() -> None:
+    card = _build_tui_focus_card(
+        recent_activity=["env drift | 环境基线发生漂移"],
+        recent_activity_commands=["lazysre scan"],
+        provider_report={"active_ready": True},
+        timeline=[],
+        environment_drift={
+            "status": "changed",
+            "headline": "环境基线发生漂移：新增 prometheus 缺失 kubernetes",
+            "top_actions": ["lazysre scan", "kubectl config current-context"],
+        },
+        incident_session={},
+        watch_snapshot={},
+    )
+
+    assert card["title"] == "Environment Drift"
+    assert "漂移" in card["body"]
+    assert card["actions"][0] == "lazysre scan"
 
 
 def test_build_tui_focus_card_uses_incident_session_when_present() -> None:
