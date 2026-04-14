@@ -5661,6 +5661,7 @@ def _collect_watch_snapshot(
             "bad_nodes": swarm_report.get("bad_nodes", []) if isinstance(swarm_report, dict) else [],
             "root_causes": swarm_report.get("root_causes", []) if isinstance(swarm_report, dict) else [],
             "recommendations": swarm_report.get("recommendations", []) if isinstance(swarm_report, dict) else [],
+            "posture": swarm_report.get("posture", {}) if isinstance(swarm_report, dict) else {},
         },
         "suggestions": scan_report.get("suggestions", []),
     }
@@ -7000,6 +7001,7 @@ def _build_tui_focus_card(
     recent_activity_commands: list[str],
     provider_report: dict[str, object],
     timeline: list[dict[str, str]],
+    watch_snapshot: dict[str, object] | None = None,
 ) -> dict[str, object]:
     latest_failure = next(
         (
@@ -7018,6 +7020,26 @@ def _build_tui_focus_card(
                 f"{str(latest_failure.get('summary', ''))[:120]}"
             ).strip(),
             "actions": ["/trace", "/timeline"],
+        }
+    posture = (
+        ((watch_snapshot or {}).get("swarm", {}) if isinstance((watch_snapshot or {}).get("swarm", {}), dict) else {}).get("posture", {})
+        if isinstance(watch_snapshot, dict)
+        else {}
+    )
+    if isinstance(posture, dict) and str(posture.get("headline", "")).strip():
+        actions = posture.get("top_actions", [])
+        normalized_actions = [
+            str(item).strip()
+            for item in actions
+            if str(item).strip() and _looks_like_shell_command(str(item).strip())
+        ] if isinstance(actions, list) else []
+        return {
+            "title": "Swarm Posture",
+            "body": (
+                f"{str(posture.get('headline', '')).strip()} "
+                f"{str(posture.get('summary', '')).strip()}"
+            ).strip()[:140],
+            "actions": normalized_actions[:2] or ["/activity", "/swarm --logs"],
         }
     alert = next((item for item in recent_activity if "attention" in str(item).lower()), "")
     if str(alert).strip():
@@ -7235,6 +7257,7 @@ def _build_tui_recent_activity_context(options: dict[str, object]) -> dict[str, 
     items: list[str] = []
     commands: list[str] = []
     watch_snapshot = _load_latest_watch_snapshot(None)
+    posture: dict[str, object] = {}
     if watch_snapshot:
         alerts = watch_snapshot.get("alerts", [])
         alert_count = len(alerts) if isinstance(alerts, list) else 0
@@ -7254,6 +7277,16 @@ def _build_tui_recent_activity_context(options: dict[str, object]) -> dict[str, 
                 alert_source = str(first_alert.get("source", "")).strip()
                 if alert_source.startswith("swarm") and alert_name:
                     commands.append(f"/swarm --service {alert_name} --logs")
+        swarm = watch_snapshot.get("swarm", {})
+        if isinstance(swarm, dict):
+            posture = swarm.get("posture", {})
+            if isinstance(posture, dict) and str(posture.get("headline", "")).strip():
+                items.append(
+                    f"swarm posture | {str(posture.get('headline', '')).strip()[:92]}"
+                )
+                top_actions = posture.get("top_actions", [])
+                if isinstance(top_actions, list):
+                    commands.extend(str(item).strip() for item in top_actions[:2] if str(item).strip())
     last_fix_path = Path(str(options.get("fix_plan_file", Path(settings.data_dir) / "lsre-fix-last.json"))).expanduser()
     last_fix = _read_last_fix_plan_summary(last_fix_path)
     if bool(last_fix.get("exists")):
@@ -7269,6 +7302,7 @@ def _build_tui_recent_activity_context(options: dict[str, object]) -> dict[str, 
         "items": _dedupe_strings([str(item).strip() for item in items if str(item).strip()])[:5],
         "commands": _dedupe_strings([str(item).strip() for item in commands if str(item).strip()])[:4],
         "watch": watch_snapshot if isinstance(watch_snapshot, dict) else {},
+        "swarm_posture": posture if isinstance(posture, dict) else {},
         "last_fix": last_fix,
         "audit_log": str(audit_log),
     }
@@ -9253,6 +9287,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         recent_activity_commands=list(recent_activity_context.get("commands", [])),
         provider_report=provider_report,
         timeline=timeline_entries_raw,
+        watch_snapshot=recent_activity_context.get("watch", {}) if isinstance(recent_activity_context.get("watch", {}), dict) else {},
     )
     quick_action_items = _build_quick_action_catalog(
         focus_title=str(focus_card.get("title", "")),
@@ -9303,6 +9338,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "recent_commands": recent_commands[-3:],
         "recent_activity": recent_activity,
         "recent_activity_commands": recent_activity_context.get("commands", []),
+        "swarm_posture": recent_activity_context.get("swarm_posture", {}) if isinstance(recent_activity_context.get("swarm_posture", {}), dict) else {},
         "sidebar_panel": _normalize_tui_panel_name(str(options.get("tui_panel", "overview"))),
         "panel_hint": _build_tui_panel_hint(_normalize_tui_panel_name(str(options.get("tui_panel", "overview")))),
         "provider_report": provider_report,
@@ -9376,6 +9412,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     environment_signals = snapshot.get("environment_signals", [])
     if not isinstance(environment_signals, list):
         environment_signals = []
+    swarm_posture = snapshot.get("swarm_posture", {})
+    if not isinstance(swarm_posture, dict):
+        swarm_posture = {}
     starter_prompts = _build_tui_starter_prompts(snapshot)
     action_bar = _build_tui_action_bar(snapshot)
     panel_hint = str(snapshot.get("panel_hint", "")).strip()
@@ -9399,6 +9438,13 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         f"│ headline={snapshot.get('headline', '-')}",
         "├─ Focus ─────────────────────────────────────────────────────────┤",
         f"│ {snapshot.get('focus_title', 'Focus')}: {snapshot.get('focus_body', '-')}",
+        *(
+            ["├─ Swarm Posture ───────────────────────────────────────────────┤"]
+            + [f"│ {str(swarm_posture.get('headline', '')).strip()}"]
+            + [f"│ {str(item)}" for item in list(swarm_posture.get("signals", []))[:3]]
+            if str(swarm_posture.get("headline", "")).strip()
+            else []
+        ),
         "├─ Target ────────────────────────────────────────────────────────┤",
         f"│ active_provider={snapshot.get('active_provider', '-')}",
         f"│ usable_targets={', '.join(str(x) for x in usable_targets) or '(none)'}",
@@ -9796,6 +9842,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     recent_commands = snapshot.get("recent_commands", [])
     if not isinstance(recent_commands, list):
         recent_commands = []
+    swarm_posture = snapshot.get("swarm_posture", {})
+    if not isinstance(swarm_posture, dict):
+        swarm_posture = {}
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     state_card = _build_tui_state_card(snapshot)
     lines = [
@@ -9894,6 +9943,11 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         lines.extend(["", "Signals:"])
         for item in environment_signals[:3]:
             lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
+    if str(swarm_posture.get("headline", "")).strip():
+        lines.extend(["", "Swarm Posture:"])
+        lines.extend(_wrap_tui_text_lines(str(swarm_posture.get("headline", "")).strip(), width=width))
+        for item in list(swarm_posture.get("signals", []))[:3]:
+            lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
     focus_body = str(snapshot.get("focus_body", "")).strip()
     if focus_body:
         lines.extend(["", "Focus:"])
@@ -9971,6 +10025,10 @@ def _build_tui_starter_prompts(snapshot: dict[str, object]) -> list[str]:
     if not isinstance(targets, list):
         targets = []
     target_set = {str(item).strip().lower() for item in targets if str(item).strip()}
+    swarm_posture = snapshot.get("swarm_posture", {})
+    if not isinstance(swarm_posture, dict):
+        swarm_posture = {}
+    focus_service = str(swarm_posture.get("focus_service", "")).strip()
     provider = str(snapshot.get("active_provider", snapshot.get("provider", "auto"))).strip() or "auto"
     prompts: list[str] = [
         "检查当前环境有什么异常",
@@ -9983,6 +10041,8 @@ def _build_tui_starter_prompts(snapshot: dict[str, object]) -> list[str]:
                 "分析最近失败的 Swarm task 并给出修复建议",
             ]
         )
+        if focus_service:
+            prompts.append(f"为什么 {focus_service} 副本不足")
     if "docker" in target_set:
         prompts.append("看看 Docker 容器里有没有异常重启")
     if target_set.intersection({"k8s", "kubernetes"}):
@@ -10015,10 +10075,14 @@ def _build_tui_idle_content_rows(snapshot: dict[str, object], *, width: int) -> 
     state_card = _build_tui_state_card(snapshot)
     profile = str(snapshot.get("environment_profile", "")).strip() or "-"
     summary = str(snapshot.get("environment_summary", "")).strip() or "-"
+    swarm_posture = snapshot.get("swarm_posture", {})
+    if not isinstance(swarm_posture, dict):
+        swarm_posture = {}
     sections = [
         "Start Here",
         f"- profile: {profile}",
         f"- summary: {summary}",
+        *([f"- swarm: {str(swarm_posture.get('headline', '')).strip()}"] if str(swarm_posture.get("headline", "")).strip() else []),
         f"- next: {state_card.get('next', '-')}",
         f"- quick: {quick_state}",
         f"- hint: {snapshot.get('panel_hint', '-')}",

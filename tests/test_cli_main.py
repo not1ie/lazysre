@@ -144,6 +144,7 @@ from lazysre.cli.main import (
     _build_tui_panel_hint,
     _build_tui_status_hint_line,
     _build_tui_panel_counts,
+    _build_tui_focus_card,
     _build_tui_starter_prompts,
     _build_recent_trace_summary,
     _infer_trace_stage,
@@ -1939,6 +1940,22 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
             {
                 "cycle": 3,
                 "alerts": [{"source": "swarm", "name": "api", "detail": "replicas=0/1"}],
+                "swarm": {
+                    "posture": {
+                        "headline": "Swarm 主要阻塞点是 api，根因倾向 swarm_image_pull_failed。",
+                        "summary": "services=3 unhealthy=1 bad_nodes=0 root_causes=1",
+                        "focus_service": "api",
+                        "signals": [
+                            "services=3",
+                            "unhealthy=1",
+                            "top_root_cause=swarm_image_pull_failed",
+                        ],
+                        "top_actions": [
+                            "lazysre template run swarm-image-pull-failed --var service=api --apply",
+                            "lazysre swarm --service api --logs",
+                        ],
+                    }
+                },
             },
             ensure_ascii=False,
         ),
@@ -2010,6 +2027,7 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert snapshot["environment_profile"] == "Hybrid Swarm + K8s"
     assert "swarm=3 services" in snapshot["environment_summary"]
     assert any("Swarm active" in item for item in snapshot["environment_signals"])
+    assert snapshot["swarm_posture"]["focus_service"] == "api"
     assert snapshot["session_turns"] == 2
     assert snapshot["last_user"] == "重启它"
     assert snapshot["recent_commands"] == ["检查 swarm 服务", "重启它"]
@@ -2020,8 +2038,8 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert "/activity" in snapshot["recent_activity_commands"]
     assert "/swarm --service api --logs" in snapshot["recent_activity_commands"]
     assert any("08:30 [observe/ok/exec] docker service ls" in item for item in snapshot["timeline_entries"])
-    assert snapshot["focus_title"] == "Active Alert"
-    assert "/activity" in snapshot["focus_actions"]
+    assert snapshot["focus_title"] == "Swarm Posture"
+    assert snapshot["focus_actions"][0] == "lazysre template run swarm-image-pull-failed --var service=api --apply"
     assert isinstance(snapshot["quick_action_items"], list)
     assert snapshot["quick_action_items"]
     assert snapshot["quick_action_items"][0]["id"] == "1"
@@ -2360,6 +2378,51 @@ def test_build_tui_idle_content_rows_show_starter_prompts() -> None:
     assert "列出 Swarm 当前不健康的 service" in joined
     assert "Direct Commands" in joined
     assert "/do 1" in joined
+
+
+def test_render_tui_demo_text_shows_swarm_posture_block() -> None:
+    rendered = _render_tui_demo_text(
+        {
+            "version": "0.1.1",
+            "mode": "dry-run",
+            "provider": "mock",
+            "model": "gpt-5.4-mini",
+            "sidebar_panel": "overview",
+            "panel_hint": "hint",
+            "status": "attention",
+            "headline": "headline",
+            "focus_title": "Swarm Posture",
+            "focus_body": "api needs repair",
+            "swarm_posture": {
+                "headline": "Swarm 主要阻塞点是 api，根因倾向 swarm_image_pull_failed。",
+                "signals": ["top_root_cause=swarm_image_pull_failed", "focus_service=api"],
+            },
+            "active_provider": "mock",
+            "usable_targets": ["docker-swarm"],
+            "configured_providers": ["mock"],
+            "namespace": "default",
+            "ssh_target": "",
+            "prometheus_url": "",
+            "session_turns": 1,
+            "last_user": "",
+            "recent_activity": [],
+            "recent_activity_commands": [],
+            "focus_actions": ["lazysre swarm --service api --logs"],
+            "quick_action_items": [],
+            "latest_quick_action": {},
+            "recommended_commands": ["/swarm --logs"],
+            "recent_commands": [],
+            "trace_summary": [],
+            "timeline_entries": [],
+            "shortcuts": ["/swarm --logs"],
+            "environment_profile": "Observed Swarm",
+            "environment_summary": "Observed Swarm; swarm=3 services",
+            "environment_signals": ["Swarm active，services=3"],
+        }
+    )
+
+    assert "Swarm Posture" in rendered
+    assert "swarm_image_pull_failed" in rendered
 
 
 def test_build_tui_status_hint_line_uses_panel() -> None:
@@ -2944,6 +3007,14 @@ def test_collect_watch_snapshot_rolls_up_scan_and_swarm_alerts(monkeypatch: pyte
                 }
             ],
             "recommendations": ["lazysre swarm --service api --logs"],
+            "posture": {
+                "status": "attention",
+                "headline": "Swarm 主要阻塞点是 api，根因倾向 swarm_image_pull_failed。",
+                "focus_service": "api",
+                "focus_category": "swarm_image_pull_failed",
+                "signals": ["top_root_cause=swarm_image_pull_failed"],
+                "top_actions": ["lazysre template run swarm-image-pull-failed --var service=api --apply"],
+            },
         }
 
     monkeypatch.setattr(cli_main, "_collect_environment_discovery", fake_scan)
@@ -2955,6 +3026,33 @@ def test_collect_watch_snapshot_rolls_up_scan_and_swarm_alerts(monkeypatch: pyte
     assert snapshot["usable_targets"] == ["docker-swarm"]
     assert any(alert["source"] == "swarm" and alert["name"] == "api" for alert in snapshot["alerts"])
     assert any(alert["source"] == "swarm-root-cause" for alert in snapshot["alerts"])
+    assert snapshot["swarm"]["posture"]["focus_service"] == "api"
+
+
+def test_build_tui_focus_card_prefers_swarm_posture_after_watch_alerts() -> None:
+    card = _build_tui_focus_card(
+        recent_activity=["watch attention alerts=1 cycle=3"],
+        recent_activity_commands=["/activity", "/swarm --service api --logs"],
+        provider_report={"active_ready": True},
+        timeline=[],
+        watch_snapshot={
+            "swarm": {
+                "posture": {
+                    "headline": "Swarm 主要阻塞点是 api，根因倾向 swarm_image_pull_failed。",
+                    "summary": "services=2 unhealthy=1 bad_nodes=0 root_causes=1",
+                    "focus_service": "api",
+                    "top_actions": [
+                        "lazysre template run swarm-image-pull-failed --var service=api --apply",
+                        "lazysre swarm --service api --logs",
+                    ],
+                }
+            }
+        },
+    )
+
+    assert card["title"] == "Swarm Posture"
+    assert "api" in card["body"]
+    assert card["actions"][0] == "lazysre template run swarm-image-pull-failed --var service=api --apply"
 
 
 def test_run_watch_snapshots_persists_alert_memory_once(monkeypatch: pytest.MonkeyPatch) -> None:
