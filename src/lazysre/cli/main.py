@@ -7052,14 +7052,48 @@ def _build_tui_state_card(snapshot: dict[str, object]) -> dict[str, str]:
     }
 
 
+def _classify_quick_action_kind(command_text: str) -> str:
+    command = str(command_text or "").strip()
+    if not command:
+        return "other"
+    lowered = command.lower()
+    if command.startswith("/"):
+        if any(lowered.startswith(prefix) for prefix in ["/trace", "/timeline", "/activity", "/focus", "/scan", "/brief", "/providers"]):
+            return "inspect"
+        if any(lowered.startswith(prefix) for prefix in ["/do", "/actions"]):
+            return "dispatch"
+        return "command"
+    if lowered.startswith("lazysre template run") or lowered.startswith("lsre template run"):
+        return "template"
+    if lowered.startswith("lazysre remote") or lowered.startswith("lsre remote"):
+        return "remote"
+    if lowered.startswith("lazysre fix") or lowered.startswith("lsre fix") or lowered.startswith("lazysre remediate") or lowered.startswith("lsre remediate"):
+        return "repair"
+    if lowered.startswith("lazysre swarm") or lowered.startswith("lsre swarm") or lowered.startswith("lazysre scan") or lowered.startswith("lsre scan") or lowered.startswith("lazysre brief") or lowered.startswith("lsre brief"):
+        return "inspect"
+    try:
+        tokens = shlex.split(command)
+    except Exception:
+        return "other"
+    if not tokens:
+        return "other"
+    decision = assess_command(tokens)
+    if decision.risk_level in {"high", "critical"}:
+        return "write"
+    if tokens[0] in {"ssh", "scp"}:
+        return "remote"
+    return "inspect"
+
+
 def _format_quick_action_line(item: dict[str, object]) -> str:
     action_id = str(item.get("id", "?")).strip() or "?"
     command = str(item.get("command", "")).strip() or "-"
     title = str(item.get("title", command)).strip() or command
     source = str(item.get("source", "suggested")).strip() or "suggested"
+    kind = _classify_quick_action_kind(command)
     status = str(item.get("last_status", "")).strip()
     suffix = f" [last={status}]" if status else ""
-    return f"{action_id}. [{source}] {title}{suffix}"
+    return f"{action_id}. [{kind}][{source}] {title}{suffix}"
 
 
 def _format_quick_action_command(item: dict[str, object]) -> str:
