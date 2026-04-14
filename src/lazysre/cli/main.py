@@ -9065,6 +9065,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     recent_commands = snapshot.get("recent_commands", [])
     if not isinstance(recent_commands, list):
         recent_commands = []
+    starter_prompts = _build_tui_starter_prompts(snapshot)
     action_bar = _build_tui_action_bar(snapshot)
     panel_hint = str(snapshot.get("panel_hint", "")).strip()
     state_card = _build_tui_state_card(snapshot)
@@ -9124,6 +9125,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         *([ "├─ Command Trail ─────────────────────────────────────────────────┤"] + [f"│ {item}" for item in recent_commands[-3:]] if recent_commands else []),
         *([ "├─ Trace Summary ────────────────────────────────────────────────┤"] + [f"│ {item}" for item in trace_summary[:3]] if trace_summary else []),
         *([ "├─ Execution Timeline ────────────────────────────────────────────┤"] + [f"│ {item}" for item in timeline_entries[:3]] if timeline_entries else []),
+        *([ "├─ Starter Prompts ──────────────────────────────────────────────┤"] + [f"│ {item}" for item in starter_prompts[:4]] if starter_prompts else []),
         "├─ Shortcuts ─────────────────────────────────────────────────────┤",
         *[f"│ {item}" for item in shortcuts],
         "├─ Conversation ──────────────────────────────────────────────────┤",
@@ -9311,6 +9313,9 @@ def _draw_tui(
 
     content_w = max(10, width - sidebar_w - 3)
     rows: list[str] = []
+    if (not input_text.strip()) and (not _has_tui_user_history(history)):
+        rows.extend(_build_tui_idle_content_rows(snapshot, width=content_w))
+        rows.append("")
     for speaker, text in history[-30:]:
         rows.append(f"{speaker}:")
         for raw in str(text).splitlines() or [""]:
@@ -9338,6 +9343,7 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     state_card = _build_tui_state_card(snapshot)
     active_provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
+    starter_prompts = _build_tui_starter_prompts(snapshot)
     panel_examples = {
         "overview": [
             "检查当前环境有什么异常",
@@ -9388,6 +9394,9 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
         "- /timeline",
         "- /providers",
         "- /scan",
+        "",
+        "Try Asking",
+        *[f"- {item}" for item in starter_prompts[:4]],
     ]
     lines: list[str] = []
     for entry in sections:
@@ -9397,7 +9406,7 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
         if entry.startswith("- "):
             lines.extend(_wrap_tui_text_lines(entry, width=width))
             continue
-        if entry in {"LazySRE Help", "Core", "Keys", "Panel Examples", "High Value Commands"}:
+        if entry in {"LazySRE Help", "Core", "Keys", "Panel Examples", "High Value Commands", "Try Asking"}:
             lines.append(entry)
             continue
         lines.extend(_wrap_tui_text_lines(entry, width=width))
@@ -9627,6 +9636,80 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         lines.extend(_wrap_tui_text_lines(str(item), width=width))
     lines.extend(["", "Tab: autocomplete", "1-4/F2: switch panel"])
     return lines
+
+
+def _build_tui_starter_prompts(snapshot: dict[str, object]) -> list[str]:
+    panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
+    targets = snapshot.get("usable_targets", [])
+    if not isinstance(targets, list):
+        targets = []
+    provider = str(snapshot.get("active_provider", snapshot.get("provider", "auto"))).strip() or "auto"
+    prompts: list[str] = [
+        "检查当前环境有什么异常",
+        "总结目前最值得优先处理的问题",
+    ]
+    if "swarm" in [str(item).strip().lower() for item in targets]:
+        prompts.extend(
+            [
+                "列出 Swarm 当前不健康的 service",
+                "分析最近失败的 Swarm task 并给出修复建议",
+            ]
+        )
+    if "docker" in [str(item).strip().lower() for item in targets]:
+        prompts.append("看看 Docker 容器里有没有异常重启")
+    if "k8s" in [str(item).strip().lower() for item in targets]:
+        prompts.append("找出当前集群里异常 Pod 和最近 Events")
+    panel_prompts = {
+        "overview": ["给我一份当前平台总览简报"],
+        "activity": ["把最近活动里最危险的动作挑出来"],
+        "timeline": ["解释最近一次操作链路发生了什么"],
+        "providers": [f"检查 {provider} provider 当前是否可用"],
+    }
+    prompts.extend(panel_prompts.get(panel, []))
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in prompts:
+        text = str(item).strip()
+        if (not text) or (text in seen):
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return ordered
+
+
+def _has_tui_user_history(history: list[tuple[str, str]]) -> bool:
+    return any(str(speaker) == "You" and str(text).strip() for speaker, text in history)
+
+
+def _build_tui_idle_content_rows(snapshot: dict[str, object], *, width: int) -> list[str]:
+    prompts = _build_tui_starter_prompts(snapshot)
+    quick_state = _build_latest_quick_action_badge(snapshot)
+    state_card = _build_tui_state_card(snapshot)
+    sections = [
+        "Start Here",
+        f"- next: {state_card.get('next', '-')}",
+        f"- quick: {quick_state}",
+        f"- hint: {snapshot.get('panel_hint', '-')}",
+        "",
+        "Try Asking",
+        *[f"- {item}" for item in prompts[:5]],
+        "",
+        "Direct Commands",
+        "- /do 1",
+        "- /focus",
+        "- /activity",
+        "- /trace",
+    ]
+    rows: list[str] = []
+    for entry in sections:
+        if not entry:
+            rows.append("")
+            continue
+        if entry in {"Start Here", "Try Asking", "Direct Commands"}:
+            rows.append(entry)
+            continue
+        rows.extend(textwrap.wrap(entry, width=max(10, width)) or [entry])
+    return rows
 
 
 def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history: list[tuple[str, str]]) -> str:

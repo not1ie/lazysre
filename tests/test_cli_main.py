@@ -139,9 +139,11 @@ from lazysre.cli.main import (
     _build_tui_footer_line,
     _build_tui_action_bar,
     _build_tui_help_overlay_lines,
+    _build_tui_idle_content_rows,
     _build_tui_panel_hint,
     _build_tui_status_hint_line,
     _build_tui_panel_counts,
+    _build_tui_starter_prompts,
     _build_recent_trace_summary,
     _infer_trace_stage,
     _build_tui_panel_tabs,
@@ -843,6 +845,7 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "action_bar=" in rendered
     assert "Up/Down 浏览历史" in rendered
     assert "F1/? 打开帮助" in rendered
+    assert "Starter Prompts" in rendered
 
 
 def test_natural_language_remediate_detection() -> None:
@@ -2234,6 +2237,47 @@ def test_build_tui_help_overlay_lines_reflects_panel_and_next_action() -> None:
     assert "建议下一步: /do 2 -> /scan" in joined
     assert "F1 或 ? 打开/关闭帮助" in joined
     assert "列出最近失败的 Swarm service" in joined
+    assert "Try Asking" in joined
+
+
+def test_build_tui_starter_prompts_include_target_specific_items() -> None:
+    prompts = _build_tui_starter_prompts(
+        {
+            "sidebar_panel": "providers",
+            "provider": "mock",
+            "active_provider": "openai",
+            "usable_targets": ["docker", "swarm", "k8s"],
+        }
+    )
+
+    joined = "\n".join(prompts)
+
+    assert "检查当前环境有什么异常" in joined
+    assert "列出 Swarm 当前不健康的 service" in joined
+    assert "看看 Docker 容器里有没有异常重启" in joined
+    assert "找出当前集群里异常 Pod 和最近 Events" in joined
+    assert "检查 openai provider 当前是否可用" in joined
+
+
+def test_build_tui_idle_content_rows_show_starter_prompts() -> None:
+    rows = _build_tui_idle_content_rows(
+        {
+            "sidebar_panel": "overview",
+            "panel_hint": "总览环境与下一步",
+            "quick_action_items": [{"id": "1", "command": "/focus", "title": "Focus"}],
+            "latest_quick_action": {"status": "ok", "command": "/focus"},
+            "usable_targets": ["swarm"],
+        },
+        width=48,
+    )
+
+    joined = "\n".join(rows)
+
+    assert "Start Here" in joined
+    assert "Try Asking" in joined
+    assert "列出 Swarm 当前不健康的 service" in joined
+    assert "Direct Commands" in joined
+    assert "/do 1" in joined
 
 
 def test_build_tui_status_hint_line_uses_panel() -> None:
