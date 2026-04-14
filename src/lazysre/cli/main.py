@@ -3557,6 +3557,7 @@ def _collect_environment_discovery(
         "suggestions": _build_environment_scan_suggestions(discoveries, usable_targets, issues),
         "next_actions": _build_environment_scan_next_actions(checks, usable_targets),
     }
+    payload["landscape"] = _build_environment_landscape(payload)
     payload["briefing"] = _build_environment_scan_briefing(payload)
     return payload
 
@@ -3865,6 +3866,9 @@ def _build_environment_scan_briefing(report: dict[str, object]) -> dict[str, obj
     summary = report.get("summary", {})
     if not isinstance(summary, dict):
         summary = {}
+    landscape = report.get("landscape", {})
+    if (not isinstance(landscape, dict)) or (not landscape):
+        landscape = _build_environment_landscape(report)
     usable_targets = report.get("usable_targets", [])
     targets = [str(item) for item in usable_targets] if isinstance(usable_targets, list) else []
     issues = report.get("issues", [])
@@ -3882,17 +3886,34 @@ def _build_environment_scan_briefing(report: dict[str, object]) -> dict[str, obj
     elif warn_count or issue_items:
         status = "attention"
 
+    profile_label = str(landscape.get("label", "")).strip()
+    profile_summary = str(landscape.get("summary", "")).strip()
+    signal_items = [str(item).strip() for item in landscape.get("signals", [])] if isinstance(landscape.get("signals", []), list) else []
+
     if targets and issue_items:
-        headline = f"已发现可纳管目标：{', '.join(targets)}，同时有 {len(issue_items)} 个需要关注的问题。"
+        headline = (
+            f"现场画像：{profile_label or '已发现可纳管环境'}；"
+            f"已发现可纳管目标：{', '.join(targets)}，同时有 {len(issue_items)} 个需要关注的问题。"
+        )
     elif targets:
-        headline = f"已发现可纳管目标：{', '.join(targets)}，可以直接开始自然语言诊断。"
+        headline = (
+            f"现场画像：{profile_label or '已发现可纳管环境'}；"
+            f"已发现可纳管目标：{', '.join(targets)}，可以直接开始自然语言诊断。"
+        )
     else:
-        headline = "暂未发现可直接访问的运维目标，请先确认 Docker、kubectl 或 Prometheus 配置。"
+        headline = (
+            f"现场画像：{profile_label or 'Bootstrap / Unmanaged'}；"
+            "暂未发现可直接访问的运维目标，请先确认 Docker、kubectl 或 Prometheus 配置。"
+        )
 
     evidence = [
         f"checks: pass={summary.get('pass', 0)} warn={warn_count} error={error_count}",
         f"usable_targets={', '.join(targets) if targets else 'none'}",
     ]
+    if profile_summary:
+        evidence.append(f"profile: {profile_summary}")
+    for item in signal_items[:3]:
+        evidence.append(f"signal: {item}")
     for item in issue_items[:3]:
         evidence.append(
             f"{item.get('severity', '-')}: {item.get('name', '-')} {str(item.get('detail', '')).strip()[:120]}"
@@ -3918,6 +3939,109 @@ def _build_environment_scan_briefing(report: dict[str, object]) -> dict[str, obj
         "headline": headline,
         "evidence": evidence[:5],
         "next": next_step,
+        "profile": str(landscape.get("profile", "")).strip(),
+        "profile_label": profile_label,
+        "summary": profile_summary,
+        "signals": signal_items[:5],
+    }
+
+
+def _build_environment_landscape(report: dict[str, object]) -> dict[str, object]:
+    usable_targets = report.get("usable_targets", [])
+    targets = [str(item).strip() for item in usable_targets] if isinstance(usable_targets, list) else []
+    target_set = {item for item in targets if item}
+    discoveries = report.get("discoveries", {})
+    if not isinstance(discoveries, dict):
+        discoveries = {}
+    docker = discoveries.get("docker", {})
+    k8s = discoveries.get("kubernetes", {})
+    prometheus = discoveries.get("prometheus", {})
+    providers = discoveries.get("providers", {})
+    docker = docker if isinstance(docker, dict) else {}
+    k8s = k8s if isinstance(k8s, dict) else {}
+    prometheus = prometheus if isinstance(prometheus, dict) else {}
+    providers = providers if isinstance(providers, dict) else {}
+
+    has_docker = "docker" in target_set
+    has_swarm = "docker-swarm" in target_set
+    has_k8s = "kubernetes" in target_set
+    has_prom = "prometheus" in target_set
+
+    if has_swarm and has_k8s:
+        profile = "hybrid-swarm-k8s"
+        label = "Hybrid Swarm + K8s"
+    elif has_swarm and has_prom:
+        profile = "observed-swarm"
+        label = "Observed Swarm"
+    elif has_swarm:
+        profile = "swarm-runtime"
+        label = "Swarm Runtime"
+    elif has_k8s and has_prom:
+        profile = "observed-k8s"
+        label = "Observed Kubernetes"
+    elif has_k8s:
+        profile = "kubernetes-cluster"
+        label = "Kubernetes Cluster"
+    elif has_docker:
+        profile = "docker-host"
+        label = "Docker Host"
+    elif has_prom:
+        profile = "metrics-observer"
+        label = "Metrics Observer"
+    else:
+        profile = "bootstrap"
+        label = "Bootstrap / Unmanaged"
+
+    signals: list[str] = []
+    if has_swarm:
+        service_count = _safe_int(docker.get("swarm_services", 0))
+        signals.append(f"Swarm active，services={service_count}")
+    elif has_docker:
+        version = str(docker.get("server_version", "")).strip()
+        signals.append(f"Docker reachable{f'，server={version}' if version else ''}")
+    exited = _safe_int(docker.get("exited_containers", 0))
+    if exited > 0:
+        signals.append(f"Docker exited containers={exited}")
+    if has_k8s:
+        nodes = _safe_int(k8s.get("nodes", 0))
+        problem_pods = _safe_int(k8s.get("problem_pods", 0))
+        warning_events = _safe_int(k8s.get("warning_events", 0))
+        ns = str(k8s.get("namespace", "")).strip() or "default"
+        signals.append(f"K8s reachable，nodes={nodes}，namespace={ns}")
+        if problem_pods > 0:
+            signals.append(f"K8s problem pods={problem_pods}")
+        if warning_events > 0:
+            signals.append(f"K8s warning events={warning_events}")
+    if has_prom:
+        prom_url = str(prometheus.get("url", "")).strip()
+        signals.append(f"Prometheus ready{f'，url={prom_url}' if prom_url else ''}")
+    configured = providers.get("configured", [])
+    if isinstance(configured, list) and configured:
+        signals.append(f"AI providers={','.join(str(item) for item in configured[:3])}")
+    elif providers:
+        signals.append("AI provider 未配置，当前更适合先用 mock 预览")
+
+    summary_parts: list[str] = []
+    if has_swarm:
+        summary_parts.append(f"swarm={_safe_int(docker.get('swarm_services', 0))} services")
+    elif has_docker:
+        summary_parts.append("docker reachable")
+    if has_k8s:
+        summary_parts.append(
+            f"k8s nodes={_safe_int(k8s.get('nodes', 0))}/problem_pods={_safe_int(k8s.get('problem_pods', 0))}"
+        )
+    if has_prom:
+        summary_parts.append("prometheus ready")
+    if exited > 0:
+        summary_parts.append(f"exited_containers={exited}")
+    summary = f"{label}; " + ", ".join(summary_parts[:3]) if summary_parts else label
+
+    return {
+        "profile": profile,
+        "label": label,
+        "summary": summary,
+        "signals": _dedupe_strings(signals)[:6],
+        "targets": targets,
     }
 
 
@@ -4021,11 +4145,17 @@ def _render_environment_discovery(report: dict[str, object]) -> None:
         return
     summary = report.get("summary", {})
     targets = report.get("usable_targets", [])
+    landscape = report.get("landscape", {})
+    if not isinstance(landscape, dict):
+        landscape = _build_environment_landscape(report)
     target_text = ", ".join(str(x) for x in targets) if isinstance(targets, list) and targets else "none"
     summary_text = (
         f"mode={report.get('mode', 'read-only')} usable_targets={target_text} "
         f"pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} error={summary.get('error', 0)}"
     )
+    profile_label = str(landscape.get("label", "")).strip()
+    if profile_label:
+        summary_text = f"{summary_text} profile={profile_label}"
     if Panel:
         _console.print(Panel(summary_text, title="Environment Scan", border_style="cyan"))
     briefing = report.get("briefing", {})
@@ -4034,6 +4164,7 @@ def _render_environment_discovery(report: dict[str, object]) -> None:
         evidence_lines = [f"- {item}" for item in evidence[:5]] if isinstance(evidence, list) else []
         lines = [
             f"状态: {briefing.get('status', '-')}",
+            f"环境画像: {briefing.get('profile_label', profile_label or '-')}",
             f"结论: {briefing.get('headline', '-')}",
         ]
         if evidence_lines:
@@ -7823,6 +7954,7 @@ def _write_first_scan_marker(report: dict[str, object]) -> Path:
         "first_scan_done": True,
         "source": str(report.get("source", "environment-scan")),
         "briefing": report.get("briefing", {}),
+        "landscape": scan_report.get("landscape", {}),
         "scan_summary": scan_report.get("summary", {}),
         "usable_targets": scan_report.get("usable_targets", []),
         "issues": scan_report.get("issues", [])[:8] if isinstance(scan_report.get("issues", []), list) else [],
@@ -8885,6 +9017,9 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     briefing = marker.get("briefing", {}) if isinstance(marker, dict) else {}
     if not isinstance(briefing, dict):
         briefing = {}
+    landscape = marker.get("landscape", {}) if isinstance(marker, dict) else {}
+    if not isinstance(landscape, dict):
+        landscape = {}
     session_store = SessionStore(Path(str(options.get("session_file", ".data/lsre-session.json"))))
     session_turns = session_store.recent_turns(limit=30)
     last_user = ""
@@ -8906,6 +9041,13 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     usable_targets = marker.get("usable_targets", []) if isinstance(marker, dict) else []
     if not isinstance(usable_targets, list):
         usable_targets = []
+    if (not landscape) and usable_targets:
+        landscape = _build_environment_landscape(
+            {
+                "usable_targets": usable_targets,
+                "discoveries": marker.get("discoveries", {}) if isinstance(marker, dict) else {},
+            }
+        )
     if not usable_targets:
         inferred_targets: list[str] = []
         if shutil.which("docker"):
@@ -8983,6 +9125,13 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "model": str(options.get("model", settings.model_name)),
         "status": str(briefing.get("status", "cold-start")),
         "headline": str(briefing.get("headline", "")).strip() or "输入 /scan 或 /brief，LazySRE 会先给你一份现场总览。",
+        "environment_profile": str(briefing.get("profile_label", landscape.get("label", ""))).strip(),
+        "environment_summary": str(briefing.get("summary", landscape.get("summary", ""))).strip(),
+        "environment_signals": (
+            [str(item).strip() for item in briefing.get("signals", []) if str(item).strip()]
+            if isinstance(briefing.get("signals", []), list)
+            else [str(item).strip() for item in landscape.get("signals", []) if str(item).strip()]
+        )[:5],
         "generated_at": str(marker.get("generated_at_utc", "")).strip() if isinstance(marker, dict) else "",
         "usable_targets": _dedupe_strings([str(item) for item in usable_targets if str(item).strip()]),
         "configured_providers": configured_providers,
@@ -9065,6 +9214,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     recent_commands = snapshot.get("recent_commands", [])
     if not isinstance(recent_commands, list):
         recent_commands = []
+    environment_signals = snapshot.get("environment_signals", [])
+    if not isinstance(environment_signals, list):
+        environment_signals = []
     starter_prompts = _build_tui_starter_prompts(snapshot)
     action_bar = _build_tui_action_bar(snapshot)
     panel_hint = str(snapshot.get("panel_hint", "")).strip()
@@ -9079,6 +9231,10 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         f"│ focus={state_card.get('focus', '-')}",
         f"│ quick={state_card.get('quick', '-')}",
         f"│ next={state_card.get('next', '-')}",
+        "├─ Environment ───────────────────────────────────────────────────┤",
+        f"│ profile={snapshot.get('environment_profile', '-') or '-'}",
+        f"│ summary={snapshot.get('environment_summary', '-') or '-'}",
+        *[f"│ signal: {item}" for item in environment_signals[:3]],
         "├─ Brief ─────────────────────────────────────────────────────────┤",
         f"│ status={snapshot.get('status', '-')}",
         f"│ headline={snapshot.get('headline', '-')}",
@@ -9475,6 +9631,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     trace_summary = snapshot.get("trace_summary", [])
     if not isinstance(trace_summary, list):
         trace_summary = []
+    environment_signals = snapshot.get("environment_signals", [])
+    if not isinstance(environment_signals, list):
+        environment_signals = []
     recent_commands = snapshot.get("recent_commands", [])
     if not isinstance(recent_commands, list):
         recent_commands = []
@@ -9486,6 +9645,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         f"panel: {panel}",
         f"hint: {snapshot.get('panel_hint', '-')}",
         f"status: {snapshot.get('status', '-')}",
+        f"env: {snapshot.get('environment_profile', '-') or '-'}",
         f"focus: {snapshot.get('focus_title', '-')}",
         f"quick: {_build_latest_quick_action_badge(snapshot)}",
         f"next: {state_card.get('next', '-')}",
@@ -9567,6 +9727,14 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     if headline:
         lines.extend(["", "Brief:"])
         lines.extend(_wrap_tui_text_lines(headline, width=width))
+    environment_summary = str(snapshot.get("environment_summary", "")).strip()
+    if environment_summary:
+        lines.extend(["", "Environment:"])
+        lines.extend(_wrap_tui_text_lines(environment_summary, width=width))
+    if environment_signals:
+        lines.extend(["", "Signals:"])
+        for item in environment_signals[:3]:
+            lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
     focus_body = str(snapshot.get("focus_body", "")).strip()
     if focus_body:
         lines.extend(["", "Focus:"])
@@ -9643,21 +9811,22 @@ def _build_tui_starter_prompts(snapshot: dict[str, object]) -> list[str]:
     targets = snapshot.get("usable_targets", [])
     if not isinstance(targets, list):
         targets = []
+    target_set = {str(item).strip().lower() for item in targets if str(item).strip()}
     provider = str(snapshot.get("active_provider", snapshot.get("provider", "auto"))).strip() or "auto"
     prompts: list[str] = [
         "检查当前环境有什么异常",
         "总结目前最值得优先处理的问题",
     ]
-    if "swarm" in [str(item).strip().lower() for item in targets]:
+    if target_set.intersection({"swarm", "docker-swarm"}):
         prompts.extend(
             [
                 "列出 Swarm 当前不健康的 service",
                 "分析最近失败的 Swarm task 并给出修复建议",
             ]
         )
-    if "docker" in [str(item).strip().lower() for item in targets]:
+    if "docker" in target_set:
         prompts.append("看看 Docker 容器里有没有异常重启")
-    if "k8s" in [str(item).strip().lower() for item in targets]:
+    if target_set.intersection({"k8s", "kubernetes"}):
         prompts.append("找出当前集群里异常 Pod 和最近 Events")
     panel_prompts = {
         "overview": ["给我一份当前平台总览简报"],
@@ -9685,8 +9854,12 @@ def _build_tui_idle_content_rows(snapshot: dict[str, object], *, width: int) -> 
     prompts = _build_tui_starter_prompts(snapshot)
     quick_state = _build_latest_quick_action_badge(snapshot)
     state_card = _build_tui_state_card(snapshot)
+    profile = str(snapshot.get("environment_profile", "")).strip() or "-"
+    summary = str(snapshot.get("environment_summary", "")).strip() or "-"
     sections = [
         "Start Here",
+        f"- profile: {profile}",
+        f"- summary: {summary}",
         f"- next: {state_card.get('next', '-')}",
         f"- quick: {quick_state}",
         f"- hint: {snapshot.get('panel_hint', '-')}",

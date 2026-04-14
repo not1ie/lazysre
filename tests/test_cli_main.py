@@ -14,6 +14,7 @@ from lazysre.cli.main import (
     _build_provider_setup_checks,
     _build_doctor_gate,
     _build_discovery_target_updates,
+    _build_environment_landscape,
     _build_incident_report_payload,
     _compute_doctor_autofix,
     _collect_runtime_status,
@@ -1679,6 +1680,9 @@ def test_collect_environment_discovery_scans_without_k8s_token(
     assert report["briefing"]["status"] == "attention"
     assert "docker-swarm" in report["briefing"]["headline"]
     assert report["briefing"]["next"] == "lazysre swarm --logs"
+    assert report["landscape"]["profile"] == "hybrid-swarm-k8s"
+    assert report["briefing"]["profile_label"] == "Hybrid Swarm + K8s"
+    assert any("signal:" in item for item in report["briefing"]["evidence"])
 
 
 def test_build_discovery_target_updates_prefers_discovered_values() -> None:
@@ -1730,6 +1734,63 @@ def test_build_environment_scan_briefing_when_no_targets() -> None:
     assert briefing["status"] == "attention"
     assert "暂未发现" in briefing["headline"]
     assert briefing["next"] == 'lazysre "帮我解释为什么当前机器还不能被 LazySRE 纳管"'
+
+
+def test_build_environment_landscape_detects_hybrid_runtime() -> None:
+    landscape = _build_environment_landscape(
+        {
+            "usable_targets": ["docker", "docker-swarm", "kubernetes", "prometheus"],
+            "discoveries": {
+                "docker": {
+                    "reachable": True,
+                    "swarm_active": True,
+                    "swarm_services": 6,
+                    "exited_containers": 2,
+                },
+                "kubernetes": {
+                    "reachable": True,
+                    "nodes": 3,
+                    "namespace": "prod",
+                    "problem_pods": 2,
+                    "warning_events": 4,
+                },
+                "prometheus": {"reachable": True, "url": "http://prom:9090"},
+                "providers": {"configured": ["openai"]},
+            },
+        }
+    )
+
+    assert landscape["profile"] == "hybrid-swarm-k8s"
+    assert landscape["label"] == "Hybrid Swarm + K8s"
+    assert "swarm=6 services" in landscape["summary"]
+    assert any("Swarm active" in item for item in landscape["signals"])
+    assert any("K8s problem pods=2" in item for item in landscape["signals"])
+    assert any("Prometheus ready" in item for item in landscape["signals"])
+
+
+def test_build_environment_scan_briefing_includes_profile_and_signals() -> None:
+    report = {
+        "summary": {"pass": 6, "warn": 2, "error": 0},
+        "usable_targets": ["docker", "docker-swarm", "kubernetes", "prometheus"],
+        "discoveries": {
+            "docker": {"reachable": True, "swarm_active": True, "swarm_services": 4, "exited_containers": 1},
+            "kubernetes": {"reachable": True, "nodes": 2, "namespace": "prod", "problem_pods": 1, "warning_events": 2},
+            "prometheus": {"reachable": True, "url": "http://prometheus:9090"},
+            "providers": {"configured": []},
+        },
+        "issues": [{"name": "k8s.problem_pods", "severity": "warn", "detail": "1 problem pod", "hint": "check pod"}],
+        "suggestions": ["检查 K8s 异常 Pod 和 Warning Events"],
+        "next_actions": ["lazysre swarm --logs"],
+    }
+
+    briefing = _build_environment_scan_briefing(report)
+
+    assert briefing["profile"] == "hybrid-swarm-k8s"
+    assert briefing["profile_label"] == "Hybrid Swarm + K8s"
+    assert "现场画像" in briefing["headline"]
+    assert any("profile:" in item for item in briefing["evidence"])
+    assert any("signal:" in item for item in briefing["evidence"])
+    assert any("K8s problem pods=1" in item for item in briefing["signals"])
 
 
 def test_build_overview_briefing_prefers_remote_attention() -> None:
@@ -1844,13 +1905,31 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
             {
                 "generated_at_utc": "2026-04-10T00:00:00+00:00",
                 "usable_targets": ["docker-swarm", "kubernetes"],
+                "landscape": {
+                    "profile": "hybrid-swarm-k8s",
+                    "label": "Hybrid Swarm + K8s",
+                    "summary": "Hybrid Swarm + K8s; swarm=3 services, k8s nodes=2/problem_pods=1",
+                    "signals": [
+                        "Swarm active，services=3",
+                        "K8s reachable，nodes=2，namespace=prod",
+                        "K8s problem pods=1",
+                    ],
+                },
                 "next_actions": ["lazysre swarm --logs"],
                 "briefing": {
-                    "status": "attention",
-                    "headline": "本机已发现 Swarm 和 K8s，可直接开始诊断。",
-                    "next": "lazysre swarm --logs",
+                        "status": "attention",
+                        "headline": "本机已发现 Swarm 和 K8s，可直接开始诊断。",
+                        "profile": "hybrid-swarm-k8s",
+                        "profile_label": "Hybrid Swarm + K8s",
+                        "summary": "Hybrid Swarm + K8s; swarm=3 services, k8s nodes=2/problem_pods=1",
+                        "signals": [
+                            "Swarm active，services=3",
+                            "K8s reachable，nodes=2，namespace=prod",
+                            "K8s problem pods=1",
+                        ],
+                        "next": "lazysre swarm --logs",
+                    },
                 },
-            },
             ensure_ascii=False,
         ),
         encoding="utf-8",
@@ -1928,6 +2007,9 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
 
     assert snapshot["status"] == "attention"
     assert "docker-swarm" in snapshot["usable_targets"]
+    assert snapshot["environment_profile"] == "Hybrid Swarm + K8s"
+    assert "swarm=3 services" in snapshot["environment_summary"]
+    assert any("Swarm active" in item for item in snapshot["environment_signals"])
     assert snapshot["session_turns"] == 2
     assert snapshot["last_user"] == "重启它"
     assert snapshot["recent_commands"] == ["检查 swarm 服务", "重启它"]
