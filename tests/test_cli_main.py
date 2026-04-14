@@ -1939,7 +1939,7 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert snapshot["quick_action_items"]
     assert snapshot["quick_action_items"][0]["id"] == "1"
     assert snapshot["latest_quick_action"]["command"] == "/activity"
-    assert snapshot["quick_action_items"][0]["last_status"] == "ok"
+    assert any(item.get("command") == "/activity" and item.get("last_status") == "ok" for item in snapshot["quick_action_items"])
 
 
 def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2248,6 +2248,18 @@ def test_sort_quick_action_catalog_prefers_low_risk_inspect_in_normal_state() ->
     assert sorted_items[-1]["command"] == "docker service update --force api"
 
 
+def test_sort_quick_action_catalog_demotes_latest_successful_command() -> None:
+    items = [
+        {"id": "1", "title": "Trace", "source": "focus", "command": "/trace", "kind": "inspect", "risk": "low"},
+        {"id": "2", "title": "Scan", "source": "recommended", "command": "lazysre scan", "kind": "inspect", "risk": "low"},
+    ]
+
+    sorted_items = cli_main._sort_quick_action_catalog(items, latest_result={"status": "ok", "command": "/trace"})
+
+    assert sorted_items[0]["command"] == "lazysre scan"
+    assert sorted_items[1]["command"] == "/trace"
+
+
 def test_sort_quick_action_catalog_prioritizes_trace_after_failure() -> None:
     items = [
         {"id": "1", "title": "Apply", "source": "recommended", "command": "docker service update --force api", "kind": "write", "risk": "high"},
@@ -2260,6 +2272,22 @@ def test_sort_quick_action_catalog_prioritizes_trace_after_failure() -> None:
     assert sorted_items[0]["command"] == "/trace"
     assert sorted_items[1]["command"] == "/timeline"
     assert sorted_items[-1]["command"] == "docker service update --force api"
+
+
+def test_build_tui_state_card_skips_latest_successful_command() -> None:
+    card = cli_main._build_tui_state_card(
+        {
+            "focus_title": "Ready",
+            "focus_body": "no blocker",
+            "latest_quick_action": {"status": "ok", "command": "/trace"},
+            "quick_action_items": [
+                {"id": "1", "command": "/trace"},
+                {"id": "2", "command": "lazysre scan"},
+            ],
+            "focus_actions": ["/activity"],
+        }
+    )
+    assert card["next"] == "/do 2 -> lazysre scan"
 
 
 def test_build_tui_action_bar_changes_by_panel() -> None:
@@ -2356,7 +2384,7 @@ def test_build_tui_sidebar_lines_overview_shows_focus_section() -> None:
 
     assert "focus: Active Alert" in joined
     assert "quick: ok:/activity" in joined
-    assert "next: /do 1 -> /activity" in joined
+    assert "next: /do 2 -> /scan" in joined
     assert "Focus:" in joined
     assert "Focus Actions:" in joined
     assert "Quick Actions:" in joined

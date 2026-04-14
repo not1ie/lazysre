@@ -6835,6 +6835,8 @@ def _sort_quick_action_catalog(
     latest_result: dict[str, object],
 ) -> list[dict[str, str]]:
     latest_failed = str(latest_result.get("status", "")).strip().lower() == "fail"
+    latest_succeeded = str(latest_result.get("status", "")).strip().lower() == "ok"
+    latest_command = str(latest_result.get("command", "")).strip()
 
     def _rank(item: dict[str, str]) -> tuple[int, int, str, str]:
         command = str(item.get("command", "")).strip()
@@ -6842,35 +6844,45 @@ def _sort_quick_action_catalog(
         kind = str(item.get("kind", "")).strip() or _classify_quick_action_kind(command)
         risk = str(item.get("risk", "")).strip() or _classify_quick_action_risk(command)
         risk_order = {"low": 0, "medium": 1, "high": 2, "critical": 3, "unknown": 4}
+        repeated_success_penalty = 1 if latest_succeeded and latest_command and command == latest_command else 0
+        bucket = 5
 
         if latest_failed:
             if command == "/trace":
-                return (0, 0, source, command)
+                bucket = 0
+                return (bucket, 0, source, command)
             if command == "/timeline":
-                return (1, 0, source, command)
+                bucket = 1
+                return (bucket, 0, source, command)
             if kind == "inspect" and risk == "low":
-                return (2, risk_order.get(risk, 4), source, command)
-            if source == "focus":
-                return (3, risk_order.get(risk, 4), source, command)
-            if risk in {"medium"}:
-                return (4, risk_order.get(risk, 4), source, command)
-            if risk in {"high", "critical"}:
-                return (6, risk_order.get(risk, 4), source, command)
-            return (5, risk_order.get(risk, 4), source, command)
+                bucket = 2
+            elif source == "focus":
+                bucket = 3
+            elif risk in {"medium"}:
+                bucket = 4
+            elif risk in {"high", "critical"}:
+                bucket = 6
+            else:
+                bucket = 5
+            return (bucket, risk_order.get(risk, 4), source, command)
 
         if source == "focus" and risk == "low":
-            return (0, risk_order.get(risk, 4), source, command)
-        if kind == "inspect" and risk == "low":
-            return (1, risk_order.get(risk, 4), source, command)
-        if source == "activity":
-            return (2, risk_order.get(risk, 4), source, command)
-        if risk == "medium":
-            return (3, risk_order.get(risk, 4), source, command)
-        if kind == "remote" and risk == "low":
-            return (4, risk_order.get(risk, 4), source, command)
-        if risk in {"high", "critical"}:
-            return (6, risk_order.get(risk, 4), source, command)
-        return (5, risk_order.get(risk, 4), source, command)
+            bucket = 0
+        elif kind == "inspect" and risk == "low":
+            bucket = 1
+        elif source == "activity":
+            bucket = 2
+        elif risk == "medium":
+            bucket = 3
+        elif kind == "remote" and risk == "low":
+            bucket = 4
+        elif risk in {"high", "critical"}:
+            bucket = 6
+        else:
+            bucket = 5
+        if repeated_success_penalty:
+            bucket += 2
+        return (bucket, risk_order.get(risk, 4), source, command)
 
     ordered = sorted(items, key=_rank)
     normalized: list[dict[str, str]] = []
@@ -7093,6 +7105,8 @@ def _build_tui_state_card(snapshot: dict[str, object]) -> dict[str, str]:
                 command = str(raw.get("command", "")).strip()
                 action_id = str(raw.get("id", "")).strip()
                 if command and action_id:
+                    if latest_status == "ok" and command == latest_command:
+                        continue
                     next_line = f"/do {action_id} -> {command[:56]}"
                     break
         if next_line == "-":
