@@ -7085,15 +7085,42 @@ def _classify_quick_action_kind(command_text: str) -> str:
     return "inspect"
 
 
+def _classify_quick_action_risk(command_text: str) -> str:
+    command = str(command_text or "").strip()
+    if not command:
+        return "unknown"
+    lowered = command.lower()
+    if command.startswith("/"):
+        if any(lowered.startswith(prefix) for prefix in ["/trace", "/timeline", "/activity", "/focus", "/scan", "/brief", "/providers", "/do", "/actions"]):
+            return "low"
+        return "medium"
+    if lowered.startswith("lazysre template run") or lowered.startswith("lsre template run"):
+        return "high" if "--apply" in lowered else "medium"
+    if lowered.startswith("lazysre fix") or lowered.startswith("lsre fix") or lowered.startswith("lazysre remediate") or lowered.startswith("lsre remediate"):
+        return "high"
+    if lowered.startswith("lazysre remote") or lowered.startswith("lsre remote"):
+        return "low" if ("--logs" in lowered or "--service" in lowered) else "medium"
+    if lowered.startswith("lazysre swarm") or lowered.startswith("lsre swarm") or lowered.startswith("lazysre scan") or lowered.startswith("lsre scan") or lowered.startswith("lazysre brief") or lowered.startswith("lsre brief"):
+        return "low"
+    try:
+        tokens = shlex.split(command)
+    except Exception:
+        return "unknown"
+    if not tokens:
+        return "unknown"
+    return str(assess_command(tokens).risk_level or "unknown")
+
+
 def _format_quick_action_line(item: dict[str, object]) -> str:
     action_id = str(item.get("id", "?")).strip() or "?"
     command = str(item.get("command", "")).strip() or "-"
     title = str(item.get("title", command)).strip() or command
     source = str(item.get("source", "suggested")).strip() or "suggested"
     kind = _classify_quick_action_kind(command)
+    risk = _classify_quick_action_risk(command)
     status = str(item.get("last_status", "")).strip()
     suffix = f" [last={status}]" if status else ""
-    return f"{action_id}. [{kind}][{source}] {title}{suffix}"
+    return f"{action_id}. [{kind}][{risk}][{source}] {title}{suffix}"
 
 
 def _format_quick_action_command(item: dict[str, object]) -> str:

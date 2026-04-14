@@ -2023,10 +2023,10 @@ def test_render_quick_actions_text_lists_numbered_items(monkeypatch: pytest.Monk
     rendered = _render_quick_actions_text({})
 
     assert "Quick Actions" in rendered
-    assert "1. [inspect][focus] Focus [last=ok]" in rendered
+    assert "1. [inspect][low][focus] Focus [last=ok]" in rendered
     assert "cmd: /trace" in rendered
     assert "last-output: Trace Summary ready" in rendered
-    assert "2. [inspect][recommended] Recommended" in rendered
+    assert "2. [inspect][low][recommended] Recommended" in rendered
     assert "cmd: lazysre scan" in rendered
     assert "Last Run" in rendered
     assert "/do 1" in rendered
@@ -2228,6 +2228,10 @@ def test_quick_action_kind_classifies_common_commands() -> None:
     assert cli_main._classify_quick_action_kind("lazysre template run swarm-image-pull-failed --var service=api --apply") == "template"
     assert cli_main._classify_quick_action_kind("lazysre remote root@192.168.10.101 --logs") == "remote"
     assert cli_main._classify_quick_action_kind("docker service update --force api") == "write"
+    assert cli_main._classify_quick_action_risk("/trace") == "low"
+    assert cli_main._classify_quick_action_risk("lazysre template run swarm-image-pull-failed --var service=api --apply") == "high"
+    assert cli_main._classify_quick_action_risk("lazysre remote root@192.168.10.101 --logs") == "low"
+    assert cli_main._classify_quick_action_risk("docker service update --force api") == "high"
 
 
 def test_build_tui_action_bar_changes_by_panel() -> None:
@@ -2329,7 +2333,8 @@ def test_build_tui_sidebar_lines_overview_shows_focus_section() -> None:
     assert "Focus Actions:" in joined
     assert "Quick Actions:" in joined
     assert "Last Quick Action:" in joined
-    assert "[inspect][focus] Active Alert" in joined
+    assert "[inspect][low][focus] Active" in joined
+    assert "Alert [last=ok]" in joined
     assert "[last=ok]" in joined
     assert "cmd: /activity" in joined
     assert "/activity" in joined
