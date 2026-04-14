@@ -9128,7 +9128,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         *[f"│ {item}" for item in shortcuts],
         "├─ Conversation ──────────────────────────────────────────────────┤",
         "│ 直接输入自然语言，例如：检查当前服务器 / 修复 swarm 副本不足",
-        "│ Tab 自动补全命令，Up/Down 浏览历史，Ctrl-L 清屏。",
+        "│ Tab 自动补全命令，Up/Down 浏览历史，Ctrl-L 清屏，F1/? 打开帮助。",
         "╰─────────────────────────────────────────────────────────────────╯",
     ]
     return "\n".join(lines)
@@ -9161,11 +9161,20 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
     input_history: list[str] = []
     history_index = -1
     history_seed = ""
+    overlay = ""
     while True:
-        _draw_tui(stdscr, snapshot=snapshot, history=history, input_text=input_text, status=status)
+        _draw_tui(stdscr, snapshot=snapshot, history=history, input_text=input_text, status=status, overlay=overlay)
         key = stdscr.get_wch()
         if isinstance(key, str):
+            if (not input_text) and key == "?":
+                overlay = "" if overlay == "help" else "help"
+                status = "help" if overlay else "ready"
+                continue
             if key in {"\n", "\r"}:
+                if overlay:
+                    overlay = ""
+                    status = "ready"
+                    continue
                 text = input_text.strip()
                 input_text = ""
                 if not text:
@@ -9189,6 +9198,7 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 history.append(("LazySRE", output.strip() or "(no output)"))
                 snapshot.update(_build_tui_dashboard_snapshot(options))
                 status = "ready"
+                overlay = ""
                 completion_index = -1
                 completion_seed = ""
                 history_index = -1
@@ -9206,6 +9216,7 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 history = [("LazySRE", "已清空当前屏幕内容。输入 /help /providers /brief 继续。")]
                 input_text = ""
                 status = "ready"
+                overlay = ""
                 completion_index = -1
                 completion_seed = ""
                 history_index = -1
@@ -9219,14 +9230,20 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 history_seed = ""
                 continue
             if key == "\x1b":
+                if overlay:
+                    overlay = ""
+                    status = "ready"
+                    continue
                 break
             if (not input_text) and key in {"1", "2", "3", "4"}:
                 options["tui_panel"] = _panel_name_from_shortcut(key)
                 snapshot.update(_build_tui_dashboard_snapshot(options))
                 history.append(("LazySRE", f"左侧面板已切换到 {snapshot.get('sidebar_panel', 'overview')}。"))
                 status = f"panel:{snapshot.get('sidebar_panel', 'overview')}"
+                overlay = ""
                 continue
             if key.isprintable():
+                overlay = ""
                 input_text += key
                 completion_index = -1
                 completion_seed = ""
@@ -9249,26 +9266,39 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 history_seed=history_seed,
                 direction="down",
             )
+        elif key == curses.KEY_F1:
+            overlay = "" if overlay == "help" else "help"
+            status = "help" if overlay else "ready"
         elif key == curses.KEY_F2:
             options["tui_panel"] = _next_tui_panel(str(options.get("tui_panel", snapshot.get("sidebar_panel", "overview"))))
             snapshot.update(_build_tui_dashboard_snapshot(options))
             history.append(("LazySRE", f"左侧面板已切换到 {snapshot.get('sidebar_panel', 'overview')}。"))
             status = f"panel:{snapshot.get('sidebar_panel', 'overview')}"
+            overlay = ""
         elif key in {curses.KEY_BACKSPACE, curses.KEY_DC}:
             input_text = input_text[:-1]
+            overlay = ""
             completion_index = -1
             completion_seed = ""
             history_index = -1
             history_seed = ""
 
 
-def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, str]], input_text: str, status: str) -> None:
+def _draw_tui(
+    stdscr,
+    *,
+    snapshot: dict[str, object],
+    history: list[tuple[str, str]],
+    input_text: str,
+    status: str,
+    overlay: str = "",
+) -> None:
     height, width = stdscr.getmaxyx()
     stdscr.erase()
     sidebar_w = min(max(28, width // 3), 46)
     title = (
         f" LazySRE {snapshot.get('version', '-')} | {status} | panel={snapshot.get('sidebar_panel', 'overview')} "
-        "| Tab autocomplete | Up/Down history | Ctrl-L clear | 1-4/F2 panel | Esc quit "
+        "| Tab autocomplete | Up/Down history | Ctrl-L clear | F1/? help | 1-4/F2 panel | Esc quit "
     )
     stdscr.addnstr(0, 0, title.ljust(width), width - 1)
     for y in range(1, height - 2):
@@ -9298,8 +9328,108 @@ def _draw_tui(stdscr, *, snapshot: dict[str, object], history: list[tuple[str, s
     prompt = f"lsre> {input_text}"
     stdscr.addnstr(height - 2, 0, "-" * max(1, width - 1), width - 1)
     stdscr.addnstr(height - 1, 0, prompt, width - 1)
+    if overlay == "help":
+        _draw_tui_help_overlay(stdscr, snapshot=snapshot, width=width, height=height)
     stdscr.move(height - 1, min(len(prompt), width - 2))
     stdscr.refresh()
+
+
+def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) -> list[str]:
+    panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
+    state_card = _build_tui_state_card(snapshot)
+    active_provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
+    panel_examples = {
+        "overview": [
+            "检查当前环境有什么异常",
+            "/focus",
+            "/brief",
+        ],
+        "activity": [
+            "/activity",
+            "列出最近失败的 Swarm service",
+            "/do 1",
+        ],
+        "timeline": [
+            "/trace",
+            "/timeline",
+            "解释最近一次修复为什么失败",
+        ],
+        "providers": [
+            "/providers",
+            "/provider openai",
+            "检查当前 provider 是否就绪",
+        ],
+    }
+    sections = [
+        "LazySRE Help",
+        f"当前面板: {panel}",
+        f"当前 provider: {active_provider}",
+        f"建议下一步: {state_card.get('next', '-')}",
+        "",
+        "Core",
+        "- 直接输入自然语言，例如：检查当前服务器 / 修复 swarm 副本不足",
+        "- /do 1 执行当前最优先建议，/focus /activity /trace /timeline 查看上下文",
+        "- /scan 零配置探测本机 Docker/Swarm/K8s/Prometheus",
+        "",
+        "Keys",
+        "- Tab 自动补全，Up/Down 浏览输入历史",
+        "- 1-4 或 F2 切换左侧面板",
+        "- F1 或 ? 打开/关闭帮助",
+        "- Ctrl-L 清屏，Esc 关闭帮助或退出 TUI",
+        "",
+        "Panel Examples",
+        *[f"- {item}" for item in panel_examples.get(panel, panel_examples["overview"])],
+        "",
+        "High Value Commands",
+        "- /do 1",
+        "- /focus",
+        "- /activity",
+        "- /trace",
+        "- /timeline",
+        "- /providers",
+        "- /scan",
+    ]
+    lines: list[str] = []
+    for entry in sections:
+        if not entry:
+            lines.append("")
+            continue
+        if entry.startswith("- "):
+            lines.extend(_wrap_tui_text_lines(entry, width=width))
+            continue
+        if entry in {"LazySRE Help", "Core", "Keys", "Panel Examples", "High Value Commands"}:
+            lines.append(entry)
+            continue
+        lines.extend(_wrap_tui_text_lines(entry, width=width))
+    return lines
+
+
+def _draw_tui_help_overlay(stdscr, *, snapshot: dict[str, object], width: int, height: int) -> None:
+    overlay_width = min(max(52, width - 10), 92)
+    content_width = max(20, overlay_width - 4)
+    content_lines = _build_tui_help_overlay_lines(snapshot, width=content_width)
+    overlay_height = min(height - 4, len(content_lines) + 4)
+    top = max(1, (height - overlay_height) // 2)
+    left = max(1, (width - overlay_width) // 2)
+    bottom = min(height - 2, top + overlay_height - 1)
+    right = min(width - 2, left + overlay_width - 1)
+
+    for y in range(top, bottom + 1):
+        for x in range(left, right + 1):
+            char = " "
+            if y in {top, bottom} and x in {left, right}:
+                char = "+"
+            elif y in {top, bottom}:
+                char = "-"
+            elif x in {left, right}:
+                char = "|"
+            stdscr.addch(y, x, char)
+
+    visible_lines = content_lines[: max(0, overlay_height - 4)]
+    for idx, line in enumerate(visible_lines, top + 1):
+        stdscr.addnstr(idx, left + 2, line, content_width)
+    footer = "F1/? close"
+    stdscr.addnstr(bottom - 1, left + 2, footer, content_width)
 
 
 def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list[str]:
@@ -9674,7 +9804,7 @@ def _switch_tui_panel(options: dict[str, object], requested: str) -> str:
 
 
 def _tui_welcome_message() -> str:
-    return "全屏 TUI 已启动。输入自然语言，或使用 /do 1 /focus /activity /trace /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板。"
+    return "全屏 TUI 已启动。输入自然语言，或使用 /do 1 /focus /activity /trace /timeline /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板，按 F1 或 ? 查看帮助。"
 
 
 def _cycle_tui_input_history(

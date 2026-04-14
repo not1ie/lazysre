@@ -138,6 +138,7 @@ from lazysre.cli.main import (
     _render_timeline_text,
     _build_tui_footer_line,
     _build_tui_action_bar,
+    _build_tui_help_overlay_lines,
     _build_tui_panel_hint,
     _build_tui_status_hint_line,
     _build_tui_panel_counts,
@@ -841,6 +842,7 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "hint=" in rendered
     assert "action_bar=" in rendered
     assert "Up/Down 浏览历史" in rendered
+    assert "F1/? 打开帮助" in rendered
 
 
 def test_natural_language_remediate_detection() -> None:
@@ -2207,6 +2209,31 @@ def test_build_tui_panel_hint_changes_by_panel() -> None:
     assert "建议动作" in _build_tui_panel_hint("activity")
     assert "执行轨迹" in _build_tui_panel_hint("timeline")
     assert "模型与网关" in _build_tui_panel_hint("providers")
+
+
+def test_build_tui_help_overlay_lines_reflects_panel_and_next_action() -> None:
+    lines = _build_tui_help_overlay_lines(
+        {
+            "sidebar_panel": "activity",
+            "provider": "mock",
+            "active_provider": "mock",
+            "focus_title": "Swarm Failure",
+            "quick_action_items": [
+                {"id": "1", "command": "/activity", "title": "Active Alert"},
+                {"id": "2", "command": "/scan", "title": "Rescan"},
+            ],
+            "latest_quick_action": {"status": "ok", "command": "/activity"},
+        },
+        width=40,
+    )
+
+    joined = "\n".join(lines)
+
+    assert "LazySRE Help" in joined
+    assert "当前面板: activity" in joined
+    assert "建议下一步: /do 2 -> /scan" in joined
+    assert "F1 或 ? 打开/关闭帮助" in joined
+    assert "列出最近失败的 Swarm service" in joined
 
 
 def test_build_tui_status_hint_line_uses_panel() -> None:
