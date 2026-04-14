@@ -6823,8 +6823,62 @@ def _annotate_quick_action_catalog(
                 item["last_output_preview"] = latest_summary[:120]
             if latest_when:
                 item["last_executed_at_utc"] = latest_when
+        item["kind"] = _classify_quick_action_kind(command)
+        item["risk"] = _classify_quick_action_risk(command)
         annotated.append({str(k): str(v) for k, v in item.items()})
     return annotated
+
+
+def _sort_quick_action_catalog(
+    items: list[dict[str, str]],
+    *,
+    latest_result: dict[str, object],
+) -> list[dict[str, str]]:
+    latest_failed = str(latest_result.get("status", "")).strip().lower() == "fail"
+
+    def _rank(item: dict[str, str]) -> tuple[int, int, str, str]:
+        command = str(item.get("command", "")).strip()
+        source = str(item.get("source", "")).strip()
+        kind = str(item.get("kind", "")).strip() or _classify_quick_action_kind(command)
+        risk = str(item.get("risk", "")).strip() or _classify_quick_action_risk(command)
+        risk_order = {"low": 0, "medium": 1, "high": 2, "critical": 3, "unknown": 4}
+
+        if latest_failed:
+            if command == "/trace":
+                return (0, 0, source, command)
+            if command == "/timeline":
+                return (1, 0, source, command)
+            if kind == "inspect" and risk == "low":
+                return (2, risk_order.get(risk, 4), source, command)
+            if source == "focus":
+                return (3, risk_order.get(risk, 4), source, command)
+            if risk in {"medium"}:
+                return (4, risk_order.get(risk, 4), source, command)
+            if risk in {"high", "critical"}:
+                return (6, risk_order.get(risk, 4), source, command)
+            return (5, risk_order.get(risk, 4), source, command)
+
+        if source == "focus" and risk == "low":
+            return (0, risk_order.get(risk, 4), source, command)
+        if kind == "inspect" and risk == "low":
+            return (1, risk_order.get(risk, 4), source, command)
+        if source == "activity":
+            return (2, risk_order.get(risk, 4), source, command)
+        if risk == "medium":
+            return (3, risk_order.get(risk, 4), source, command)
+        if kind == "remote" and risk == "low":
+            return (4, risk_order.get(risk, 4), source, command)
+        if risk in {"high", "critical"}:
+            return (6, risk_order.get(risk, 4), source, command)
+        return (5, risk_order.get(risk, 4), source, command)
+
+    ordered = sorted(items, key=_rank)
+    normalized: list[dict[str, str]] = []
+    for index, raw in enumerate(ordered, 1):
+        item = dict(raw)
+        item["id"] = str(index)
+        normalized.append({str(k): str(v) for k, v in item.items()})
+    return normalized
 
 
 def _infer_trace_stage(summary: str) -> str:
@@ -7116,8 +7170,8 @@ def _format_quick_action_line(item: dict[str, object]) -> str:
     command = str(item.get("command", "")).strip() or "-"
     title = str(item.get("title", command)).strip() or command
     source = str(item.get("source", "suggested")).strip() or "suggested"
-    kind = _classify_quick_action_kind(command)
-    risk = _classify_quick_action_risk(command)
+    kind = str(item.get("kind", "")).strip() or _classify_quick_action_kind(command)
+    risk = str(item.get("risk", "")).strip() or _classify_quick_action_risk(command)
     status = str(item.get("last_status", "")).strip()
     suffix = f" [last={status}]" if status else ""
     return f"{action_id}. [{kind}][{risk}][{source}] {title}{suffix}"
@@ -8894,6 +8948,10 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     )
     latest_quick_action = _load_latest_quick_action_result()
     quick_action_items = _annotate_quick_action_catalog(
+        quick_action_items,
+        latest_result=latest_quick_action,
+    )
+    quick_action_items = _sort_quick_action_catalog(
         quick_action_items,
         latest_result=latest_quick_action,
     )

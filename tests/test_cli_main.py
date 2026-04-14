@@ -2234,6 +2234,34 @@ def test_quick_action_kind_classifies_common_commands() -> None:
     assert cli_main._classify_quick_action_risk("docker service update --force api") == "high"
 
 
+def test_sort_quick_action_catalog_prefers_low_risk_inspect_in_normal_state() -> None:
+    items = [
+        {"id": "1", "title": "Apply", "source": "recommended", "command": "docker service update --force api", "kind": "write", "risk": "high"},
+        {"id": "2", "title": "Trace", "source": "focus", "command": "/trace", "kind": "inspect", "risk": "low"},
+        {"id": "3", "title": "Scan", "source": "recommended", "command": "lazysre scan", "kind": "inspect", "risk": "low"},
+    ]
+
+    sorted_items = cli_main._sort_quick_action_catalog(items, latest_result={})
+
+    assert sorted_items[0]["command"] == "/trace"
+    assert sorted_items[1]["command"] == "lazysre scan"
+    assert sorted_items[-1]["command"] == "docker service update --force api"
+
+
+def test_sort_quick_action_catalog_prioritizes_trace_after_failure() -> None:
+    items = [
+        {"id": "1", "title": "Apply", "source": "recommended", "command": "docker service update --force api", "kind": "write", "risk": "high"},
+        {"id": "2", "title": "Timeline", "source": "focus", "command": "/timeline", "kind": "inspect", "risk": "low"},
+        {"id": "3", "title": "Trace", "source": "focus", "command": "/trace", "kind": "inspect", "risk": "low"},
+    ]
+
+    sorted_items = cli_main._sort_quick_action_catalog(items, latest_result={"status": "fail"})
+
+    assert sorted_items[0]["command"] == "/trace"
+    assert sorted_items[1]["command"] == "/timeline"
+    assert sorted_items[-1]["command"] == "docker service update --force api"
+
+
 def test_build_tui_action_bar_changes_by_panel() -> None:
     overview_bar = _build_tui_action_bar({"sidebar_panel": "overview"})
     activity_bar = _build_tui_action_bar({"sidebar_panel": "activity"})
