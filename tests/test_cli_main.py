@@ -151,6 +151,7 @@ from lazysre.cli.main import (
     _infer_trace_stage,
     _build_tui_panel_tabs,
     _build_tui_sidebar_lines,
+    _maybe_auto_bootstrap_for_tui,
     _normalize_tui_panel_name,
     _switch_tui_panel,
     _cycle_tui_completion,
@@ -1917,6 +1918,65 @@ def test_render_cached_startup_brief_prints_next_step(capsys: pytest.CaptureFixt
     out = capsys.readouterr().out
     assert "上次总览: attention" in out
     assert "lazysre swarm --logs" in out
+
+
+def test_maybe_auto_bootstrap_for_tui_writes_marker_on_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+
+    def fake_collect(*, timeout_sec: int, secrets_file: Path | None) -> dict[str, object]:
+        assert timeout_sec == 3
+        assert secrets_file is None
+        return {
+            "source": "environment-scan",
+            "briefing": {
+                "status": "attention",
+                "headline": "本机发现 Docker Swarm。",
+                "next": "lazysre swarm --logs",
+            },
+            "usable_targets": ["docker-swarm"],
+            "summary": {"warn": 1, "error": 0},
+            "next_actions": ["lazysre swarm --logs"],
+        }
+
+    monkeypatch.setattr(cli_main, "_collect_environment_discovery", fake_collect)
+
+    result = _maybe_auto_bootstrap_for_tui({"startup_scan_timeout_sec": 3})
+    marker = tmp_path / "lsre-onboarding.json"
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+
+    assert result["triggered"] is True
+    assert result["written"] is True
+    assert payload["first_scan_done"] is True
+    assert payload["briefing"]["next"] == "lazysre swarm --logs"
+
+
+def test_maybe_auto_bootstrap_for_tui_skips_when_marker_exists(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+    (tmp_path / "lsre-onboarding.json").write_text("{}", encoding="utf-8")
+
+    def fake_collect(*, timeout_sec: int, secrets_file: Path | None) -> dict[str, object]:
+        raise AssertionError("should not run collect when marker already exists")
+
+    monkeypatch.setattr(cli_main, "_collect_environment_discovery", fake_collect)
+
+    result = _maybe_auto_bootstrap_for_tui({})
+
+    assert result["triggered"] is False
+    assert result["reason"] == "marker-exists"
+
+
+def test_maybe_auto_bootstrap_for_tui_respects_disable_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+
+    def fake_collect(*, timeout_sec: int, secrets_file: Path | None) -> dict[str, object]:
+        raise AssertionError("should not run collect when disabled")
+
+    monkeypatch.setattr(cli_main, "_collect_environment_discovery", fake_collect)
+
+    result = _maybe_auto_bootstrap_for_tui({"tui_auto_bootstrap": False})
+
+    assert result["triggered"] is False
+    assert result["reason"] == "disabled"
 
 
 def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

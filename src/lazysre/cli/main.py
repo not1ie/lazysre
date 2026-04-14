@@ -8369,6 +8369,26 @@ def _maybe_auto_bootstrap_on_first_chat(options: dict[str, object]) -> None:
     typer.echo("你可以直接复制上面的建议来问我；需要交互式配置时再输入 /init，想刷新总览可输入 /brief。")
 
 
+def _maybe_auto_bootstrap_for_tui(options: dict[str, object]) -> dict[str, object]:
+    marker = Path(settings.data_dir) / "lsre-onboarding.json"
+    if marker.exists():
+        return {"triggered": False, "reason": "marker-exists"}
+    if not bool(options.get("tui_auto_bootstrap", True)):
+        return {"triggered": False, "reason": "disabled"}
+    timeout_raw = options.get("startup_scan_timeout_sec", 4)
+    try:
+        timeout_sec = int(timeout_raw)
+    except Exception:
+        timeout_sec = 4
+    timeout_sec = max(2, min(timeout_sec, 12))
+    try:
+        report = _collect_environment_discovery(timeout_sec=timeout_sec, secrets_file=None)
+        _write_first_scan_marker(report)
+    except Exception as exc:
+        return {"triggered": True, "written": False, "error": str(exc)[:180]}
+    return {"triggered": True, "written": True, "timeout_sec": timeout_sec}
+
+
 def _render_cached_startup_brief(marker: dict[str, object]) -> None:
     briefing = marker.get("briefing", {})
     if not isinstance(briefing, dict) or not briefing:
@@ -9651,6 +9671,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
 
 
 def _run_tui(options: dict[str, object], *, demo: bool) -> None:
+    _maybe_auto_bootstrap_for_tui(options)
     snapshot = _build_tui_dashboard_snapshot(options)
     if demo or (not sys.stdin.isatty()) or (not sys.stdout.isatty()):
         typer.echo(_render_tui_demo_text(snapshot))
