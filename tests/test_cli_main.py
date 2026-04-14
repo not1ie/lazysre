@@ -111,6 +111,7 @@ from lazysre.cli.main import (
     _split_fix_plan_read_write_commands,
     _parse_step_selection,
     _read_last_fix_plan_summary,
+    _read_last_incident_session_summary,
     _render_incident_report_markdown,
     _rewrite_argv_for_default_run,
     _summarize_doctor_checks,
@@ -848,6 +849,39 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "Up/Down 浏览历史" in rendered
     assert "F1/? 打开帮助" in rendered
     assert "Starter Prompts" in rendered
+
+
+def test_tui_demo_snapshot_renders_incident_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+    (tmp_path / "lsre-remediation-last.json").write_text(
+        json.dumps(
+            {
+                "generated_at_utc": "2026-04-10T08:05:00+00:00",
+                "objective": "恢复 payment 副本",
+                "mode": "execute",
+                "ok": True,
+                "next_step": "继续观察一个 watch 周期。",
+                "execution": {
+                    "diagnose": {"executed": 1, "succeeded": 1, "failed": 0},
+                    "apply": {"executed": 1, "succeeded": 1, "failed": 0},
+                    "verify": {"executed": 1, "succeeded": 1, "failed": 0},
+                    "rollback": {"executed": 0, "succeeded": 0, "failed": 0},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    rendered = _render_tui_demo_text(
+        _build_tui_dashboard_snapshot(
+            {"execute": False, "provider": "mock", "model": "test-model", "audit_log": str(tmp_path / "audit.jsonl")}
+        )
+    )
+
+    assert "Incident Session" in rendered
+    assert "恢复 payment 副本" in rendered
+    assert "diagnose:1/1 ok -> apply:1/1 ok -> verify:1/1 ok" in rendered
 
 
 def test_natural_language_remediate_detection() -> None:
@@ -1972,6 +2006,25 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
         ),
         encoding="utf-8",
     )
+    (tmp_path / "lsre-remediation-last.json").write_text(
+        json.dumps(
+            {
+                "generated_at_utc": "2026-04-10T00:12:00+00:00",
+                "objective": "恢复 api 服务副本",
+                "mode": "dry-run",
+                "ok": False,
+                "next_step": "先查看 verify 输出，再决定是否真正执行。",
+                "execution": {
+                    "diagnose": {"executed": 1, "succeeded": 1, "failed": 0},
+                    "apply": {"executed": 1, "succeeded": 0, "failed": 1},
+                    "verify": {"executed": 1, "succeeded": 0, "failed": 1},
+                    "rollback": {"executed": 0, "succeeded": 0, "failed": 0},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     (tmp_path / "lsre-quick-action-last.json").write_text(
         json.dumps(
             {
@@ -2028,6 +2081,8 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert "swarm=3 services" in snapshot["environment_summary"]
     assert any("Swarm active" in item for item in snapshot["environment_signals"])
     assert snapshot["swarm_posture"]["focus_service"] == "api"
+    assert snapshot["incident_session"]["source"] == "closed-loop-remediation"
+    assert snapshot["incident_session"]["status"] == "attention"
     assert snapshot["session_turns"] == 2
     assert snapshot["last_user"] == "重启它"
     assert snapshot["recent_commands"] == ["检查 swarm 服务", "重启它"]
@@ -2279,6 +2334,78 @@ def test_build_recent_trace_summary_handles_empty_and_counts() -> None:
 
     assert "steps=2 ok=1 fail=1 dry-run=1 exec=1" in summary[0]
     assert "stage-flow=observex1 -> applyx1" in summary[-1]
+
+
+def test_read_last_incident_session_summary_prefers_newer_closed_loop(tmp_path: Path) -> None:
+    (tmp_path / "lsre-fix-last.json").write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-04-10T08:00:00+00:00",
+                "instruction": "重启 api 服务",
+                "plan": {
+                    "apply_commands": ["docker service update --force api"],
+                    "rollback_commands": ["docker service rollback api"],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "lsre-remediation-last.json").write_text(
+        json.dumps(
+            {
+                "generated_at_utc": "2026-04-10T08:05:00+00:00",
+                "objective": "恢复 api 副本",
+                "mode": "execute",
+                "ok": False,
+                "next_step": "先查看 verify 阶段输出，再考虑回滚。",
+                "execution": {
+                    "diagnose": {"executed": 1, "succeeded": 1, "failed": 0},
+                    "apply": {"executed": 1, "succeeded": 0, "failed": 1},
+                    "verify": {"executed": 1, "succeeded": 0, "failed": 1},
+                    "rollback": {"executed": 0, "succeeded": 0, "failed": 0},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _read_last_incident_session_summary(tmp_path)
+
+    assert summary["exists"] is True
+    assert summary["source"] == "closed-loop-remediation"
+    assert summary["status"] == "attention"
+    assert "恢复 api 副本" in summary["headline"]
+    assert "diagnose:1/1 ok" in summary["stage_flow"]
+    assert "apply:0/1 fail=1" in summary["stage_flow"]
+    assert summary["commands"][0] == "/trace"
+
+
+def test_read_last_incident_session_summary_falls_back_to_fix_plan(tmp_path: Path) -> None:
+    (tmp_path / "lsre-fix-last.json").write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-04-10T08:00:00+00:00",
+                "instruction": "扩容 payment 到 3 个副本",
+                "plan": {
+                    "apply_commands": ["docker service scale payment=3"],
+                    "rollback_commands": ["docker service scale payment=1"],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _read_last_incident_session_summary(tmp_path)
+
+    assert summary["exists"] is True
+    assert summary["source"] == "fix-plan"
+    assert summary["status"] == "plan-ready"
+    assert "payment" in summary["headline"]
+    assert summary["stage_flow"] == "plan apply=1 rollback=1"
+    assert summary["commands"][0] == "/approve"
 
 
 def test_infer_trace_stage_recognizes_common_phases() -> None:
@@ -3053,6 +3180,27 @@ def test_build_tui_focus_card_prefers_swarm_posture_after_watch_alerts() -> None
     assert card["title"] == "Swarm Posture"
     assert "api" in card["body"]
     assert card["actions"][0] == "lazysre template run swarm-image-pull-failed --var service=api --apply"
+
+
+def test_build_tui_focus_card_uses_incident_session_when_present() -> None:
+    card = _build_tui_focus_card(
+        recent_activity=["incident attention | 恢复 payment 副本"],
+        recent_activity_commands=["/trace", "/timeline"],
+        provider_report={"active_ready": True},
+        timeline=[],
+        incident_session={
+            "exists": True,
+            "status": "attention",
+            "headline": "恢复 payment 副本",
+            "stage_flow": "diagnose:1/1 ok -> apply:0/1 fail=1",
+            "commands": ["/trace", "/timeline", "lazysre undo"],
+        },
+        watch_snapshot={},
+    )
+
+    assert card["title"] == "Incident Session"
+    assert "payment" in card["body"]
+    assert card["actions"][:2] == ["/trace", "/timeline"]
 
 
 def test_run_watch_snapshots_persists_alert_memory_once(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -6848,6 +6848,113 @@ def _read_last_fix_plan_summary(path: Path) -> dict[str, object]:
     }
 
 
+def _read_last_incident_session_summary(data_dir: Path) -> dict[str, object]:
+    def _parse_time(raw: object, *, fallback: Path) -> float:
+        text = str(raw or "").strip()
+        if text:
+            try:
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                pass
+        try:
+            return fallback.stat().st_mtime
+        except Exception:
+            return 0.0
+
+    def _stage_line(name: str, payload: dict[str, object]) -> str:
+        executed = int(payload.get("executed", 0) or 0)
+        succeeded = int(payload.get("succeeded", 0) or 0)
+        failed = int(payload.get("failed", 0) or 0)
+        skipped = int(payload.get("skipped", payload.get("skipped_high_risk", 0)) or 0)
+        if executed <= 0 and failed <= 0 and skipped <= 0:
+            return ""
+        line = f"{name}:{succeeded}/{executed}"
+        if failed:
+            line += f" fail={failed}"
+        elif executed > 0:
+            line += " ok"
+        if skipped:
+            line += f" skip={skipped}"
+        return line
+
+    fix_path = data_dir / "lsre-fix-last.json"
+    remediation_path = data_dir / "lsre-remediation-last.json"
+    candidates: list[tuple[float, dict[str, object]]] = []
+
+    if fix_path.exists():
+        try:
+            payload = json.loads(fix_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            plan = payload.get("plan", {})
+            apply_commands = [str(x).strip() for x in list(plan.get("apply_commands", [])) if str(x).strip()] if isinstance(plan, dict) else []
+            rollback_commands = [str(x).strip() for x in list(plan.get("rollback_commands", [])) if str(x).strip()] if isinstance(plan, dict) else []
+            instruction = str(payload.get("instruction", "")).strip()
+            candidates.append(
+                (
+                    _parse_time(payload.get("generated_at"), fallback=fix_path),
+                    {
+                        "exists": True,
+                        "source": "fix-plan",
+                        "status": "plan-ready",
+                        "headline": instruction[:120] or "最近一次修复计划已生成，等待执行。",
+                        "objective": instruction[:180],
+                        "mode": "plan",
+                        "stage_flow": f"plan apply={len(apply_commands)} rollback={len(rollback_commands)}",
+                        "next_step": "可先 /approve 分步执行，或用 lazysre remediate --from-last-plan --apply --verify 进入闭环执行。",
+                        "commands": [
+                            "/approve",
+                            "/undo",
+                            "lazysre remediate --from-last-plan --apply --verify",
+                        ],
+                        "generated_at": str(payload.get("generated_at", "")),
+                        "remote_target": "",
+                    },
+                )
+            )
+
+    if remediation_path.exists():
+        try:
+            payload = json.loads(remediation_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            execution = payload.get("execution", {})
+            execution = execution if isinstance(execution, dict) else {}
+            stage_parts = [
+                _stage_line("diagnose", execution.get("diagnose", {}) if isinstance(execution.get("diagnose", {}), dict) else {}),
+                _stage_line("apply", execution.get("apply", {}) if isinstance(execution.get("apply", {}), dict) else {}),
+                _stage_line("verify", execution.get("verify", {}) if isinstance(execution.get("verify", {}), dict) else {}),
+                _stage_line("rollback", execution.get("rollback", {}) if isinstance(execution.get("rollback", {}), dict) else {}),
+            ]
+            objective = str(payload.get("objective", "")).strip()
+            ok = bool(payload.get("ok", False))
+            candidates.append(
+                (
+                    _parse_time(payload.get("generated_at_utc"), fallback=remediation_path),
+                    {
+                        "exists": True,
+                        "source": "closed-loop-remediation",
+                        "status": "monitoring" if ok else "attention",
+                        "headline": objective[:120] or "最近一次闭环修复已执行。",
+                        "objective": objective[:180],
+                        "mode": str(payload.get("mode", "")).strip() or "-",
+                        "stage_flow": " -> ".join(part for part in stage_parts if part) or "closed-loop",
+                        "next_step": str(payload.get("next_step", "")).strip(),
+                        "commands": ["/trace", "/timeline", "/activity"] if ok else ["/trace", "/timeline", "lazysre undo"],
+                        "generated_at": str(payload.get("generated_at_utc", "")),
+                        "remote_target": str(payload.get("remote_target", "")).strip(),
+                    },
+                )
+            )
+
+    if not candidates:
+        return {"exists": False}
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
 def _read_recent_audit_events(path: Path, *, limit: int = 4) -> list[str]:
     if limit <= 0 or not path.exists():
         return []
@@ -7001,6 +7108,7 @@ def _build_tui_focus_card(
     recent_activity_commands: list[str],
     provider_report: dict[str, object],
     timeline: list[dict[str, str]],
+    incident_session: dict[str, object] | None = None,
     watch_snapshot: dict[str, object] | None = None,
 ) -> dict[str, object]:
     latest_failure = next(
@@ -7041,6 +7149,17 @@ def _build_tui_focus_card(
             ).strip()[:140],
             "actions": normalized_actions[:2] or ["/activity", "/swarm --logs"],
         }
+    if isinstance(incident_session, dict) and bool(incident_session.get("exists")):
+        headline = str(incident_session.get("headline", "")).strip()
+        stage_flow = str(incident_session.get("stage_flow", "")).strip()
+        commands = incident_session.get("commands", [])
+        normalized_commands = [str(item).strip() for item in commands if str(item).strip()] if isinstance(commands, list) else []
+        if headline or stage_flow:
+            return {
+                "title": "Incident Session",
+                "body": f"{headline} {stage_flow}".strip()[:140],
+                "actions": normalized_commands[:2] or ["/trace", "/timeline"],
+            }
     alert = next((item for item in recent_activity if "attention" in str(item).lower()), "")
     if str(alert).strip():
         actions = [cmd for cmd in recent_activity_commands[:2] if str(cmd).strip()] or ["/activity", "/scan"]
@@ -7258,6 +7377,7 @@ def _build_tui_recent_activity_context(options: dict[str, object]) -> dict[str, 
     commands: list[str] = []
     watch_snapshot = _load_latest_watch_snapshot(None)
     posture: dict[str, object] = {}
+    incident_session = _read_last_incident_session_summary(Path(settings.data_dir))
     if watch_snapshot:
         alerts = watch_snapshot.get("alerts", [])
         alert_count = len(alerts) if isinstance(alerts, list) else 0
@@ -7293,6 +7413,13 @@ def _build_tui_recent_activity_context(options: dict[str, object]) -> dict[str, 
         instruction = str(last_fix.get("instruction", "")).strip() or "最近一次修复计划"
         items.append(f"fix plan | cmds={last_fix.get('apply_commands', 0)} | {instruction[:72]}")
         commands.extend(["/activity", "/undo", "/approve"])
+    if bool(incident_session.get("exists")):
+        headline = str(incident_session.get("headline", "")).strip() or "最近一次 incident session"
+        status = str(incident_session.get("status", "")).strip() or "unknown"
+        items.append(f"incident {status} | {headline[:72]}")
+        incident_commands = incident_session.get("commands", [])
+        if isinstance(incident_commands, list):
+            commands.extend(str(item).strip() for item in incident_commands[:2] if str(item).strip())
     audit_log = Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))).expanduser()
     items.extend(_read_recent_audit_events(audit_log, limit=3))
     if not items:
@@ -7304,6 +7431,7 @@ def _build_tui_recent_activity_context(options: dict[str, object]) -> dict[str, 
         "watch": watch_snapshot if isinstance(watch_snapshot, dict) else {},
         "swarm_posture": posture if isinstance(posture, dict) else {},
         "last_fix": last_fix,
+        "incident_session": incident_session if isinstance(incident_session, dict) else {},
         "audit_log": str(audit_log),
     }
 
@@ -7410,6 +7538,9 @@ def _render_quick_action_result(
 def _build_tui_state_card(snapshot: dict[str, object]) -> dict[str, str]:
     focus_title = str(snapshot.get("focus_title", "")).strip() or "Focus"
     focus_body = str(snapshot.get("focus_body", "")).strip() or "-"
+    incident_session = snapshot.get("incident_session", {})
+    if not isinstance(incident_session, dict):
+        incident_session = {}
     latest = snapshot.get("latest_quick_action", {})
     if not isinstance(latest, dict):
         latest = {}
@@ -7420,6 +7551,12 @@ def _build_tui_state_card(snapshot: dict[str, object]) -> dict[str, str]:
     next_line = "-"
     if latest_status == "fail":
         next_line = "/trace -> /timeline -> /do 1"
+    elif bool(incident_session.get("exists")):
+        incident_commands = incident_session.get("commands", [])
+        if isinstance(incident_commands, list) and incident_commands:
+            next_line = str(incident_commands[0])[:72]
+        else:
+            next_line = str(incident_session.get("next_step", "")).strip()[:72] or "-"
     else:
         quick_actions = snapshot.get("quick_action_items", [])
         if isinstance(quick_actions, list):
@@ -9277,6 +9414,9 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     recent_activity = recent_activity_context.get("items", [])
     if not isinstance(recent_activity, list):
         recent_activity = []
+    incident_session = recent_activity_context.get("incident_session", {})
+    if not isinstance(incident_session, dict):
+        incident_session = {}
     provider_report = _build_provider_runtime_report(options)
     timeline_entries_raw = _read_recent_audit_timeline(
         Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))).expanduser(),
@@ -9287,6 +9427,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         recent_activity_commands=list(recent_activity_context.get("commands", [])),
         provider_report=provider_report,
         timeline=timeline_entries_raw,
+        incident_session=incident_session,
         watch_snapshot=recent_activity_context.get("watch", {}) if isinstance(recent_activity_context.get("watch", {}), dict) else {},
     )
     quick_action_items = _build_quick_action_catalog(
@@ -9339,6 +9480,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "recent_activity": recent_activity,
         "recent_activity_commands": recent_activity_context.get("commands", []),
         "swarm_posture": recent_activity_context.get("swarm_posture", {}) if isinstance(recent_activity_context.get("swarm_posture", {}), dict) else {},
+        "incident_session": incident_session,
         "sidebar_panel": _normalize_tui_panel_name(str(options.get("tui_panel", "overview"))),
         "panel_hint": _build_tui_panel_hint(_normalize_tui_panel_name(str(options.get("tui_panel", "overview")))),
         "provider_report": provider_report,
@@ -9415,6 +9557,9 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     swarm_posture = snapshot.get("swarm_posture", {})
     if not isinstance(swarm_posture, dict):
         swarm_posture = {}
+    incident_session = snapshot.get("incident_session", {})
+    if not isinstance(incident_session, dict):
+        incident_session = {}
     starter_prompts = _build_tui_starter_prompts(snapshot)
     action_bar = _build_tui_action_bar(snapshot)
     panel_hint = str(snapshot.get("panel_hint", "")).strip()
@@ -9443,6 +9588,14 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
             + [f"│ {str(swarm_posture.get('headline', '')).strip()}"]
             + [f"│ {str(item)}" for item in list(swarm_posture.get("signals", []))[:3]]
             if str(swarm_posture.get("headline", "")).strip()
+            else []
+        ),
+        *(
+            ["├─ Incident Session ────────────────────────────────────────────┤"]
+            + [f"│ status={incident_session.get('status', '-')}", f"│ {incident_session.get('headline', '-')}"]
+            + ([f"│ {incident_session.get('stage_flow', '')}"] if str(incident_session.get("stage_flow", "")).strip() else [])
+            + ([f"│ next={incident_session.get('next_step', '')}"] if str(incident_session.get("next_step", "")).strip() else [])
+            if bool(incident_session.get("exists"))
             else []
         ),
         "├─ Target ────────────────────────────────────────────────────────┤",
@@ -9845,6 +9998,9 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     swarm_posture = snapshot.get("swarm_posture", {})
     if not isinstance(swarm_posture, dict):
         swarm_posture = {}
+    incident_session = snapshot.get("incident_session", {})
+    if not isinstance(incident_session, dict):
+        incident_session = {}
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     state_card = _build_tui_state_card(snapshot)
     lines = [
@@ -9948,6 +10104,20 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         lines.extend(_wrap_tui_text_lines(str(swarm_posture.get("headline", "")).strip(), width=width))
         for item in list(swarm_posture.get("signals", []))[:3]:
             lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
+    if bool(incident_session.get("exists")):
+        lines.extend(["", "Incident Session:"])
+        lines.extend(
+            _wrap_tui_text_lines(
+                f"{incident_session.get('status', '-')}: {incident_session.get('headline', '-')}",
+                width=width,
+            )
+        )
+        stage_flow = str(incident_session.get("stage_flow", "")).strip()
+        if stage_flow:
+            lines.extend(_wrap_tui_text_lines(stage_flow, width=width))
+        next_step = str(incident_session.get("next_step", "")).strip()
+        if next_step:
+            lines.extend(_wrap_tui_text_lines(f"next: {next_step}", width=width))
     focus_body = str(snapshot.get("focus_body", "")).strip()
     if focus_body:
         lines.extend(["", "Focus:"])
@@ -10078,11 +10248,15 @@ def _build_tui_idle_content_rows(snapshot: dict[str, object], *, width: int) -> 
     swarm_posture = snapshot.get("swarm_posture", {})
     if not isinstance(swarm_posture, dict):
         swarm_posture = {}
+    incident_session = snapshot.get("incident_session", {})
+    if not isinstance(incident_session, dict):
+        incident_session = {}
     sections = [
         "Start Here",
         f"- profile: {profile}",
         f"- summary: {summary}",
         *([f"- swarm: {str(swarm_posture.get('headline', '')).strip()}"] if str(swarm_posture.get("headline", "")).strip() else []),
+        *([f"- incident: {str(incident_session.get('headline', '')).strip()}"] if bool(incident_session.get("exists")) and str(incident_session.get("headline", "")).strip() else []),
         f"- next: {state_card.get('next', '-')}",
         f"- quick: {quick_state}",
         f"- hint: {snapshot.get('panel_hint', '-')}",
@@ -10115,6 +10289,8 @@ def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history:
     timeline_count = len(timeline_entries) if isinstance(timeline_entries, list) else 0
     targets = snapshot.get("usable_targets", [])
     target_count = len(targets) if isinstance(targets, list) else 0
+    incident_session = snapshot.get("incident_session", {})
+    incident_status = str(incident_session.get("status", "")).strip() if isinstance(incident_session, dict) else ""
     last_you = ""
     for speaker, text in reversed(history):
         if speaker == "You":
@@ -10129,6 +10305,8 @@ def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history:
         f"activity={activity_count}",
         f"timeline={timeline_count}",
     ]
+    if incident_status:
+        parts.append(f"incident={incident_status}")
     if last_you:
         parts.append(f"last={last_you[:48]}")
     return " | ".join(parts)
@@ -10166,6 +10344,14 @@ def _build_tui_status_hint_line(snapshot: dict[str, object]) -> str:
             return f"hint> 最近 quick action 失败，先看 /trace /timeline，再决定是否重试 {command[:36]}"
         if status == "ok" and command:
             return f"hint> 最近 quick action 成功，可继续 /focus、/activity 或重跑 {command[:36]}"
+    incident_session = snapshot.get("incident_session", {})
+    if isinstance(incident_session, dict) and bool(incident_session.get("exists")):
+        stage_flow = str(incident_session.get("stage_flow", "")).strip()
+        next_step = str(incident_session.get("next_step", "")).strip()
+        if str(incident_session.get("status", "")).strip() == "attention":
+            return f"hint> 最近闭环会话仍需处理，先看 /trace /timeline。{stage_flow[:72]}"
+        if next_step:
+            return f"hint> 最近闭环会话下一步: {next_step[:72]}"
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     return f"hint> {_build_tui_panel_hint(panel)}"
 
