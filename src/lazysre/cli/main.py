@@ -9753,7 +9753,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     state_card = _build_tui_state_card(snapshot)
     logo_lines = _build_tui_logo_lines()
     lines = [
-        "╭─ LazySRE Fullscreen TUI ─────────────────────────────────────────╮",
+        "╭─ ◉ LazySRE Fullscreen TUI ───────────────────────────────────────╮",
         "├─ Brand ──────────────────────────────────────────────────────────┤",
         *[f"│ {line}" for line in logo_lines],
         f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
@@ -10012,7 +10012,7 @@ def _draw_tui(
     sidebar_w = min(max(28, width // 3), 46)
     logo = _build_tui_logo_lines(compact=True)[0]
     title = (
-        f" {logo} | {snapshot.get('version', '-')} | {status} | panel={snapshot.get('sidebar_panel', 'overview')} "
+        f" {logo} | {status} | panel={snapshot.get('sidebar_panel', 'overview')} "
         "| F1 help | F2 panel | Tab complete | Esc quit "
     )
     stdscr.addnstr(0, 0, title.ljust(width), width - 1)
@@ -10207,7 +10207,15 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
         incident_session = {}
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
     state_card = _build_tui_state_card(snapshot)
+    logo_lines = _build_tui_logo_lines()
+    side_brand = (
+        f"v{snapshot.get('version', '-')} {snapshot.get('mode', '-')}/{snapshot.get('provider', '-')}"
+    )
     lines = [
+        logo_lines[0],
+        logo_lines[1],
+        side_brand,
+        "",
         *_build_tui_panel_tabs(panel, width=width, snapshot=snapshot),
         "",
         f"panel: {panel}",
@@ -10707,10 +10715,10 @@ def _tui_welcome_message() -> str:
 
 def _build_tui_logo_lines(*, compact: bool = False) -> list[str]:
     if compact:
-        return ["lazysre"]
+        return ["◉ LazySRE"]
     return [
-        "lazysre",
-        "minimal ai sre cli",
+        "◉ LazySRE",
+        "AI-native Ops CLI",
     ]
 
 

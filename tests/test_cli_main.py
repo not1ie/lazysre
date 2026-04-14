@@ -831,7 +831,8 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
 
     assert "LazySRE Fullscreen TUI" in rendered
     assert "Brand" in rendered
-    assert "minimal ai sre cli" in rendered
+    assert "◉ LazySRE" in rendered
+    assert "AI-native Ops CLI" in rendered
     assert "provider=mock" in rendered
     assert "/remediate <目标>" in rendered
     assert "/swarm --logs" in rendered
@@ -2806,6 +2807,8 @@ def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
     joined = "\n".join(lines)
 
     assert "Panels:" in joined
+    assert "◉ LazySRE" in joined
+    assert "AI-native Ops CLI" in joined
     assert "[3:timeline(1)]" in joined
     assert "hint:" in joined
     assert "panel: timeline" in joined
