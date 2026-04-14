@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Formatter
@@ -9869,6 +9870,7 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
     stdscr.keypad(True)
     history: list[tuple[str, str]] = [("LazySRE", _tui_welcome_message())]
     input_text = ""
+    cursor_index = 0
     status = "ready"
     completion_index = -1
     completion_seed = ""
@@ -9877,7 +9879,15 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
     history_seed = ""
     overlay = ""
     while True:
-        _draw_tui(stdscr, snapshot=snapshot, history=history, input_text=input_text, status=status, overlay=overlay)
+        _draw_tui(
+            stdscr,
+            snapshot=snapshot,
+            history=history,
+            input_text=input_text,
+            cursor_index=cursor_index,
+            status=status,
+            overlay=overlay,
+        )
         key = stdscr.get_wch()
         if isinstance(key, str):
             if (not input_text) and key == "?":
@@ -9891,6 +9901,7 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                     continue
                 text = input_text.strip()
                 input_text = ""
+                cursor_index = 0
                 if not text:
                     continue
                 if text.lower() in {"exit", "quit", ":q", "/exit", "/quit"}:
@@ -9902,12 +9913,20 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                     history_seed = ""
                     completion_index = -1
                     completion_seed = ""
+                    cursor_index = 0
                     continue
                 if (not input_history) or (input_history[-1] != text):
                     input_history.append(text)
                 history.append(("You", text))
                 status = "running"
-                _draw_tui(stdscr, snapshot=snapshot, history=history, input_text=input_text, status=status)
+                _draw_tui(
+                    stdscr,
+                    snapshot=snapshot,
+                    history=history,
+                    input_text=input_text,
+                    cursor_index=cursor_index,
+                    status=status,
+                )
                 output = _handle_tui_input(text, options)
                 history.append(("LazySRE", output.strip() or "(no output)"))
                 snapshot.update(_build_tui_dashboard_snapshot(options))
@@ -9917,6 +9936,7 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 completion_seed = ""
                 history_index = -1
                 history_seed = ""
+                cursor_index = 0
                 continue
             if key == "\t":
                 input_text, completion_index, completion_seed = _cycle_tui_completion(
@@ -9925,10 +9945,12 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                     completion_index=completion_index,
                     completion_seed=completion_seed,
                 )
+                cursor_index = len(input_text)
                 continue
             if key == "\x0c":
                 history = [("LazySRE", "已清空当前屏幕内容。输入 /help /providers /brief 继续。")]
                 input_text = ""
+                cursor_index = 0
                 status = "ready"
                 overlay = ""
                 completion_index = -1
@@ -9937,7 +9959,9 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 history_seed = ""
                 continue
             if key in {"\x7f", "\b"}:
-                input_text = input_text[:-1]
+                if cursor_index > 0:
+                    input_text = input_text[: cursor_index - 1] + input_text[cursor_index:]
+                    cursor_index -= 1
                 completion_index = -1
                 completion_seed = ""
                 history_index = -1
@@ -9958,7 +9982,8 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 continue
             if key.isprintable():
                 overlay = ""
-                input_text += key
+                input_text = input_text[:cursor_index] + key + input_text[cursor_index:]
+                cursor_index += 1
                 completion_index = -1
                 completion_seed = ""
                 history_index = -1
@@ -9972,6 +9997,7 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 history_seed=history_seed,
                 direction="up",
             )
+            cursor_index = len(input_text)
         elif key == curses.KEY_DOWN:
             input_text, history_index, history_seed = _cycle_tui_input_history(
                 input_text,
@@ -9980,6 +10006,23 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 history_seed=history_seed,
                 direction="down",
             )
+            cursor_index = len(input_text)
+        elif key == curses.KEY_LEFT:
+            cursor_index = max(0, cursor_index - 1)
+            completion_index = -1
+            completion_seed = ""
+        elif key == curses.KEY_RIGHT:
+            cursor_index = min(len(input_text), cursor_index + 1)
+            completion_index = -1
+            completion_seed = ""
+        elif key == curses.KEY_HOME:
+            cursor_index = 0
+            completion_index = -1
+            completion_seed = ""
+        elif key == curses.KEY_END:
+            cursor_index = len(input_text)
+            completion_index = -1
+            completion_seed = ""
         elif key == curses.KEY_F1:
             overlay = "" if overlay == "help" else "help"
             status = "help" if overlay else "ready"
@@ -9989,8 +10032,18 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
             history.append(("LazySRE", f"左侧面板已切换到 {snapshot.get('sidebar_panel', 'overview')}。"))
             status = f"panel:{snapshot.get('sidebar_panel', 'overview')}"
             overlay = ""
-        elif key in {curses.KEY_BACKSPACE, curses.KEY_DC}:
-            input_text = input_text[:-1]
+        elif key == curses.KEY_BACKSPACE:
+            if cursor_index > 0:
+                input_text = input_text[: cursor_index - 1] + input_text[cursor_index:]
+                cursor_index -= 1
+            overlay = ""
+            completion_index = -1
+            completion_seed = ""
+            history_index = -1
+            history_seed = ""
+        elif key == curses.KEY_DC:
+            if cursor_index < len(input_text):
+                input_text = input_text[:cursor_index] + input_text[cursor_index + 1 :]
             overlay = ""
             completion_index = -1
             completion_seed = ""
@@ -10004,6 +10057,7 @@ def _draw_tui(
     snapshot: dict[str, object],
     history: list[tuple[str, str]],
     input_text: str,
+    cursor_index: int,
     status: str,
     overlay: str = "",
 ) -> None:
@@ -10043,13 +10097,60 @@ def _draw_tui(
     stdscr.addnstr(height - 4, 0, hint_line.ljust(width), width - 1)
     footer = _build_tui_footer_line(snapshot=snapshot, status=status, history=history)
     stdscr.addnstr(height - 3, 0, footer.ljust(width), width - 1)
-    prompt = f"lsre> {input_text}"
+    prompt, cursor_x = _build_tui_prompt_line_and_cursor(input_text=input_text, cursor_index=cursor_index, width=width)
     stdscr.addnstr(height - 2, 0, "-" * max(1, width - 1), width - 1)
     stdscr.addnstr(height - 1, 0, prompt, width - 1)
     if overlay == "help":
         _draw_tui_help_overlay(stdscr, snapshot=snapshot, width=width, height=height)
-    stdscr.move(height - 1, min(len(prompt), width - 2))
+    stdscr.move(height - 1, cursor_x)
     stdscr.refresh()
+
+
+def _tui_char_display_width(value: str) -> int:
+    if not value:
+        return 0
+    if unicodedata.combining(value):
+        return 0
+    if unicodedata.category(value).startswith("C"):
+        return 0
+    return 2 if unicodedata.east_asian_width(value) in {"W", "F"} else 1
+
+
+def _tui_text_display_width(text: str) -> int:
+    return sum(_tui_char_display_width(ch) for ch in str(text))
+
+
+def _build_tui_prompt_line_and_cursor(*, input_text: str, cursor_index: int, width: int) -> tuple[str, int]:
+    prefix = "lsre> "
+    max_width = max(1, int(width) - 1)
+    prefix_width = _tui_text_display_width(prefix)
+    if prefix_width >= max_width:
+        return prefix[:max_width], max(0, max_width - 1)
+
+    chars = list(str(input_text))
+    cursor = max(0, min(int(cursor_index), len(chars)))
+    char_widths = [_tui_char_display_width(ch) for ch in chars]
+    width_prefix = [0]
+    for w in char_widths:
+        width_prefix.append(width_prefix[-1] + w)
+
+    budget = max(0, max_width - prefix_width)
+
+    def _segment_width(start: int, end: int) -> int:
+        return width_prefix[end] - width_prefix[start]
+
+    start = 0
+    while start < cursor and _segment_width(start, cursor) > budget:
+        start += 1
+
+    end = start
+    while end < len(chars) and _segment_width(start, end + 1) <= budget:
+        end += 1
+
+    visible = "".join(chars[start:end])
+    cursor_x = prefix_width + _segment_width(start, cursor)
+    cursor_x = max(0, min(max_width - 1, cursor_x))
+    return f"{prefix}{visible}", cursor_x
 
 
 def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) -> list[str]:
@@ -10093,6 +10194,7 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
         "",
         "Keys",
         "- Tab 自动补全，Up/Down 浏览输入历史",
+        "- Left/Right/Home/End 移动光标，Delete 删除光标后字符",
         "- 1-4 或 F2 切换左侧面板",
         "- F1 或 ? 打开/关闭帮助",
         "- Ctrl-L 清屏，Esc 关闭帮助或退出 TUI",

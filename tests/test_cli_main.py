@@ -148,6 +148,7 @@ from lazysre.cli.main import (
     _build_tui_status_hint_line,
     _build_tui_panel_counts,
     _build_tui_focus_card,
+    _build_tui_prompt_line_and_cursor,
     _build_tui_starter_prompts,
     _build_recent_trace_summary,
     _infer_trace_stage,
@@ -161,6 +162,7 @@ from lazysre.cli.main import (
     _build_provider_runtime_report,
     _switch_runtime_provider,
     _tui_completion_candidates,
+    _tui_text_display_width,
     _handle_tui_input,
     _classify_quick_action_confidence,
     _derive_closed_loop_plan,
@@ -2630,6 +2632,17 @@ def test_build_tui_idle_content_rows_show_starter_prompts() -> None:
     assert "列出 Swarm 当前不健康的 service" in joined
     assert "Direct Commands" in joined
     assert "/do 1" in joined
+
+
+def test_tui_text_display_width_handles_mixed_cn_en() -> None:
+    assert _tui_text_display_width("abc中文") == 7
+
+
+def test_build_tui_prompt_line_and_cursor_handles_mixed_cn_en() -> None:
+    prompt, cursor_x = _build_tui_prompt_line_and_cursor(input_text="我又一k8s", cursor_index=4, width=40)
+
+    assert prompt.startswith("lsre> 我又一k8s")
+    assert cursor_x == 13
 
 
 def test_render_tui_demo_text_shows_swarm_posture_block() -> None:
