@@ -9751,8 +9751,11 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     action_bar = _build_tui_action_bar(snapshot)
     panel_hint = str(snapshot.get("panel_hint", "")).strip()
     state_card = _build_tui_state_card(snapshot)
+    logo_lines = _build_tui_logo_lines()
     lines = [
         "╭─ LazySRE Fullscreen TUI ─────────────────────────────────────────╮",
+        "├─ Brand ──────────────────────────────────────────────────────────┤",
+        *[f"│ {line}" for line in logo_lines],
         f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
         f"│ panel={snapshot.get('sidebar_panel', 'overview')} hint={panel_hint or '-'}",
         f"│ action_bar={action_bar}",
@@ -10007,9 +10010,10 @@ def _draw_tui(
     height, width = stdscr.getmaxyx()
     stdscr.erase()
     sidebar_w = min(max(28, width // 3), 46)
+    logo = _build_tui_logo_lines(compact=True)[0]
     title = (
-        f" LazySRE {snapshot.get('version', '-')} | {status} | panel={snapshot.get('sidebar_panel', 'overview')} "
-        "| Tab autocomplete | Up/Down history | Ctrl-L clear | F1/? help | 1-4/F2 panel | Esc quit "
+        f" {logo} | {snapshot.get('version', '-')} | {status} | panel={snapshot.get('sidebar_panel', 'overview')} "
+        "| F1 help | F2 panel | Tab complete | Esc quit "
     )
     stdscr.addnstr(0, 0, title.ljust(width), width - 1)
     for y in range(1, height - 2):
@@ -10461,7 +10465,11 @@ def _build_tui_idle_content_rows(snapshot: dict[str, object], *, width: int) -> 
     incident_session = snapshot.get("incident_session", {})
     if not isinstance(incident_session, dict):
         incident_session = {}
+    logo_lines = _build_tui_logo_lines()
     sections = [
+        "Brand",
+        *[f"- {line}" for line in logo_lines],
+        "",
         "Start Here",
         f"- profile: {profile}",
         f"- summary: {summary}",
@@ -10486,7 +10494,7 @@ def _build_tui_idle_content_rows(snapshot: dict[str, object], *, width: int) -> 
         if not entry:
             rows.append("")
             continue
-        if entry in {"Start Here", "Try Asking", "Direct Commands"}:
+        if entry in {"Brand", "Start Here", "Try Asking", "Direct Commands"}:
             rows.append(entry)
             continue
         rows.extend(textwrap.wrap(entry, width=max(10, width)) or [entry])
@@ -10578,18 +10586,18 @@ def _build_tui_status_hint_line(snapshot: dict[str, object]) -> str:
 
 def _build_tui_action_bar(snapshot: dict[str, object]) -> str:
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
-    base = "actions> 1 overview | 2 activity | 3 timeline | 4 providers"
+    base = "actions> [1]overview [2]activity [3]timeline [4]providers"
     latest = snapshot.get("latest_quick_action", {})
     latest_status = str(latest.get("status", "")).strip().lower() if isinstance(latest, dict) else ""
     if latest_status == "fail":
-        return f"{base} || /trace | /timeline | /do 1"
+        return f"{base} · /trace · /timeline · /do 1"
     panel_actions = {
         "overview": "/do 1 | /focus | /drift",
         "activity": "/do 1 | /activity | /swarm --logs",
         "timeline": "/trace | /timeline | /panel next",
         "providers": "/providers | /provider <name> | /panel next",
     }
-    return f"{base} || {panel_actions.get(panel, panel_actions['overview'])}"
+    return f"{base} · {panel_actions.get(panel, panel_actions['overview'])}"
 
 
 def _build_tui_panel_tabs(active_panel: str, *, width: int, snapshot: dict[str, object] | None = None) -> list[str]:
@@ -10689,7 +10697,21 @@ def _switch_tui_panel(options: dict[str, object], requested: str) -> str:
 
 
 def _tui_welcome_message() -> str:
-    return "全屏 TUI 已启动。输入自然语言，或使用 /do 1 /focus /activity /trace /timeline /drift /panel next /brief /scan /providers /swarm /autopilot /remediate；也可按 1-4/F2 切换面板，按 F1 或 ? 查看帮助。"
+    logo = "\n".join(_build_tui_logo_lines())
+    return (
+        f"{logo}\n"
+        "全屏 TUI 已启动。输入自然语言，或使用 /do 1 /focus /activity /trace /timeline /drift /panel next /brief /scan /providers /swarm /autopilot /remediate；"
+        "也可按 1-4/F2 切换面板，按 F1 或 ? 查看帮助。"
+    )
+
+
+def _build_tui_logo_lines(*, compact: bool = False) -> list[str]:
+    if compact:
+        return ["lazysre"]
+    return [
+        "lazysre",
+        "minimal ai sre cli",
+    ]
 
 
 def _cycle_tui_input_history(

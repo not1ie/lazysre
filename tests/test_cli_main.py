@@ -830,6 +830,8 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     rendered = _render_tui_demo_text(snapshot)
 
     assert "LazySRE Fullscreen TUI" in rendered
+    assert "Brand" in rendered
+    assert "minimal ai sre cli" in rendered
     assert "provider=mock" in rendered
     assert "/remediate <目标>" in rendered
     assert "/swarm --logs" in rendered
@@ -2766,7 +2768,7 @@ def test_build_tui_action_bar_changes_by_panel() -> None:
     assert "/do 1" in activity_bar
     assert "/trace" in timeline_bar
     assert "/providers" in provider_bar
-    assert "1 overview" in timeline_bar
+    assert "overview" in timeline_bar
 
 
 def test_build_tui_action_bar_prioritizes_trace_after_failed_quick_action() -> None:
