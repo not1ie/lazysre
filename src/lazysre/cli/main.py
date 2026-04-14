@@ -10939,10 +10939,23 @@ def _capture_plain_output(callback) -> str:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             callback()
     except Exception as exc:
-        print(f"error: {exc}", file=out)
+        print(f"error: {_normalize_runtime_exception_message(exc)}", file=out)
     finally:
         _console = old_console
     return "\n".join(x for x in [out.getvalue().strip(), err.getvalue().strip()] if x)
+
+
+def _normalize_runtime_exception_message(exc: Exception) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    lower = message.lower()
+    if ("using socks proxy" in lower) and ("socksio" in lower):
+        return (
+            f"{message}\n"
+            "fix: 当前 Python 环境缺少 SOCKS 依赖。执行 "
+            "`python3 -m pip install \"httpx[socks]\"`。\n"
+            "如你不需要代理，清理环境变量 `ALL_PROXY/HTTPS_PROXY/HTTP_PROXY` 后重试。"
+        )
+    return message
 
 
 def _resolve_runtime_provider_label(provider: str, *, secrets_file: Path | None = None) -> str:

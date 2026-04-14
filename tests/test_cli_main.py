@@ -155,6 +155,7 @@ from lazysre.cli.main import (
     _build_tui_panel_tabs,
     _build_tui_sidebar_lines,
     _maybe_auto_bootstrap_for_tui,
+    _normalize_runtime_exception_message,
     _normalize_tui_panel_name,
     _switch_tui_panel,
     _cycle_tui_completion,
@@ -2643,6 +2644,18 @@ def test_build_tui_prompt_line_and_cursor_handles_mixed_cn_en() -> None:
 
     assert prompt.startswith("lsre> 我又一k8s")
     assert cursor_x == 13
+
+
+def test_normalize_runtime_exception_message_for_socks_proxy_error() -> None:
+    msg = _normalize_runtime_exception_message(
+        RuntimeError(
+            "Using SOCKS proxy, but the 'socksio' package is not installed. "
+            "Make sure to install httpx using `pip install httpx[socks]`."
+        )
+    )
+    assert "fix:" in msg
+    assert "httpx[socks]" in msg
+    assert "ALL_PROXY" in msg
 
 
 def test_render_tui_demo_text_shows_swarm_posture_block() -> None:
