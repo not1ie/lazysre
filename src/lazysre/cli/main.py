@@ -9868,6 +9868,13 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
 
     curses.curs_set(1)
     stdscr.keypad(True)
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+    except Exception:
+        pass
+    stdscr.attrset(curses.A_NORMAL)
+    stdscr.bkgd(" ", curses.A_NORMAL)
     history: list[tuple[str, str]] = [("LazySRE", _tui_welcome_message())]
     input_text = ""
     cursor_index = 0
@@ -10061,7 +10068,11 @@ def _draw_tui(
     status: str,
     overlay: str = "",
 ) -> None:
+    import curses
+
     height, width = stdscr.getmaxyx()
+    stdscr.attrset(curses.A_NORMAL)
+    stdscr.bkgd(" ", curses.A_NORMAL)
     stdscr.erase()
     sidebar_w = min(max(28, width // 3), 46)
     logo = _build_tui_logo_lines(compact=True)[0]
@@ -10069,14 +10080,14 @@ def _draw_tui(
         f" {logo} | {status} | panel={snapshot.get('sidebar_panel', 'overview')} "
         "| F1 help | F2 panel | Tab complete | Esc quit "
     )
-    stdscr.addnstr(0, 0, title.ljust(width), width - 1)
+    _tui_addnstr(stdscr, 0, 0, title.ljust(width), width - 1)
     for y in range(1, height - 2):
         if sidebar_w < width:
             stdscr.addch(y, sidebar_w, "|")
     side_width = max(12, sidebar_w - 2)
     side_lines = _build_tui_sidebar_lines(snapshot, width=side_width)
     for idx, line in enumerate(side_lines[: max(0, height - 7)], 1):
-        stdscr.addnstr(idx, 1, line, side_width)
+        _tui_addnstr(stdscr, idx, 1, line, side_width)
 
     content_w = max(10, width - sidebar_w - 3)
     rows: list[str] = []
@@ -10090,16 +10101,16 @@ def _draw_tui(
         rows.append("")
     visible = rows[-max(1, height - 8) :]
     for idx, line in enumerate(visible, 1):
-        stdscr.addnstr(idx, sidebar_w + 2, line, content_w)
+        _tui_addnstr(stdscr, idx, sidebar_w + 2, line, content_w)
     action_line = _build_tui_action_bar(snapshot)
-    stdscr.addnstr(height - 5, 0, action_line.ljust(width), width - 1)
+    _tui_addnstr(stdscr, height - 5, 0, action_line.ljust(width), width - 1)
     hint_line = _build_tui_status_hint_line(snapshot)
-    stdscr.addnstr(height - 4, 0, hint_line.ljust(width), width - 1)
+    _tui_addnstr(stdscr, height - 4, 0, hint_line.ljust(width), width - 1)
     footer = _build_tui_footer_line(snapshot=snapshot, status=status, history=history)
-    stdscr.addnstr(height - 3, 0, footer.ljust(width), width - 1)
+    _tui_addnstr(stdscr, height - 3, 0, footer.ljust(width), width - 1)
     prompt, cursor_x = _build_tui_prompt_line_and_cursor(input_text=input_text, cursor_index=cursor_index, width=width)
-    stdscr.addnstr(height - 2, 0, "-" * max(1, width - 1), width - 1)
-    stdscr.addnstr(height - 1, 0, prompt, width - 1)
+    _tui_addnstr(stdscr, height - 2, 0, "-" * max(1, width - 1), width - 1)
+    _tui_addnstr(stdscr, height - 1, 0, prompt, width - 1)
     if overlay == "help":
         _draw_tui_help_overlay(stdscr, snapshot=snapshot, width=width, height=height)
     stdscr.move(height - 1, cursor_x)
@@ -10253,9 +10264,18 @@ def _draw_tui_help_overlay(stdscr, *, snapshot: dict[str, object], width: int, h
 
     visible_lines = content_lines[: max(0, overlay_height - 4)]
     for idx, line in enumerate(visible_lines, top + 1):
-        stdscr.addnstr(idx, left + 2, line, content_width)
+        _tui_addnstr(stdscr, idx, left + 2, line, content_width)
     footer = "F1/? close"
-    stdscr.addnstr(bottom - 1, left + 2, footer, content_width)
+    _tui_addnstr(stdscr, bottom - 1, left + 2, footer, content_width)
+
+
+def _tui_addnstr(stdscr, y: int, x: int, text: str, max_width: int) -> None:
+    import curses
+
+    try:
+        stdscr.addnstr(y, x, text, max_width, curses.A_NORMAL)
+    except TypeError:
+        stdscr.addnstr(y, x, text, max_width)
 
 
 def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list[str]:
