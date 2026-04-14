@@ -2788,6 +2788,10 @@ def test_collect_swarm_health_report_detects_unhealthy_service(monkeypatch: pyte
     assert "No such image" in report["tasks"][0]["tasks"][0]["error"]
     assert report["logs"][0]["service"] == "api"
     assert report["root_causes"][0]["category"] == "swarm_image_pull_failed"
+    assert report["posture"]["status"] == "attention"
+    assert report["posture"]["focus_service"] == "api"
+    assert report["posture"]["focus_category"] == "swarm_image_pull_failed"
+    assert report["posture"]["top_actions"][0] == "lazysre template run swarm-image-pull-failed --var service=api --apply"
 
 
 def test_collect_remote_docker_report_detects_swarm_issue(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2831,6 +2835,9 @@ def test_collect_remote_docker_report_detects_swarm_issue(monkeypatch: pytest.Mo
     assert report["briefing"]["status"] == "attention"
     assert "api" in report["briefing"]["headline"]
     assert "lazysre remote root@192.168.10.101 --service api --logs" in report["recommendations"]
+    assert report["posture"]["status"] == "attention"
+    assert report["posture"]["focus_service"] == "api"
+    assert report["posture"]["top_actions"][0] == "lazysre remote root@192.168.10.101 --service api --logs"
     assert any("docker service logs" in item for item in calls)
 
 

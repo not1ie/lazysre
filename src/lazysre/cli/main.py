@@ -4503,6 +4503,14 @@ def _collect_swarm_health_report(
         log_reports=log_reports,
     )
     summary = _summarize_doctor_checks(checks)
+    posture = _build_swarm_posture(
+        summary=summary,
+        services=services,
+        unhealthy=unhealthy,
+        bad_nodes=bad_nodes,
+        root_causes=root_causes,
+        recommendations=recommendations,
+    )
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "ok": bool(summary.get("error", 0) == 0 and len(unhealthy) == 0 and len(bad_nodes) == 0),
@@ -4518,6 +4526,7 @@ def _collect_swarm_health_report(
         "logs": log_reports,
         "root_causes": root_causes,
         "recommendations": recommendations,
+        "posture": posture,
     }
 
 
@@ -4693,11 +4702,123 @@ def _compact_swarm_evidence(text: str) -> str:
     return _preview_lines(interesting or lines, limit=4)[:500] if lines else ""
 
 
+def _build_swarm_posture(
+    *,
+    summary: dict[str, object],
+    services: list[dict[str, object]],
+    unhealthy: list[dict[str, object]],
+    bad_nodes: list[dict[str, object]],
+    root_causes: list[dict[str, object]],
+    recommendations: list[str],
+    remote_target: str = "",
+) -> dict[str, object]:
+    service_items = services if isinstance(services, list) else []
+    unhealthy_items = unhealthy if isinstance(unhealthy, list) else []
+    bad_node_items = bad_nodes if isinstance(bad_nodes, list) else []
+    cause_items = root_causes if isinstance(root_causes, list) else []
+    recommendation_items = recommendations if isinstance(recommendations, list) else []
+    target_label = f"{remote_target} 远程 " if str(remote_target).strip() else ""
+
+    status = "healthy"
+    if int(summary.get("error", 0) or 0) > 0:
+        status = "blocked"
+    elif unhealthy_items or bad_node_items or cause_items or int(summary.get("warn", 0) or 0) > 0:
+        status = "attention"
+
+    focus_service = ""
+    focus_category = ""
+    focus_advice = ""
+    if cause_items and isinstance(cause_items[0], dict):
+        focus = cause_items[0]
+        focus_service = str(focus.get("service", "")).strip()
+        focus_category = str(focus.get("category", "")).strip()
+        focus_advice = str(focus.get("advice", "")).strip()
+
+    if bad_node_items:
+        names = [
+            str(item.get("hostname", item.get("name", "-"))).strip()
+            for item in bad_node_items[:3]
+            if isinstance(item, dict)
+        ]
+        headline = f"{target_label}Swarm 当前有 {len(bad_node_items)} 个异常节点：{', '.join([x for x in names if x]) or 'unknown'}。"
+    elif focus_category and focus_service:
+        headline = f"{target_label}Swarm 主要阻塞点是 {focus_service}，根因倾向 {focus_category}。"
+    elif unhealthy_items:
+        names = [
+            f"{str(item.get('name', '-')).strip()}({str(item.get('replicas', '-')).strip()})"
+            for item in unhealthy_items[:4]
+            if isinstance(item, dict)
+        ]
+        headline = f"{target_label}Swarm 有 {len(unhealthy_items)} 个服务副本异常：{', '.join([x for x in names if x]) or 'unknown'}。"
+    elif service_items:
+        headline = f"{target_label}Swarm service 副本状态整体正常。"
+    else:
+        headline = f"{target_label}未发现可分析的 Swarm service。"
+
+    signals: list[str] = [
+        f"services={len(service_items)}",
+        f"unhealthy={len(unhealthy_items)}",
+        f"bad_nodes={len(bad_node_items)}",
+        f"warn={int(summary.get('warn', 0) or 0)} error={int(summary.get('error', 0) or 0)}",
+    ]
+    if focus_category:
+        signals.append(f"top_root_cause={focus_category}")
+    if focus_service:
+        signals.append(f"focus_service={focus_service}")
+    if focus_advice:
+        signals.append(f"advice={focus_advice}")
+
+    top_actions: list[str] = []
+    if focus_category and (not remote_target):
+        action = _action_from_swarm_root_cause(
+            {
+                "category": focus_category,
+                "service": focus_service,
+                "severity": "high",
+                "advice": focus_advice,
+            }
+        )
+        if isinstance(action, dict):
+            command = str(action.get("command", "")).strip()
+            if command and _looks_like_shell_command(command):
+                top_actions.append(command)
+    if focus_service:
+        followup = (
+            f"lazysre remote {remote_target} --service {focus_service} --logs"
+            if remote_target
+            else f"lazysre swarm --service {focus_service} --logs"
+        )
+        if _looks_like_shell_command(followup):
+            top_actions.append(followup)
+    for item in recommendation_items:
+        text = str(item).strip()
+        if text and _looks_like_shell_command(text):
+            top_actions.append(text)
+    top_actions = _dedupe_strings(top_actions)[:4]
+
+    return {
+        "status": status,
+        "headline": headline,
+        "summary": (
+            f"services={len(service_items)} unhealthy={len(unhealthy_items)} "
+            f"bad_nodes={len(bad_node_items)} root_causes={len(cause_items)}"
+        ),
+        "focus_service": focus_service,
+        "focus_category": focus_category,
+        "focus_advice": focus_advice,
+        "signals": _dedupe_strings(signals)[:6],
+        "top_actions": top_actions,
+    }
+
+
 def _render_swarm_health_report(report: dict[str, object]) -> None:
     if not (_console and Table):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return
     summary = report.get("summary", {})
+    posture = report.get("posture", {})
+    if not isinstance(posture, dict):
+        posture = {}
     summary_text = (
         f"ok={report.get('ok', False)} services={len(report.get('services', []))} "
         f"unhealthy={len(report.get('unhealthy_services', []))} "
@@ -4706,6 +4827,19 @@ def _render_swarm_health_report(report: dict[str, object]) -> None:
     )
     if Panel:
         _console.print(Panel(summary_text, title="Swarm Health", border_style="cyan"))
+    if posture and Panel:
+        lines = [
+            f"状态: {posture.get('status', '-')}",
+            f"结论: {posture.get('headline', '-')}",
+            f"摘要: {posture.get('summary', '-')}",
+        ]
+        signals = posture.get("signals", [])
+        if isinstance(signals, list) and signals:
+            lines.extend(["信号:", *[f"- {str(item)}" for item in signals[:4]]])
+        actions = posture.get("top_actions", [])
+        if isinstance(actions, list) and actions:
+            lines.extend(["下一步:", *[f"- {str(item)}" for item in actions[:3]]])
+        _console.print(Panel("\n".join(lines), title="Swarm Posture", border_style="magenta"))
     service_table = Table(title="Swarm Services")
     service_table.add_column("Service", style="cyan")
     service_table.add_column("Replicas", style="white", no_wrap=True)
@@ -5109,6 +5243,15 @@ def _remote_report_payload(
         "root_causes": root_causes,
         "recommendations": recommendations,
     }
+    payload["posture"] = _build_swarm_posture(
+        summary=summary,
+        services=services,
+        unhealthy=unhealthy,
+        bad_nodes=bad_nodes,
+        root_causes=root_causes,
+        recommendations=recommendations,
+        remote_target=target,
+    )
     payload["briefing"] = _build_remote_briefing(payload)
     return payload
 
@@ -5234,6 +5377,9 @@ def _render_remote_docker_report(report: dict[str, object]) -> None:
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return
     summary = report.get("summary", {})
+    posture = report.get("posture", {})
+    if not isinstance(posture, dict):
+        posture = {}
     summary_text = (
         f"target={report.get('target', '-')} ok={report.get('ok', False)} "
         f"pass={summary.get('pass', 0)} warn={summary.get('warn', 0)} error={summary.get('error', 0)} "
@@ -5241,6 +5387,19 @@ def _render_remote_docker_report(report: dict[str, object]) -> None:
     )
     if Panel:
         _console.print(Panel(summary_text, title="Remote Docker/Swarm", border_style="cyan"))
+    if posture and Panel:
+        lines = [
+            f"状态: {posture.get('status', '-')}",
+            f"结论: {posture.get('headline', '-')}",
+            f"摘要: {posture.get('summary', '-')}",
+        ]
+        signals = posture.get("signals", [])
+        if isinstance(signals, list) and signals:
+            lines.extend(["信号:", *[f"- {str(item)}" for item in signals[:4]]])
+        actions = posture.get("top_actions", [])
+        if isinstance(actions, list) and actions:
+            lines.extend(["下一步:", *[f"- {str(item)}" for item in actions[:3]]])
+        _console.print(Panel("\n".join(lines), title="Swarm Posture", border_style="magenta"))
     briefing = report.get("briefing", {})
     if isinstance(briefing, dict) and Panel:
         evidence = briefing.get("evidence", [])
