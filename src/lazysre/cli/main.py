@@ -9638,6 +9638,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     return {
         "title": "LazySRE TUI",
         "version": __version__,
+        "ui_mode": _normalize_tui_ui_mode(str(options.get("tui_ui_mode", "simple"))),
         "mode": "execute" if bool(options.get("execute", False)) else "dry-run",
         "provider": str(options.get("provider", "auto")),
         "model": str(options.get("model", settings.model_name)),
@@ -9851,6 +9852,11 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
 def _run_tui(options: dict[str, object], *, demo: bool) -> None:
     _maybe_auto_bootstrap_for_tui(options)
     snapshot = _build_tui_dashboard_snapshot(options)
+    term = str(os.getenv("TERM", "")).strip().lower()
+    if term in {"dumb", "unknown", ""}:
+        typer.echo("终端能力受限，已切换简洁文本模式（可正常使用）。")
+        typer.echo(_render_tui_demo_text(snapshot))
+        return
     if demo or (not sys.stdin.isatty()) or (not sys.stdout.isatty()):
         typer.echo(_render_tui_demo_text(snapshot))
         return
@@ -9875,7 +9881,7 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
         pass
     stdscr.attrset(curses.A_NORMAL)
     stdscr.bkgd(" ", curses.A_NORMAL)
-    history: list[tuple[str, str]] = [("LazySRE", _tui_welcome_message())]
+    history: list[tuple[str, str]] = [("LazySRE", _tui_welcome_message(snapshot))]
     input_text = ""
     cursor_index = 0
     status = "ready"
@@ -9897,6 +9903,24 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
         )
         key = stdscr.get_wch()
         if isinstance(key, str):
+            if key in {"\x10", "\x0e"}:
+                # Ctrl+P / Ctrl+N fallback for terminals that don't map arrow keys.
+                direction = "up" if key == "\x10" else "down"
+                input_text, history_index, history_seed = _cycle_tui_input_history(
+                    input_text,
+                    input_history=input_history,
+                    history_index=history_index,
+                    history_seed=history_seed,
+                    direction=direction,
+                )
+                cursor_index = len(input_text)
+                completion_index = -1
+                completion_seed = ""
+                continue
+            if key == "\x1b":
+                escape_key = _read_tui_escape_key(stdscr)
+                if escape_key is not None:
+                    key = escape_key
             if (not input_text) and key == "?":
                 overlay = "" if overlay == "help" else "help"
                 status = "help" if overlay else "ready"
@@ -9925,7 +9949,8 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 if (not input_history) or (input_history[-1] != text):
                     input_history.append(text)
                 history.append(("You", text))
-                status = "running"
+                phase = _infer_tui_phase_from_input(text)
+                status = f"running:{phase}"
                 _draw_tui(
                     stdscr,
                     snapshot=snapshot,
@@ -9934,8 +9959,16 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                     cursor_index=cursor_index,
                     status=status,
                 )
+                started_at = time.monotonic()
                 output = _handle_tui_input(text, options)
-                history.append(("LazySRE", output.strip() or "(no output)"))
+                display_output = _format_tui_output_for_display(output)
+                elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                display_output = _render_tui_completion_card(
+                    display_output,
+                    request=text,
+                    duration_ms=elapsed_ms,
+                )
+                history.append(("LazySRE", display_output.strip() or "(no output)"))
                 snapshot.update(_build_tui_dashboard_snapshot(options))
                 status = "ready"
                 overlay = ""
@@ -9980,13 +10013,45 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                     status = "ready"
                     continue
                 break
-            if (not input_text) and key in {"1", "2", "3", "4"}:
-                options["tui_panel"] = _panel_name_from_shortcut(key)
-                snapshot.update(_build_tui_dashboard_snapshot(options))
-                history.append(("LazySRE", f"左侧面板已切换到 {snapshot.get('sidebar_panel', 'overview')}。"))
-                status = f"panel:{snapshot.get('sidebar_panel', 'overview')}"
-                overlay = ""
+            if key in {"<UP>", "<DOWN>"}:
+                direction = "up" if key == "<UP>" else "down"
+                input_text, history_index, history_seed = _cycle_tui_input_history(
+                    input_text,
+                    input_history=input_history,
+                    history_index=history_index,
+                    history_seed=history_seed,
+                    direction=direction,
+                )
+                cursor_index = len(input_text)
+                completion_index = -1
+                completion_seed = ""
                 continue
+            if key in {"<LEFT>", "<RIGHT>", "<HOME>", "<END>", "<DELETE>"}:
+                if key == "<LEFT>":
+                    cursor_index = max(0, cursor_index - 1)
+                elif key == "<RIGHT>":
+                    cursor_index = min(len(input_text), cursor_index + 1)
+                elif key == "<HOME>":
+                    cursor_index = 0
+                elif key == "<END>":
+                    cursor_index = len(input_text)
+                else:  # <DELETE>
+                    if cursor_index < len(input_text):
+                        input_text = input_text[:cursor_index] + input_text[cursor_index + 1 :]
+                completion_index = -1
+                completion_seed = ""
+                history_index = -1
+                history_seed = ""
+                continue
+            if (not input_text) and key in {"1", "2", "3", "4"}:
+                ui_mode = _normalize_tui_ui_mode(str(options.get("tui_ui_mode", "simple")))
+                if ui_mode == "expert":
+                    options["tui_panel"] = _panel_name_from_shortcut(key)
+                    snapshot.update(_build_tui_dashboard_snapshot(options))
+                    history.append(("LazySRE", f"左侧面板已切换到 {snapshot.get('sidebar_panel', 'overview')}。"))
+                    status = f"panel:{snapshot.get('sidebar_panel', 'overview')}"
+                    overlay = ""
+                    continue
             if key.isprintable():
                 overlay = ""
                 input_text = input_text[:cursor_index] + key + input_text[cursor_index:]
@@ -10071,30 +10136,51 @@ def _draw_tui(
     import curses
 
     height, width = stdscr.getmaxyx()
+    if width < 86 or height < 20:
+        _draw_tui_low_fidelity(
+            stdscr,
+            snapshot=snapshot,
+            history=history,
+            input_text=input_text,
+            cursor_index=cursor_index,
+            status=status,
+            width=width,
+            height=height,
+        )
+        return
     stdscr.attrset(curses.A_NORMAL)
     stdscr.bkgd(" ", curses.A_NORMAL)
     stdscr.erase()
-    sidebar_w = min(max(28, width // 3), 46)
+    ui_mode = _normalize_tui_ui_mode(str(snapshot.get("ui_mode", "simple")))
+    sidebar_w = min(max(30, width // 3), 44) if ui_mode == "simple" else min(max(28, width // 3), 46)
     logo = _build_tui_logo_lines(compact=True)[0]
+    active_provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
+    mode = str(snapshot.get("mode", "-")).strip() or "-"
     title = (
-        f" {logo} | {status} | panel={snapshot.get('sidebar_panel', 'overview')} "
-        "| F1 help | F2 panel | Tab complete | Esc quit "
+        f" {logo} | {status} | {mode}/{active_provider} | ui={ui_mode} | F1 help | Tab complete | Esc quit "
     )
     _tui_addnstr(stdscr, 0, 0, title.ljust(width), width - 1)
     for y in range(1, height - 2):
         if sidebar_w < width:
             stdscr.addch(y, sidebar_w, "|")
     side_width = max(12, sidebar_w - 2)
-    side_lines = _build_tui_sidebar_lines(snapshot, width=side_width)
+    if ui_mode == "simple":
+        side_lines = _build_tui_compact_sidebar_lines(snapshot, width=side_width)
+    else:
+        side_lines = _build_tui_sidebar_lines(snapshot, width=side_width)
     for idx, line in enumerate(side_lines[: max(0, height - 7)], 1):
         _tui_addnstr(stdscr, idx, 1, line, side_width)
 
     content_w = max(10, width - sidebar_w - 3)
     rows: list[str] = []
     if (not input_text.strip()) and (not _has_tui_user_history(history)):
-        rows.extend(_build_tui_idle_content_rows(snapshot, width=content_w))
+        if ui_mode == "simple":
+            rows.extend(_build_tui_compact_welcome_rows(snapshot, width=content_w))
+        else:
+            rows.extend(_build_tui_idle_content_rows(snapshot, width=content_w))
         rows.append("")
-    for speaker, text in history[-30:]:
+    history_limit = 18 if ui_mode == "simple" else 28
+    for speaker, text in history[-history_limit:]:
         rows.append(f"{speaker}:")
         for raw in str(text).splitlines() or [""]:
             rows.extend(textwrap.wrap(raw, width=content_w) or [""])
@@ -10102,11 +10188,14 @@ def _draw_tui(
     visible = rows[-max(1, height - 8) :]
     for idx, line in enumerate(visible, 1):
         _tui_addnstr(stdscr, idx, sidebar_w + 2, line, content_w)
-    action_line = _build_tui_action_bar(snapshot)
+    action_line = _build_tui_compact_action_bar(snapshot) if ui_mode == "simple" else _build_tui_action_bar(snapshot)
     _tui_addnstr(stdscr, height - 5, 0, action_line.ljust(width), width - 1)
-    hint_line = _build_tui_status_hint_line(snapshot)
+    hint_line = _build_tui_compact_hint_line(snapshot) if ui_mode == "simple" else _build_tui_status_hint_line(snapshot)
     _tui_addnstr(stdscr, height - 4, 0, hint_line.ljust(width), width - 1)
-    footer = _build_tui_footer_line(snapshot=snapshot, status=status, history=history)
+    if ui_mode == "simple":
+        footer = _build_tui_compact_footer_line(snapshot=snapshot, status=status)
+    else:
+        footer = _build_tui_footer_line(snapshot=snapshot, status=status, history=history)
     _tui_addnstr(stdscr, height - 3, 0, footer.ljust(width), width - 1)
     prompt, cursor_x = _build_tui_prompt_line_and_cursor(input_text=input_text, cursor_index=cursor_index, width=width)
     _tui_addnstr(stdscr, height - 2, 0, "-" * max(1, width - 1), width - 1)
@@ -10115,6 +10204,414 @@ def _draw_tui(
         _draw_tui_help_overlay(stdscr, snapshot=snapshot, width=width, height=height)
     stdscr.move(height - 1, cursor_x)
     stdscr.refresh()
+
+
+def _draw_tui_low_fidelity(
+    stdscr,
+    *,
+    snapshot: dict[str, object],
+    history: list[tuple[str, str]],
+    input_text: str,
+    cursor_index: int,
+    status: str,
+    width: int,
+    height: int,
+) -> None:
+    stdscr.erase()
+    coach = _build_tui_start_coach(snapshot)
+    provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
+    rows = [
+        f"◉ LazySRE [{status}] {snapshot.get('mode', '-')}/{provider} (low-fidelity)",
+        f"阶段: {coach.get('phase_label', '-')}",
+        f"下一步: {coach.get('primary', '/next')}",
+        "输入自然语言，或 /next /start /ui expert /help",
+        "-" * max(1, width - 1),
+    ]
+    if history:
+        speaker, text = history[-1]
+        rows.append(f"{speaker}:")
+        rows.extend(textwrap.wrap(str(text).strip(), width=max(12, width - 1))[: max(1, height - 9)])
+    for idx, line in enumerate(rows[: max(1, height - 3)]):
+        _tui_addnstr(stdscr, idx, 0, line, max(1, width - 1))
+    prompt, cursor_x = _build_tui_prompt_line_and_cursor(input_text=input_text, cursor_index=cursor_index, width=width)
+    _tui_addnstr(stdscr, height - 2, 0, "-" * max(1, width - 1), width - 1)
+    _tui_addnstr(stdscr, height - 1, 0, prompt, width - 1)
+    stdscr.move(height - 1, cursor_x)
+    stdscr.refresh()
+
+
+def _build_tui_compact_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list[str]:
+    state_card = _build_tui_state_card(snapshot)
+    coach = _build_tui_start_coach(snapshot)
+    boot_actions = _build_tui_boot_actions(snapshot)
+    provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
+    targets = snapshot.get("usable_targets", [])
+    target_list = [str(item).strip() for item in targets if str(item).strip()] if isinstance(targets, list) else []
+    lines: list[str] = [
+        *_build_tui_logo_lines(),
+        "",
+        "Current",
+        f"- {state_card.get('focus', '-')}",
+        "",
+        "Next",
+        f"- {state_card.get('next', '/do 1')}",
+        "",
+        "Coach",
+        f"- {coach.get('headline', '-')}",
+        *[f"- {item}" for item in list(coach.get("steps", []))[:2]],
+        "",
+        "Quick Start",
+        "- 直接输入自然语言",
+        *[f"- {item}" for item in boot_actions[:3]],
+        "- F1 帮助",
+        "",
+        "Runtime",
+        f"- provider: {provider}",
+        f"- targets: {', '.join(target_list[:3]) if target_list else '-'}",
+    ]
+    rows: list[str] = []
+    for item in lines:
+        if not item:
+            rows.append("")
+            continue
+        if item in {"Current", "Next", "Coach", "Quick Start", "Runtime"}:
+            rows.append(item)
+            continue
+        rows.extend(textwrap.wrap(item, width=max(10, width)) or [item])
+    return rows
+
+
+def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) -> list[str]:
+    state_card = _build_tui_state_card(snapshot)
+    coach = _build_tui_start_coach(snapshot)
+    boot_actions = _build_tui_boot_actions(snapshot)
+    prompts = _build_tui_starter_prompts(snapshot)[:4]
+    sections = [
+        "Start Here",
+        "- 输入一句话描述你的问题，LazySRE 会自动诊断。",
+        f"- 当前关注: {state_card.get('focus', '-')}",
+        f"- 建议下一步: {state_card.get('next', '/do 1')}",
+        f"- 当前阶段: {coach.get('phase_label', '快速开始')}",
+        f"- 优先动作: {coach.get('primary', '/next')}",
+        "- 可先执行: /next，或直接选 1/2/3",
+        "",
+        "One Minute Setup",
+        *[f"- {item}" for item in boot_actions[:3]],
+        "",
+        "One Command",
+        "- 直接回车前输入一句话，不需要记命令。",
+        "",
+        "Try Asking",
+        *[f"- {item}" for item in prompts],
+    ]
+    rows: list[str] = []
+    for item in sections:
+        if not item:
+            rows.append("")
+            continue
+        if item in {"Start Here", "One Minute Setup", "One Command", "Try Asking"}:
+            rows.append(item)
+            continue
+        rows.extend(textwrap.wrap(item, width=max(10, width)) or [item])
+    return rows
+
+
+def _build_tui_compact_action_bar(snapshot: dict[str, object]) -> str:
+    next_hint = str(_build_tui_state_card(snapshot).get("next", "")).strip() or "/do 1"
+    return f"actions> Enter 发送 · ↑/↓ 历史 · Tab 补全 · /next · /ui expert · {next_hint}"
+
+
+def _build_tui_compact_hint_line(snapshot: dict[str, object]) -> str:
+    coach = _build_tui_start_coach(snapshot)
+    coach_hint = str(coach.get("hint", "")).strip()
+    if coach_hint:
+        if len(coach_hint) > 96:
+            return coach_hint[:93] + "..."
+        return coach_hint
+    hint = _build_tui_status_hint_line(snapshot)
+    if len(hint) > 96:
+        return hint[:93] + "..."
+    return hint
+
+
+def _build_tui_compact_footer_line(*, snapshot: dict[str, object], status: str) -> str:
+    targets = snapshot.get("usable_targets", [])
+    target_count = len(targets) if isinstance(targets, list) else 0
+    provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
+    mode = str(snapshot.get("mode", "-")).strip() or "-"
+    ui_mode = _normalize_tui_ui_mode(str(snapshot.get("ui_mode", "simple")))
+    return f"{status} · {mode} · provider={provider} · targets={target_count} · ui={ui_mode} · /next"
+
+
+def _build_tui_start_coach(snapshot: dict[str, object]) -> dict[str, object]:
+    provider_ready = bool(snapshot.get("provider_ready"))
+    targets = snapshot.get("usable_targets", [])
+    target_count = len(targets) if isinstance(targets, list) else 0
+    status = str(snapshot.get("status", "")).strip().lower()
+    latest = snapshot.get("latest_quick_action", {})
+    latest_status = str(latest.get("status", "")).strip().lower() if isinstance(latest, dict) else ""
+    state_card = _build_tui_state_card(snapshot)
+
+    if not provider_ready:
+        return {
+            "phase": "connect_llm",
+            "phase_label": "连接模型",
+            "headline": "先连上一个模型 Provider",
+            "primary": "/go 3",
+            "hint": "hint> 先选 provider。未配置 key 可先用 /provider mock 体验，再 /login 配真实 key。",
+            "steps": ["/go 3", "/providers"],
+        }
+    if target_count == 0:
+        return {
+            "phase": "scan_env",
+            "phase_label": "自动探测环境",
+            "headline": "先做一次全局扫描",
+            "primary": "/go 1",
+            "hint": "hint> 先执行 /scan，LazySRE 会自动识别 Docker/Swarm/K8s/Prometheus。",
+            "steps": ["/go 1", "/go 2"],
+        }
+    if latest_status == "fail":
+        return {
+            "phase": "recover",
+            "phase_label": "处理失败链路",
+            "headline": "先看失败链路再决定重试",
+            "primary": "/trace",
+            "hint": "hint> 最近动作失败。先 /trace，再 /timeline，最后 /do 1。",
+            "steps": ["/trace", "/timeline", "/next"],
+        }
+    if status in {"cold-start", "unknown"}:
+        return {
+            "phase": "triage",
+            "phase_label": "建立现场认知",
+            "headline": "先拿一份总览简报",
+            "primary": "/go 2",
+            "hint": "hint> 先执行 /brief，确认当前最优先问题，再 /do 1。",
+            "steps": ["/go 2", "/next"],
+        }
+    return {
+        "phase": "act",
+        "phase_label": "执行下一步",
+        "headline": "按当前建议继续推进",
+        "primary": str(state_card.get("next", "/do 1")).strip() or "/do 1",
+        "hint": "hint> 输入 /next 自动执行建议动作，或直接说你的目标。",
+        "steps": [str(state_card.get("next", "/do 1")).strip() or "/do 1"],
+    }
+
+
+def _pick_tui_next_command(snapshot: dict[str, object]) -> str:
+    coach = _build_tui_start_coach(snapshot)
+    primary = str(coach.get("primary", "")).strip()
+    candidates = [
+        primary,
+        str(_build_tui_state_card(snapshot).get("next", "")).strip(),
+        "/do 1",
+        "/scan",
+    ]
+    tokens = ["/do 1", "/scan", "/brief", "/trace", "/timeline", "/drift", "/providers", "/activity", "/focus"]
+    for raw in candidates:
+        if not raw:
+            continue
+        lowered = raw.lower()
+        for token in tokens:
+            if token in lowered:
+                return token
+    return "/do 1"
+
+
+def _build_tui_boot_actions(snapshot: dict[str, object]) -> list[str]:
+    coach = _build_tui_start_coach(snapshot)
+    phase = str(coach.get("phase", "")).strip()
+    provider_ready = bool(snapshot.get("provider_ready"))
+    if (not provider_ready) or phase == "connect_llm":
+        return [
+            "1) /provider mock（先可用）",
+            "2) /providers（看就绪状态）",
+            "3) /provider gemini（切到 Gemini）",
+        ]
+    return [
+        "1) /scan（自动探测环境）",
+        "2) /brief（生成总览简报）",
+        "3) /next（执行建议动作）",
+    ]
+
+
+def _resolve_tui_boot_action_command(snapshot: dict[str, object], action_id: int) -> str:
+    if action_id not in {1, 2, 3}:
+        return ""
+    coach = _build_tui_start_coach(snapshot)
+    phase = str(coach.get("phase", "")).strip()
+    provider_ready = bool(snapshot.get("provider_ready"))
+    if (not provider_ready) or phase == "connect_llm":
+        return {1: "/provider mock", 2: "/providers", 3: "/provider gemini"}.get(action_id, "")
+    return {1: "/scan", 2: "/brief", 3: "/next"}.get(action_id, "")
+
+
+def _render_tui_start_card(options: dict[str, object]) -> str:
+    snapshot = _build_tui_dashboard_snapshot(options)
+    coach = _build_tui_start_coach(snapshot)
+    steps = list(coach.get("steps", [])) if isinstance(coach.get("steps", []), list) else []
+    actions = _build_tui_boot_actions(snapshot)
+    return "\n".join(
+        [
+            "Start Coach",
+            f"- 阶段: {coach.get('phase_label', '-')}",
+            f"- 目标: {coach.get('headline', '-')}",
+            f"- 优先动作: {coach.get('primary', '/next')}",
+            *(["- 下一步:"] + [f"  - {item}" for item in steps[:3]] if steps else []),
+            "",
+            "One Minute Setup",
+            *[f"- {item}" for item in actions[:3]],
+            "",
+            "输入 /next 自动执行优先动作，或直接说你的需求。",
+            "也可输入 /go 1|2|3 快速执行引导动作。",
+            "高级用户可输入 /ui expert 切换专家视图。",
+        ]
+    )
+
+
+def _format_tui_output_for_display(text: str) -> str:
+    lines = str(text or "").splitlines()
+    internal_prefixes = ("[llm_turn]", "[tool_call]", "[tool_output]", "[llm.turn]")
+    cleaned: list[str] = []
+    in_code = False
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if (not in_code) and any(stripped.startswith(prefix) for prefix in internal_prefixes):
+            continue
+        if stripped.startswith("## "):
+            cleaned.append(stripped[3:] + ":")
+            continue
+        if stripped.startswith("# "):
+            cleaned.append(stripped[2:] + ":")
+            continue
+        cleaned.append(raw)
+    compressed: list[str] = []
+    blank_count = 0
+    for line in cleaned:
+        if line.strip():
+            blank_count = 0
+            compressed.append(line)
+            continue
+        blank_count += 1
+        if blank_count <= 1:
+            compressed.append("")
+    result = "\n".join(compressed).strip() or str(text or "").strip()
+    normalized = _sanitize_tui_secret_tokens(result)
+    if _looks_like_tui_error_output(normalized):
+        return _render_tui_error_card(normalized)
+    return normalized
+
+
+def _infer_tui_phase_from_input(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    if any(token in lowered for token in ["/scan", "/brief", "/status", "/provider", "/providers"]):
+        return "observe"
+    if any(token in lowered for token in ["/trace", "/timeline", "/focus", "/activity", "/drift"]):
+        return "diagnose"
+    if any(token in lowered for token in ["/do", "/next", "/remediate", "/fix", "/apply", "/undo"]):
+        return "act"
+    return "thinking"
+
+
+def _render_tui_completion_card(text: str, *, request: str, duration_ms: int) -> str:
+    content = str(text or "").strip() or "(no output)"
+    if _looks_like_tui_error_output(content):
+        body = content
+    else:
+        body = _render_tui_success_card(content, request=request)
+    return "\n".join(
+        [
+            "Result",
+            f"- Request: {request[:96]}",
+            f"- Duration: {max(0, int(duration_ms))} ms",
+            "",
+            body,
+        ]
+    )
+
+
+def _looks_like_tui_error_output(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    return lowered.startswith("error:") or ("\nerror:" in lowered)
+
+
+def _render_tui_error_card(text: str) -> str:
+    message = str(text or "").strip()
+    detail = message.split("error:", 1)[-1].strip() if "error:" in message.lower() else message
+    impact = "当前请求未完成，未执行任何高风险变更。"
+    now_actions = ["/provider mock（先验证流程）", "/providers（检查 provider 就绪）"]
+    fallback_actions = ["/trace", "/timeline"]
+    lowered = detail.lower()
+    if "http 400" in lowered or "api key" in lowered:
+        now_actions = ["/providers（检查 key/模型）", "/provider mock（临时可用）"]
+        fallback_actions = ["/start", "/next"]
+    elif "socks" in lowered or "proxy" in lowered:
+        now_actions = ['python3 -m pip install "httpx[socks]"', "检查/清理 ALL_PROXY HTTPS_PROXY HTTP_PROXY"]
+        fallback_actions = ["/provider mock", "/providers"]
+    return "\n".join(
+        [
+            "Result: Failed",
+            f"Reason: {detail[:220]}",
+            f"Impact: {impact}",
+            "Do Now:",
+            *[f"- {item}" for item in now_actions],
+            "Fallback:",
+            *[f"- {item}" for item in fallback_actions],
+        ]
+    )
+
+
+def _render_tui_success_card(text: str, *, request: str) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    conclusion = lines[0] if lines else "已完成。"
+    evidence = [line for line in lines[1:] if (line.startswith("-") or ":" in line)][:3]
+    if not evidence and len(lines) > 1:
+        evidence = [f"- {line}" for line in lines[1:4]]
+    next_actions = _infer_tui_next_actions_from_text(text, request=request)[:2]
+    return "\n".join(
+        [
+            "Result: Success",
+            f"Conclusion: {conclusion[:220]}",
+            "Evidence:",
+            *(evidence or ["- (no structured evidence)"]),
+            "Next:",
+            *[f"- {item}" for item in next_actions],
+        ]
+    )
+
+
+def _infer_tui_next_actions_from_text(text: str, *, request: str) -> list[str]:
+    lowered = str(text or "").lower()
+    if "trace" in lowered:
+        return ["/timeline", "/next"]
+    if "scan" in lowered:
+        return ["/brief", "/next"]
+    if "provider" in lowered:
+        return ["/providers", "/next"]
+    req = str(request or "").lower()
+    if "/scan" in req:
+        return ["/brief", "/next"]
+    if "/brief" in req:
+        return ["/next", "/trace"]
+    return ["/next", "/trace"]
+
+
+def _sanitize_tui_secret_tokens(text: str) -> str:
+    value = str(text or "")
+    value = re.sub(r"AIza[0-9A-Za-z_-]{10,}", "AIza***REDACTED***", value)
+    value = re.sub(r"([?&]key=)[^&\s]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"(\bkey=)[^\s,;]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    return value
+
+
+def _normalize_tui_ui_mode(raw: str) -> str:
+    value = str(raw or "").strip().lower()
+    if value in {"expert", "pro", "advanced"}:
+        return "expert"
+    return "simple"
 
 
 def _tui_char_display_width(value: str) -> int:
@@ -10199,12 +10696,15 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
         "",
         "Core",
         "- 直接输入自然语言，例如：检查当前服务器 / 修复 swarm 副本不足",
+        "- /start 查看当前阶段与建议动作，/next 自动执行下一步",
+        "- /go 1|2|3 执行开机即用引导动作（扫描/总览/连接模型）",
         "- /do 1 执行当前最优先建议，/focus /activity /trace /timeline 查看上下文",
         "- /scan 零配置探测本机 Docker/Swarm/K8s/Prometheus",
         "- /drift 查看环境基线漂移（新增/缺失目标、基线过期）",
         "",
         "Keys",
         "- Tab 自动补全，Up/Down 浏览输入历史",
+        "- 终端若不识别方向键，可用 Ctrl+P / Ctrl+N 浏览历史",
         "- Left/Right/Home/End 移动光标，Delete 删除光标后字符",
         "- 1-4 或 F2 切换左侧面板",
         "- F1 或 ? 打开/关闭帮助",
@@ -10222,6 +10722,7 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
         "- /drift",
         "- /providers",
         "- /scan",
+        "- /ui simple|expert",
         "",
         "Try Asking",
         *[f"- {item}" for item in starter_prompts[:4]],
@@ -10276,6 +10777,71 @@ def _tui_addnstr(stdscr, y: int, x: int, text: str, max_width: int) -> None:
         stdscr.addnstr(y, x, text, max_width, curses.A_NORMAL)
     except TypeError:
         stdscr.addnstr(y, x, text, max_width)
+
+
+def _read_tui_escape_key(stdscr) -> str | None:
+    import curses
+
+    # Some terminals send arrow/home/end/delete as ESC sequences (e.g. "\x1b[A").
+    seq_chars: list[str] = []
+    stdscr.nodelay(True)
+    try:
+        deadline = time.monotonic() + 0.04
+        while time.monotonic() < deadline and len(seq_chars) < 6:
+            try:
+                nxt = stdscr.get_wch()
+            except curses.error:
+                continue
+            if isinstance(nxt, int):
+                if nxt == curses.KEY_UP:
+                    return "<UP>"
+                if nxt == curses.KEY_DOWN:
+                    return "<DOWN>"
+                if nxt == curses.KEY_LEFT:
+                    return "<LEFT>"
+                if nxt == curses.KEY_RIGHT:
+                    return "<RIGHT>"
+                if nxt == curses.KEY_HOME:
+                    return "<HOME>"
+                if nxt == curses.KEY_END:
+                    return "<END>"
+                if nxt == curses.KEY_DC:
+                    return "<DELETE>"
+                return None
+            seq_chars.append(nxt)
+            parsed = _parse_tui_escape_sequence("".join(seq_chars))
+            if parsed is not None:
+                return parsed
+    finally:
+        stdscr.nodelay(False)
+    return None
+
+
+def _parse_tui_escape_sequence(raw: str) -> str | None:
+    seq = str(raw or "")
+    mapping = {
+        "[A": "<UP>",
+        "OA": "<UP>",
+        "[B": "<DOWN>",
+        "OB": "<DOWN>",
+        "[C": "<RIGHT>",
+        "OC": "<RIGHT>",
+        "[D": "<LEFT>",
+        "OD": "<LEFT>",
+        "[H": "<HOME>",
+        "OH": "<HOME>",
+        "[F": "<END>",
+        "OF": "<END>",
+        "[1~": "<HOME>",
+        "[4~": "<END>",
+        "[3~": "<DELETE>",
+    }
+    if seq in mapping:
+        return mapping[seq]
+    for key, value in mapping.items():
+        if seq.endswith(key):
+            return value
+    return None
 
 
 def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list[str]:
@@ -10826,12 +11392,16 @@ def _switch_tui_panel(options: dict[str, object], requested: str) -> str:
     return f"已切换左侧面板: {panel}"
 
 
-def _tui_welcome_message() -> str:
+def _tui_welcome_message(snapshot: dict[str, object] | None = None) -> str:
     logo = "\n".join(_build_tui_logo_lines())
+    coach_primary = "/next"
+    if isinstance(snapshot, dict):
+        coach = _build_tui_start_coach(snapshot)
+        coach_primary = str(coach.get("primary", "/next")).strip() or "/next"
     return (
         f"{logo}\n"
-        "全屏 TUI 已启动。输入自然语言，或使用 /do 1 /focus /activity /trace /timeline /drift /panel next /brief /scan /providers /swarm /autopilot /remediate；"
-        "也可按 1-4/F2 切换面板，按 F1 或 ? 查看帮助。"
+        f"输入一句话描述问题，或输入 {coach_primary} 自动执行当前建议动作。"
+        "按 F1 查看帮助。"
     )
 
 
@@ -10905,6 +11475,10 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/providers",
             "/provider auto",
             "/provider mock",
+            "/start",
+            "/next",
+            "/ui simple",
+            "/ui expert",
             "/activity",
             "/focus",
             "/do",
@@ -11053,6 +11627,41 @@ def _switch_runtime_provider(options: dict[str, object], provider_name: str, *, 
 def _handle_tui_input(text: str, options: dict[str, object]) -> str:
     normalized = _normalize_chat_input_text(text)
     lowered = normalized.lower()
+    if lowered in {"1", "2", "3"}:
+        lowered = f"/go {lowered}"
+        normalized = lowered
+    if lowered in {"/start", "/guide"}:
+        return _render_tui_start_card(options)
+    if lowered in {"/go", "/go show"}:
+        snapshot = _build_tui_dashboard_snapshot(options)
+        actions = _build_tui_boot_actions(snapshot)
+        return "\n".join(["One Minute Setup", *[f"- {item}" for item in actions[:3]], "用法：/go 1|2|3"])
+    if lowered.startswith("/go "):
+        raw = lowered[len("/go ") :].strip()
+        action_id = _safe_int(raw)
+        if action_id <= 0:
+            return "用法：/go 1|2|3"
+        snapshot = _build_tui_dashboard_snapshot(options)
+        command = _resolve_tui_boot_action_command(snapshot, action_id)
+        if not command:
+            return "用法：/go 1|2|3"
+        rendered = _handle_tui_input(command, options)
+        return f"执行引导动作: {command}\n\n{rendered}"
+    if lowered in {"/next", "/continue"}:
+        snapshot = _build_tui_dashboard_snapshot(options)
+        command = _pick_tui_next_command(snapshot)
+        rendered = _handle_tui_input(command, options)
+        return f"自动执行下一步: {command}\n\n{rendered}"
+    if lowered in {"/ui", "/ui show"}:
+        ui_mode = _normalize_tui_ui_mode(str(options.get("tui_ui_mode", "simple")))
+        return f"当前 UI 模式: {ui_mode}（可用: /ui simple | /ui expert）"
+    if lowered.startswith("/ui "):
+        raw = lowered[len("/ui ") :].strip()
+        mode = _normalize_tui_ui_mode(raw)
+        if raw not in {"simple", "expert", "pro", "advanced"}:
+            return "用法：/ui simple 或 /ui expert"
+        options["tui_ui_mode"] = mode
+        return f"已切换 UI 模式: {mode}"
     if lowered in {"/help", "help", "?"}:
         return _render_tui_demo_text(_build_tui_dashboard_snapshot(options))
     if lowered in {"/actions", "/actions show"}:
@@ -11269,6 +11878,7 @@ def _normalize_slash_command_text(text: str) -> str:
         "remedate": "remediate",
         "remediatee": "remediate",
         "hepl": "help",
+        "ux": "ui",
     }
     known = [
         "help",
@@ -11305,6 +11915,9 @@ def _normalize_slash_command_text(text: str) -> str:
         "focus",
         "do",
         "timeline",
+        "ui",
+        "start",
+        "next",
     ]
     corrected = aliases.get(command, "")
     if not corrected:

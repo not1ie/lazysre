@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -149,6 +150,16 @@ from lazysre.cli.main import (
     _build_tui_panel_counts,
     _build_tui_focus_card,
     _build_tui_prompt_line_and_cursor,
+    _build_tui_compact_sidebar_lines,
+    _build_tui_start_coach,
+    _build_tui_boot_actions,
+    _format_tui_output_for_display,
+    _normalize_tui_ui_mode,
+    _pick_tui_next_command,
+    _parse_tui_escape_sequence,
+    _render_tui_success_card,
+    _resolve_tui_boot_action_command,
+    _sanitize_tui_secret_tokens,
     _build_tui_starter_prompts,
     _build_recent_trace_summary,
     _infer_trace_stage,
@@ -1833,7 +1844,7 @@ def test_build_environment_drift_detects_target_changes() -> None:
 def test_build_environment_drift_stable_when_targets_match() -> None:
     drift = _build_environment_drift(
         {
-            "generated_at_utc": "2026-04-14T00:00:00+00:00",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "usable_targets": ["docker", "kubernetes", "prometheus"],
         },
         ["docker", "kubernetes", "prometheus"],
@@ -2637,6 +2648,152 @@ def test_build_tui_idle_content_rows_show_starter_prompts() -> None:
 
 def test_tui_text_display_width_handles_mixed_cn_en() -> None:
     assert _tui_text_display_width("abc中文") == 7
+
+
+def test_parse_tui_escape_sequence_for_arrows_and_delete() -> None:
+    assert _parse_tui_escape_sequence("[A") == "<UP>"
+    assert _parse_tui_escape_sequence("[B") == "<DOWN>"
+    assert _parse_tui_escape_sequence("[3~") == "<DELETE>"
+
+
+def test_parse_tui_escape_sequence_for_function_style_prefix() -> None:
+    assert _parse_tui_escape_sequence("\x1b[A".replace("\x1b", "")) == "<UP>"
+    assert _parse_tui_escape_sequence("foo[1~") == "<HOME>"
+
+
+def test_format_tui_output_for_display_removes_internal_trace_lines() -> None:
+    raw = "\n".join(
+        [
+            "[llm_turn] initial_response {...}",
+            "[tool_call] get_context",
+            "## Status",
+            "Diagnosing",
+            "",
+            "```bash",
+            "kubectl get pods",
+            "```",
+        ]
+    )
+    cleaned = _format_tui_output_for_display(raw)
+    assert "[llm_turn]" not in cleaned
+    assert "[tool_call]" not in cleaned
+    assert "Status:" in cleaned
+    assert "kubectl get pods" in cleaned
+
+
+def test_build_tui_compact_sidebar_lines_contains_guided_blocks() -> None:
+    lines = _build_tui_compact_sidebar_lines(
+        {
+            "focus_title": "Environment Drift",
+            "focus_body": "targets changed",
+            "recommended_commands": ["/scan"],
+            "provider": "gemini",
+            "active_provider": "gemini",
+            "usable_targets": ["docker", "kubernetes", "prometheus"],
+            "mode": "dry-run",
+        },
+        width=40,
+    )
+    joined = "\n".join(lines)
+    assert "Current" in joined
+    assert "Next" in joined
+    assert "Quick Start" in joined
+    assert "provider: gemini" in joined
+
+
+def test_build_tui_start_coach_prioritizes_provider_setup() -> None:
+    coach = _build_tui_start_coach(
+        {
+            "provider_ready": False,
+            "provider": "auto",
+            "active_provider": "auto->mock",
+            "usable_targets": [],
+            "status": "cold-start",
+            "latest_quick_action": {},
+        }
+    )
+    assert coach["phase"] == "connect_llm"
+    assert "/go 3" in str(coach["primary"])
+
+
+def test_resolve_tui_boot_action_command_by_stage() -> None:
+    snapshot_connect = {
+        "provider_ready": False,
+        "provider": "auto",
+        "active_provider": "auto->mock",
+        "usable_targets": [],
+        "status": "cold-start",
+        "latest_quick_action": {},
+    }
+    assert _resolve_tui_boot_action_command(snapshot_connect, 1) == "/provider mock"
+    assert _resolve_tui_boot_action_command(snapshot_connect, 3) == "/provider gemini"
+
+    snapshot_ready = {
+        "provider_ready": True,
+        "provider": "gemini",
+        "active_provider": "gemini",
+        "usable_targets": ["docker"],
+        "status": "ready",
+        "latest_quick_action": {"status": "ok"},
+        "focus_title": "ok",
+        "focus_body": "ok",
+        "quick_action_items": [],
+    }
+    assert _resolve_tui_boot_action_command(snapshot_ready, 1) == "/scan"
+    assert _resolve_tui_boot_action_command(snapshot_ready, 2) == "/brief"
+    assert _resolve_tui_boot_action_command(snapshot_ready, 3) == "/next"
+
+
+def test_render_tui_success_card_has_three_sections() -> None:
+    out = _render_tui_success_card("操作已完成\n- pod_count=12\n- warn=0", request="检查 k8s")
+    assert "Result: Success" in out
+    assert "Conclusion:" in out
+    assert "Evidence:" in out
+    assert "Next:" in out
+
+
+def test_pick_tui_next_command_prefers_trace_after_failure() -> None:
+    command = _pick_tui_next_command(
+        {
+            "provider_ready": True,
+            "usable_targets": ["docker"],
+            "status": "ready",
+            "latest_quick_action": {"status": "fail", "command": "/do 1"},
+            "focus_title": "x",
+            "focus_body": "y",
+            "quick_action_items": [{"id": "1", "command": "/trace"}],
+        }
+    )
+    assert command == "/trace"
+
+
+def test_normalize_tui_ui_mode_defaults_to_simple() -> None:
+    assert _normalize_tui_ui_mode("simple") == "simple"
+    assert _normalize_tui_ui_mode("expert") == "expert"
+    assert _normalize_tui_ui_mode("advanced") == "expert"
+    assert _normalize_tui_ui_mode("weird") == "simple"
+
+
+def test_sanitize_tui_secret_tokens_masks_google_key() -> None:
+    raw = "error: key=google-api-key-demo-value"
+    masked = _sanitize_tui_secret_tokens(raw)
+    assert "google-api-key-demo-value" not in masked
+    assert "key=***REDACTED***" in masked
+
+
+def test_format_tui_output_for_display_renders_error_card() -> None:
+    out = _format_tui_output_for_display("error: Client error '400 Bad Request' for url 'https://x?key=abc'")
+    assert "Result: Failed" in out
+    assert "Reason:" in out
+    assert "Do Now:" in out
+    assert "Fallback:" in out
+
+
+def test_handle_tui_input_ui_switches_mode() -> None:
+    options = {"tui_ui_mode": "simple"}
+    res = cli_main._handle_tui_input("/ui expert", options)
+    assert "expert" in res
+    assert options["tui_ui_mode"] == "expert"
 
 
 def test_build_tui_prompt_line_and_cursor_handles_mixed_cn_en() -> None:
