@@ -150,6 +150,7 @@ from lazysre.cli.main import (
     _build_tui_panel_counts,
     _build_tui_focus_card,
     _build_tui_prompt_line_and_cursor,
+    _build_tui_compact_action_bar,
     _build_tui_compact_sidebar_lines,
     _build_tui_start_coach,
     _build_tui_boot_actions,
@@ -157,6 +158,7 @@ from lazysre.cli.main import (
     _normalize_tui_ui_mode,
     _pick_tui_next_command,
     _parse_tui_escape_sequence,
+    _render_tui_completion_card,
     _render_tui_success_card,
     _resolve_tui_boot_action_command,
     _sanitize_tui_secret_tokens,
@@ -514,6 +516,13 @@ def test_switch_runtime_provider_rejects_unready_provider(tmp_path: Path, monkey
 
     assert "尚未就绪" in message
     assert options["provider"] == "auto"
+
+
+def test_build_provider_runtime_report_marks_mock_ready() -> None:
+    report = _build_provider_runtime_report({"provider": "mock", "model": "gpt-5.4-mini"})
+    assert report["active_provider"] == "mock"
+    assert report["active_ready"] is True
+    assert "无需 API Key" in str(report["active_detail"])
 
 
 def test_detect_fix_and_apply_intent() -> None:
@@ -2695,10 +2704,15 @@ def test_build_tui_compact_sidebar_lines_contains_guided_blocks() -> None:
         width=40,
     )
     joined = "\n".join(lines)
-    assert "Current" in joined
+    assert "Now" in joined
     assert "Next" in joined
-    assert "Quick Start" in joined
+    assert "Start" in joined
     assert "provider: gemini" in joined
+
+
+def test_build_tui_compact_action_bar_mentions_shift_shortcuts() -> None:
+    line = _build_tui_compact_action_bar({"focus_title": "x", "focus_body": "y"})
+    assert "Shift+N/T/U" in line
 
 
 def test_build_tui_start_coach_prioritizes_provider_setup() -> None:
@@ -2781,12 +2795,25 @@ def test_sanitize_tui_secret_tokens_masks_google_key() -> None:
     assert "key=***REDACTED***" in masked
 
 
+def test_sanitize_tui_secret_tokens_masks_password_phrase() -> None:
+    raw = "我有一个k8s集群，ip是192.168.10.1，root密码是Aki030203"
+    masked = _sanitize_tui_secret_tokens(raw)
+    assert "Aki030203" not in masked
+    assert "密码=***REDACTED***" in masked
+
+
 def test_format_tui_output_for_display_renders_error_card() -> None:
     out = _format_tui_output_for_display("error: Client error '400 Bad Request' for url 'https://x?key=abc'")
     assert "Result: Failed" in out
     assert "Reason:" in out
     assert "Do Now:" in out
     assert "Fallback:" in out
+
+
+def test_render_tui_completion_card_keeps_failed_card() -> None:
+    out = _render_tui_completion_card("Result: Failed\nReason: bad key", request="check", duration_ms=8)
+    assert "Result: Success" not in out
+    assert "Result: Failed" in out
 
 
 def test_handle_tui_input_ui_switches_mode() -> None:

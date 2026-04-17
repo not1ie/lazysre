@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from datetime import datetime, timezone
@@ -9654,7 +9655,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "generated_at": str(marker.get("generated_at_utc", "")).strip() if isinstance(marker, dict) else "",
         "usable_targets": _dedupe_strings([str(item) for item in usable_targets if str(item).strip()]),
         "configured_providers": configured_providers,
-        "provider_ready": bool(configured_providers),
+        "provider_ready": bool(provider_report.get("active_ready", False)),
         "namespace": str(target.k8s_namespace or "default"),
         "ssh_target": str(target.ssh_target or settings.target_ssh_target or ""),
         "prometheus_url": str(target.prometheus_url or settings.target_prometheus_url or ""),
@@ -9869,6 +9870,88 @@ def _run_tui(options: dict[str, object], *, demo: bool) -> None:
     curses.wrapper(lambda stdscr: _run_curses_tui(stdscr, options, snapshot))
 
 
+def _run_tui_request_with_progress(
+    stdscr,
+    *,
+    snapshot: dict[str, object],
+    history: list[tuple[str, str]],
+    input_text: str,
+    cursor_index: int,
+    phase: str,
+    raw_text: str,
+    options: dict[str, object],
+) -> tuple[str, int]:
+    outcome: dict[str, str] = {"output": "", "error": ""}
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            outcome["output"] = _handle_tui_input(raw_text, options)
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            outcome["error"] = _normalize_runtime_exception_message(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_worker, daemon=True, name="lazysre-tui-runner")
+    worker.start()
+    spinner = ["|", "/", "-", "\\"]
+    spin_index = 0
+    started_at = time.monotonic()
+    while not done.is_set():
+        status = f"running:{phase} {spinner[spin_index % len(spinner)]}"
+        _draw_tui(
+            stdscr,
+            snapshot=snapshot,
+            history=history,
+            input_text=input_text,
+            cursor_index=cursor_index,
+            status=status,
+        )
+        spin_index += 1
+        time.sleep(0.08)
+    worker.join(timeout=0.01)
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    if outcome["error"].strip():
+        return f"error: {outcome['error']}", elapsed_ms
+    return str(outcome["output"]), elapsed_ms
+
+
+def _execute_tui_turn(
+    stdscr,
+    *,
+    raw_text: str,
+    options: dict[str, object],
+    snapshot: dict[str, object],
+    history: list[tuple[str, str]],
+    input_history: list[str],
+    input_text: str = "",
+    cursor_index: int = 0,
+) -> None:
+    safe_text = _sanitize_tui_secret_tokens(raw_text)
+    if (not input_history) or (input_history[-1] != safe_text):
+        input_history.append(safe_text)
+    history.append(("You", safe_text))
+    phase = _infer_tui_phase_from_input(raw_text)
+    output, elapsed_ms = _run_tui_request_with_progress(
+        stdscr,
+        snapshot=snapshot,
+        history=history,
+        input_text=input_text,
+        cursor_index=cursor_index,
+        phase=phase,
+        raw_text=raw_text,
+        options=options,
+    )
+    display_output = _format_tui_output_for_display(output)
+    display_output = _render_tui_completion_card(
+        display_output,
+        request=safe_text,
+        duration_ms=elapsed_ms,
+    )
+    history.append(("LazySRE", display_output.strip() or "(no output)"))
+    snapshot.update(_build_tui_dashboard_snapshot(options))
+
+
 def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, object]) -> None:
     import curses
 
@@ -9930,14 +10013,14 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                     overlay = ""
                     status = "ready"
                     continue
-                text = input_text.strip()
+                raw_text = input_text.strip()
                 input_text = ""
                 cursor_index = 0
-                if not text:
+                if not raw_text:
                     continue
-                if text.lower() in {"exit", "quit", ":q", "/exit", "/quit"}:
+                if raw_text.lower() in {"exit", "quit", ":q", "/exit", "/quit"}:
                     break
-                if text.lower() in {"/clear", "/cls"}:
+                if raw_text.lower() in {"/clear", "/cls"}:
                     history = [("LazySRE", "已清空当前屏幕内容。输入 /help /providers /brief 继续。")]
                     status = "ready"
                     history_index = -1
@@ -9946,30 +10029,16 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                     completion_seed = ""
                     cursor_index = 0
                     continue
-                if (not input_history) or (input_history[-1] != text):
-                    input_history.append(text)
-                history.append(("You", text))
-                phase = _infer_tui_phase_from_input(text)
-                status = f"running:{phase}"
-                _draw_tui(
+                _execute_tui_turn(
                     stdscr,
+                    raw_text=raw_text,
+                    options=options,
                     snapshot=snapshot,
                     history=history,
+                    input_history=input_history,
                     input_text=input_text,
                     cursor_index=cursor_index,
-                    status=status,
                 )
-                started_at = time.monotonic()
-                output = _handle_tui_input(text, options)
-                display_output = _format_tui_output_for_display(output)
-                elapsed_ms = int((time.monotonic() - started_at) * 1000)
-                display_output = _render_tui_completion_card(
-                    display_output,
-                    request=text,
-                    duration_ms=elapsed_ms,
-                )
-                history.append(("LazySRE", display_output.strip() or "(no output)"))
-                snapshot.update(_build_tui_dashboard_snapshot(options))
                 status = "ready"
                 overlay = ""
                 completion_index = -1
@@ -10051,6 +10120,28 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                     history.append(("LazySRE", f"左侧面板已切换到 {snapshot.get('sidebar_panel', 'overview')}。"))
                     status = f"panel:{snapshot.get('sidebar_panel', 'overview')}"
                     overlay = ""
+                    continue
+            if (not input_text) and key in {"N", "T", "U"}:
+                quick_map = {"N": "/next", "T": "/trace", "U": "/undo"}
+                quick_cmd = quick_map.get(key, "")
+                if quick_cmd:
+                    _execute_tui_turn(
+                        stdscr,
+                        raw_text=quick_cmd,
+                        options=options,
+                        snapshot=snapshot,
+                        history=history,
+                        input_history=input_history,
+                        input_text="",
+                        cursor_index=0,
+                    )
+                    status = "ready"
+                    overlay = ""
+                    completion_index = -1
+                    completion_seed = ""
+                    history_index = -1
+                    history_seed = ""
+                    cursor_index = 0
                     continue
             if key.isprintable():
                 overlay = ""
@@ -10250,20 +10341,20 @@ def _build_tui_compact_sidebar_lines(snapshot: dict[str, object], *, width: int)
     lines: list[str] = [
         *_build_tui_logo_lines(),
         "",
-        "Current",
+        "Now",
         f"- {state_card.get('focus', '-')}",
         "",
         "Next",
         f"- {state_card.get('next', '/do 1')}",
         "",
-        "Coach",
+        "Guide",
         f"- {coach.get('headline', '-')}",
         *[f"- {item}" for item in list(coach.get("steps", []))[:2]],
         "",
-        "Quick Start",
+        "Start",
         "- 直接输入自然语言",
         *[f"- {item}" for item in boot_actions[:3]],
-        "- F1 帮助",
+        "- Shift+N/T/U 快速闭环",
         "",
         "Runtime",
         f"- provider: {provider}",
@@ -10274,7 +10365,7 @@ def _build_tui_compact_sidebar_lines(snapshot: dict[str, object], *, width: int)
         if not item:
             rows.append("")
             continue
-        if item in {"Current", "Next", "Coach", "Quick Start", "Runtime"}:
+        if item in {"Now", "Next", "Guide", "Start", "Runtime"}:
             rows.append(item)
             continue
         rows.extend(textwrap.wrap(item, width=max(10, width)) or [item])
@@ -10287,21 +10378,20 @@ def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) 
     boot_actions = _build_tui_boot_actions(snapshot)
     prompts = _build_tui_starter_prompts(snapshot)[:4]
     sections = [
-        "Start Here",
-        "- 输入一句话描述你的问题，LazySRE 会自动诊断。",
-        f"- 当前关注: {state_card.get('focus', '-')}",
-        f"- 建议下一步: {state_card.get('next', '/do 1')}",
-        f"- 当前阶段: {coach.get('phase_label', '快速开始')}",
-        f"- 优先动作: {coach.get('primary', '/next')}",
-        "- 可先执行: /next，或直接选 1/2/3",
+        "Start",
+        f"- 当前: {state_card.get('focus', '-')}",
+        f"- 下一步: {state_card.get('next', '/do 1')}",
+        f"- 阶段: {coach.get('phase_label', '快速开始')}",
         "",
-        "One Minute Setup",
+        "One Minute",
         *[f"- {item}" for item in boot_actions[:3]],
         "",
-        "One Command",
-        "- 直接回车前输入一句话，不需要记命令。",
+        "Quick Keys",
+        "- Shift+N = /next",
+        "- Shift+T = /trace",
+        "- Shift+U = /undo",
         "",
-        "Try Asking",
+        "Try",
         *[f"- {item}" for item in prompts],
     ]
     rows: list[str] = []
@@ -10309,7 +10399,7 @@ def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) 
         if not item:
             rows.append("")
             continue
-        if item in {"Start Here", "One Minute Setup", "One Command", "Try Asking"}:
+        if item in {"Start", "One Minute", "Quick Keys", "Try"}:
             rows.append(item)
             continue
         rows.extend(textwrap.wrap(item, width=max(10, width)) or [item])
@@ -10318,7 +10408,7 @@ def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) 
 
 def _build_tui_compact_action_bar(snapshot: dict[str, object]) -> str:
     next_hint = str(_build_tui_state_card(snapshot).get("next", "")).strip() or "/do 1"
-    return f"actions> Enter 发送 · ↑/↓ 历史 · Tab 补全 · /next · /ui expert · {next_hint}"
+    return f"actions> Enter 发送 · ↑/↓ 历史 · Tab 补全 · Shift+N/T/U · /ui expert · {next_hint}"
 
 
 def _build_tui_compact_hint_line(snapshot: dict[str, object]) -> str:
@@ -10518,7 +10608,9 @@ def _infer_tui_phase_from_input(text: str) -> str:
 
 def _render_tui_completion_card(text: str, *, request: str, duration_ms: int) -> str:
     content = str(text or "").strip() or "(no output)"
-    if _looks_like_tui_error_output(content):
+    if content.lower().startswith("result: failed"):
+        body = content
+    elif _looks_like_tui_error_output(content):
         body = content
     else:
         body = _render_tui_success_card(content, request=request)
@@ -10535,7 +10627,13 @@ def _render_tui_completion_card(text: str, *, request: str, duration_ms: int) ->
 
 def _looks_like_tui_error_output(text: str) -> bool:
     lowered = str(text or "").strip().lower()
-    return lowered.startswith("error:") or ("\nerror:" in lowered)
+    return (
+        lowered.startswith("error:")
+        or ("\nerror:" in lowered)
+        or lowered.startswith("result: failed")
+        or ("traceback" in lowered)
+        or ("exception:" in lowered)
+    )
 
 
 def _render_tui_error_card(text: str) -> str:
@@ -10603,7 +10701,15 @@ def _sanitize_tui_secret_tokens(text: str) -> str:
     value = str(text or "")
     value = re.sub(r"AIza[0-9A-Za-z_-]{10,}", "AIza***REDACTED***", value)
     value = re.sub(r"([?&]key=)[^&\s]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"([?&]token=)[^&\s]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
     value = re.sub(r"(\bkey=)[^\s,;]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"(\btoken=)[^\s,;]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"(?i)\b(password|passwd|pwd|api[_-]?key|secret)\b\s*[:=]?\s*([^\s,;]+)",
+        lambda m: f"{m.group(1)}=***REDACTED***",
+        value,
+    )
+    value = re.sub(r"密码\s*[是为:=]?\s*([^\s,;]+)", "密码=***REDACTED***", value)
     return value
 
 
@@ -11545,6 +11651,14 @@ def _build_provider_runtime_report(options: dict[str, object], *, secrets_file: 
     checks = _build_provider_setup_checks(secrets_file=secrets_file)
     active_provider = _resolve_default_provider(secrets_file=secrets_file) if requested_provider == "auto" else requested_provider
     active_check = checks.get(active_provider, {}) if active_provider in checks else {}
+    active_ready = bool(active_check.get("ok", False))
+    active_detail = str(active_check.get("detail", ""))
+    active_hint = str(active_check.get("hint", ""))
+    if active_provider == "mock":
+        active_ready = True
+        if not active_detail.strip():
+            active_detail = "Mock provider 可用（无需 API Key）。"
+        active_hint = ""
     return {
         "requested_provider": requested_provider,
         "active_provider": active_provider,
@@ -11552,9 +11666,9 @@ def _build_provider_runtime_report(options: dict[str, object], *, secrets_file: 
         "resolved_model": _resolve_provider_default_model(active_provider, secrets_file=secrets_file)
         or resolve_model_name(active_provider, str(options.get("model", settings.model_name))),
         "providers": checks,
-        "active_ready": bool(active_check.get("ok", False)),
-        "active_hint": str(active_check.get("hint", "")),
-        "active_detail": str(active_check.get("detail", "")),
+        "active_ready": active_ready,
+        "active_hint": active_hint,
+        "active_detail": active_detail,
     }
 
 

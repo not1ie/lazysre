@@ -3,6 +3,15 @@
 LazySRE 是一个纯 AI 驱动的 SRE/运维 CLI 工具。  
 目标是让你用自然语言驱动排障、诊断、修复与回滚，而不是手工拼接一堆命令。
 
+## 封版状态（v0.1.2）
+
+- 默认 `lazysre`/`lsre` 进入全屏 TUI，可直接自然语言交互
+- TUI 支持 `Tab` 补全、`↑/↓` 历史、`Shift+N/T/U` 快捷闭环（`/next`、`/trace`、`/undo`）
+- 执行阶段加入运行中进度动画，避免“无响应”感知
+- Provider 就绪判断与当前 active provider 对齐，`mock` 明确标记为可用
+- 输入/输出链路补充敏感信息脱敏（key/token/password）
+- 当前封版基线测试：`239 passed`
+
 ## 安装方式（开箱即用）
 
 ```bash
@@ -126,7 +135,7 @@ lazysre --provider compatible
 
 # 2) 配置仓库 Secret: NPM_TOKEN
 # 3) 本地执行发版脚本（会先做 preflight，然后更新 package.json、打 tag、推送）
-./scripts/release_npm.sh 0.1.1
+./scripts/release_npm.sh 0.1.2
 ```
 
 发布机制：
