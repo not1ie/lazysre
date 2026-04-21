@@ -3,6 +3,57 @@
 LazySRE 是一个纯 AI 驱动的 SRE/运维 CLI 工具。  
 目标是让你用自然语言驱动排障、诊断、修复与回滚，而不是手工拼接一堆命令。
 
+## 给其他用户的 1 分钟上手
+
+```bash
+# 1) 安装（跨平台：Windows/macOS/Linux）
+npm install -g lazysre
+
+# 2) 验证安装
+lazysre --help
+
+# 3) 直接启动（默认进入全屏 TUI）
+lazysre
+```
+
+首次建议先这样用（不需要任何 API Key）：
+
+```bash
+lazysre --provider mock
+```
+
+进入后直接输入自然语言即可，例如：
+- `检查当前环境有什么异常`
+- `列出 Docker Swarm 不健康的 service`
+- `为什么最近请求变慢了`
+
+TUI 内常用命令：
+- `/scan`：自动探测本机环境（Docker/Swarm/K8s/Prometheus）
+- `/brief`：生成现场总览
+- `/next`：执行系统推荐的下一步
+- `/providers`：查看模型配置状态
+
+## 怎么确认拿到最新 Node 版本
+
+```bash
+# 查看 npm registry 上的最新版本
+npm view lazysre version
+
+# 查看本机已安装版本
+lazysre --version
+```
+
+如果两者一致，说明你已经拿到最新版本。
+
+## 常见问题（用户侧）
+
+- `npm view` 或 `npm install` 报网络/代理错误：
+检查并清理异常代理变量 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 后重试。
+- 启动后 provider 不可用：
+先用 `--provider mock` 体验完整流程，再执行 `lazysre login --provider <openai|anthropic|gemini|deepseek|qwen|kimi>` 配置真实 key。
+- 终端不支持全屏：
+可用 `lazysre tui --demo` 查看文本预览，或直接 `lsre chat`。
+
 ## 封版状态（v0.1.2）
 
 - 默认 `lazysre`/`lsre` 进入全屏 TUI，可直接自然语言交互
