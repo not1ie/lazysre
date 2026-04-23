@@ -742,6 +742,25 @@ def install_doctor(
     _render_doctor_report(report)
 
 
+@app.command("secret-scan")
+def secret_scan(
+    staged: Annotated[bool, typer.Option("--staged", help="Only scan files staged in git index.")] = False,
+    max_findings: Annotated[int, typer.Option("--max-findings", help="Maximum suspicious token findings to keep.")] = 8,
+    fail_on_findings: Annotated[bool, typer.Option("--fail-on-findings", help="Exit code 1 when suspicious tokens are found.")] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="Print secret scan report as JSON.")] = False,
+) -> None:
+    report = _collect_secret_scan_report(staged=staged, max_findings=max_findings)
+    report["gate"] = _build_doctor_gate(report, strict=False)
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        _render_doctor_report(report)
+    summary = report.get("summary", {})
+    healthy = bool(summary.get("healthy", True)) if isinstance(summary, dict) else True
+    if fail_on_findings and (not healthy):
+        raise typer.Exit(code=1)
+
+
 @app.command("login")
 def login(
     provider: Annotated[str, typer.Option("--provider", help=f"Provider: {provider_mode_help_text()}")] = "openai",
@@ -8566,9 +8585,79 @@ def _collect_proxy_runtime_checks() -> list[dict[str, object]]:
     return checks
 
 
-def _collect_workspace_secret_checks(*, root: Path | None = None, max_findings: int = 8) -> list[dict[str, object]]:
+def _collect_secret_scan_report(
+    *,
+    root: Path | None = None,
+    max_findings: int = 8,
+    staged: bool = False,
+) -> dict[str, object]:
     workspace = (root or Path.cwd()).resolve()
-    findings = _scan_workspace_for_secrets(workspace=workspace, limit=max_findings)
+    scan_paths: list[Path] | None = None
+    scope_detail = "scope=workspace"
+    if staged:
+        staged_paths = _resolve_staged_secret_scan_paths(workspace)
+        scope_detail = f"scope=staged files ({len(staged_paths)})"
+        scan_paths = staged_paths
+    checks = _collect_workspace_secret_checks(
+        root=workspace,
+        max_findings=max_findings,
+        paths=scan_paths,
+    )
+    checks.insert(
+        0,
+        {
+            "name": "runtime.workspace_secret_scan_scope",
+            "ok": True,
+            "severity": "pass",
+            "detail": scope_detail,
+            "hint": "",
+        },
+    )
+    return {"checks": checks, "summary": _summarize_doctor_checks(checks)}
+
+
+def _resolve_staged_secret_scan_paths(workspace: Path) -> list[Path]:
+    git_path = shutil.which("git")
+    if not git_path:
+        return []
+    probe = _safe_run_command(
+        [
+            git_path,
+            "-C",
+            str(workspace),
+            "diff",
+            "--cached",
+            "--name-only",
+            "--diff-filter=ACMRTUXB",
+        ],
+        timeout_sec=6,
+    )
+    if not bool(probe.get("ok")):
+        return []
+    rows = [str(item).strip() for item in str(probe.get("stdout", "")).splitlines() if str(item).strip()]
+    resolved: list[Path] = []
+    for item in rows:
+        path = (workspace / item).resolve()
+        if (not path.exists()) or (not path.is_file()):
+            continue
+        try:
+            path.relative_to(workspace)
+        except Exception:
+            continue
+        if path in resolved:
+            continue
+        resolved.append(path)
+    return resolved
+
+
+def _collect_workspace_secret_checks(
+    *,
+    root: Path | None = None,
+    max_findings: int = 8,
+    paths: list[Path] | None = None,
+) -> list[dict[str, object]]:
+    workspace = (root or Path.cwd()).resolve()
+    findings = _scan_workspace_for_secrets(workspace=workspace, limit=max_findings, paths=paths)
     if not findings:
         return [
             {
@@ -8592,7 +8681,12 @@ def _collect_workspace_secret_checks(*, root: Path | None = None, max_findings: 
     ]
 
 
-def _scan_workspace_for_secrets(*, workspace: Path, limit: int = 8) -> list[dict[str, object]]:
+def _scan_workspace_for_secrets(
+    *,
+    workspace: Path,
+    limit: int = 8,
+    paths: list[Path] | None = None,
+) -> list[dict[str, object]]:
     root = Path(workspace).resolve()
     if (not root.exists()) or (not root.is_dir()):
         return []
@@ -8630,15 +8724,26 @@ def _scan_workspace_for_secrets(*, workspace: Path, limit: int = 8) -> list[dict
         "***",
     )
     findings: list[dict[str, object]] = []
-    for path in root.rglob("*"):
+    files_to_scan: list[Path] = []
+    if paths is not None:
+        for raw in paths:
+            path = Path(raw).resolve()
+            if (not path.exists()) or (not path.is_file()):
+                continue
+            try:
+                path.relative_to(root)
+            except Exception:
+                continue
+            files_to_scan.append(path)
+    else:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [item for item in dirnames if item not in ignore_dirs]
+            for filename in filenames:
+                files_to_scan.append(Path(dirpath) / filename)
+    for path in files_to_scan:
         if len(findings) >= max(1, int(limit)):
             break
-        if path.is_dir():
-            if path.name in ignore_dirs:
-                # prune by skipping known heavy dirs quickly
-                continue
-            continue
-        if any(part in ignore_dirs for part in path.parts):
+        if (paths is None) and any(part in ignore_dirs for part in path.parts):
             continue
         try:
             if path.stat().st_size > 1024 * 1024:
@@ -11433,6 +11538,7 @@ def _render_tui_quick_help_text(snapshot: dict[str, object]) -> str:
             "- /providers: 查看模型就绪状态",
             "- /doctor: 运行环境体检（支持 /doctor strict /doctor install）",
             "- /secret-scan: 检查当前工作区是否存在疑似密钥泄漏",
+            "- /secret-scan --staged: 仅扫描当前 git 暂存区文件",
             "",
             "Input Shortcuts",
             "- 直接输入自然语言",
@@ -12814,6 +12920,7 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/doctor strict",
             "/doctor install",
             "/secret-scan",
+            "/secret-scan --staged",
             "/quickstart",
             "/status probe",
             "/refresh",
@@ -13119,12 +13226,16 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
     if lowered.startswith("/panel "):
         return _switch_tui_panel(options, normalized[len("/panel ") :].strip())
     if lowered.startswith("/secret-scan") or lowered in {"/secrets", "/doctor secrets", "/doctor secret"}:
+        tail = normalized[len("/secret-scan") :].strip() if lowered.startswith("/secret-scan") else ""
+        staged = "--staged" in tail.lower() if tail else False
+        max_findings = 8
+        if tail:
+            match = re.search(r"--max-findings(?:=|\s+)(\d+)", tail, flags=re.IGNORECASE)
+            if match:
+                max_findings = max(1, min(30, _safe_int(match.group(1))))
+
         def _render_secret_scan() -> None:
-            checks = _collect_workspace_secret_checks()
-            report = {
-                "checks": checks,
-                "summary": _summarize_doctor_checks(checks),
-            }
+            report = _collect_secret_scan_report(staged=staged, max_findings=max_findings)
             report["gate"] = _build_doctor_gate(report, strict=False)
             _render_doctor_report(report)
 
@@ -13411,6 +13522,8 @@ def _rewrite_simple_quick_phrase_to_command(text: str) -> str:
         "安装体检": "/doctor install",
         "密钥检查": "/secret-scan",
         "泄漏检查": "/secret-scan",
+        "暂存区密钥检查": "/secret-scan --staged",
+        "暂存区泄漏检查": "/secret-scan --staged",
         "secretcheck": "/secret-scan",
         "secretscan": "/secret-scan",
     }
@@ -13487,6 +13600,12 @@ def _rewrite_simple_quick_phrase_to_command(text: str) -> str:
         "secretcheck",
         "secretscan",
     )
+    secret_scan_staged_prefixes = (
+        "暂存区密钥检查",
+        "暂存区泄漏检查",
+        "stagedsecretcheck",
+        "stagedsecretscan",
+    )
     if any(compact.startswith(prefix) for prefix in next_prefixes):
         return "/next"
     if any(compact.startswith(prefix) for prefix in retry_prefixes):
@@ -13507,6 +13626,8 @@ def _rewrite_simple_quick_phrase_to_command(text: str) -> str:
         return "/providers"
     if any(compact.startswith(prefix) for prefix in secret_scan_prefixes):
         return "/secret-scan"
+    if any(compact.startswith(prefix) for prefix in secret_scan_staged_prefixes):
+        return "/secret-scan --staged"
     if any(compact.startswith(prefix) for prefix in doctor_prefixes):
         if compact.startswith("安装"):
             return "/doctor install"
@@ -18145,6 +18266,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "remote",
         "doctor",
         "install-doctor",
+        "secret-scan",
         "setup",
         "report",
         "incident",
@@ -18216,6 +18338,7 @@ def _should_launch_default_tui(tokens: list[str]) -> bool:
         "remote",
         "doctor",
         "install-doctor",
+        "secret-scan",
         "setup",
         "report",
         "incident",
@@ -18286,6 +18409,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "remote",
         "doctor",
         "install-doctor",
+        "secret-scan",
         "setup",
         "report",
         "incident",

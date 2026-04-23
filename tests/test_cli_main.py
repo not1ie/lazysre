@@ -372,6 +372,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv22 = ["lsre", "remediate", "swarm 副本不足", "--json"]
     _rewrite_argv_for_default_run(argv22)
     assert argv22 == ["lsre", "remediate", "swarm 副本不足", "--json"]
+    argv23 = ["lsre", "secret-scan", "--staged", "--json"]
+    _rewrite_argv_for_default_run(argv23)
+    assert argv23 == ["lsre", "secret-scan", "--staged", "--json"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -681,6 +684,7 @@ def test_rewrite_simple_quick_phrase_to_command() -> None:
     assert _rewrite_simple_quick_phrase_to_command("体检一下") == "/doctor"
     assert _rewrite_simple_quick_phrase_to_command("安装检查") == "/doctor install"
     assert _rewrite_simple_quick_phrase_to_command("密钥检查") == "/secret-scan"
+    assert _rewrite_simple_quick_phrase_to_command("暂存区泄漏检查") == "/secret-scan --staged"
     assert _rewrite_simple_quick_phrase_to_command("/history") == ""
 
 
@@ -904,6 +908,7 @@ def test_should_launch_default_tui_with_only_options() -> None:
     assert _should_launch_default_tui(["remote"]) is False
     assert _should_launch_default_tui(["doctor"]) is False
     assert _should_launch_default_tui(["install-doctor"]) is False
+    assert _should_launch_default_tui(["secret-scan"]) is False
     assert _should_launch_default_tui(["setup"]) is False
     assert _should_launch_default_tui(["template"]) is False
     assert _should_launch_default_tui(["report"]) is False
@@ -940,6 +945,7 @@ def test_should_launch_assistant_is_no_longer_default_surface() -> None:
     assert _should_launch_assistant(["remote"]) is False
     assert _should_launch_assistant(["doctor"]) is False
     assert _should_launch_assistant(["install-doctor"]) is False
+    assert _should_launch_assistant(["secret-scan"]) is False
     assert _should_launch_assistant(["setup"]) is False
     assert _should_launch_assistant(["template"]) is False
     assert _should_launch_assistant(["report"]) is False
@@ -1897,6 +1903,19 @@ def test_collect_workspace_secret_checks_ignores_demo_markers(tmp_path: Path) ->
     assert row["name"] == "runtime.workspace_secret_scan"
     assert row["ok"] is True
     assert row["severity"] == "pass"
+
+
+def test_collect_secret_scan_report_staged_scope(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    monkeypatch.setattr(cli_main, "_resolve_staged_secret_scan_paths", lambda workspace: [])
+
+    report = cli_main._collect_secret_scan_report(root=project, staged=True, max_findings=5)
+    checks = report["checks"]
+    assert isinstance(checks, list)
+    first = checks[0]
+    assert first["name"] == "runtime.workspace_secret_scan_scope"
+    assert "scope=staged files (0)" in str(first["detail"])
 
 
 def test_collect_environment_discovery_scans_without_k8s_token(
@@ -3511,16 +3530,19 @@ def test_handle_tui_input_bare_provider_command(monkeypatch: pytest.MonkeyPatch)
 def test_handle_tui_input_secret_scan_renders_doctor_report(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli_main,
-        "_collect_workspace_secret_checks",
-        lambda root=None, max_findings=8: [
-            {
-                "name": "runtime.workspace_secret_scan",
-                "ok": False,
-                "severity": "error",
-                "detail": "detected 1 suspicious token(s): src/app.py:7",
-                "hint": "rotate now",
-            }
-        ],
+        "_collect_secret_scan_report",
+        lambda root=None, max_findings=8, staged=False: {
+            "checks": [
+                {
+                    "name": "runtime.workspace_secret_scan",
+                    "ok": False,
+                    "severity": "error",
+                    "detail": "detected 1 suspicious token(s): src/app.py:7",
+                    "hint": "rotate now",
+                }
+            ],
+            "summary": {"pass": 0, "warn": 0, "error": 1, "healthy": False},
+        },
     )
     output = _handle_tui_input("/secret-scan", {"execute": False})
     assert "workspace_secret_scan" in output
@@ -3530,8 +3552,11 @@ def test_handle_tui_input_secret_scan_renders_doctor_report(monkeypatch: pytest.
 def test_handle_tui_input_secret_scan_with_tail_still_runs_scan(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli_main,
-        "_collect_workspace_secret_checks",
-        lambda root=None, max_findings=8: [{"name": "runtime.workspace_secret_scan", "ok": True, "severity": "pass", "detail": "ok", "hint": ""}],
+        "_collect_secret_scan_report",
+        lambda root=None, max_findings=8, staged=False: {
+            "checks": [{"name": "runtime.workspace_secret_scan", "ok": True, "severity": "pass", "detail": "ok", "hint": ""}],
+            "summary": {"pass": 1, "warn": 0, "error": 0, "healthy": True},
+        },
     )
     output = _handle_tui_input("/secret-scan --json", {"execute": False})
     assert "workspace_secret_scan" in output
@@ -3553,11 +3578,32 @@ def test_handle_tui_input_doctor_install_renders_report(monkeypatch: pytest.Monk
 def test_handle_tui_input_quick_phrase_secret_scan(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli_main,
-        "_collect_workspace_secret_checks",
-        lambda root=None, max_findings=8: [{"name": "runtime.workspace_secret_scan", "ok": True, "severity": "pass", "detail": "ok", "hint": ""}],
+        "_collect_secret_scan_report",
+        lambda root=None, max_findings=8, staged=False: {
+            "checks": [{"name": "runtime.workspace_secret_scan", "ok": True, "severity": "pass", "detail": "ok", "hint": ""}],
+            "summary": {"pass": 1, "warn": 0, "error": 0, "healthy": True},
+        },
     )
     output = _handle_tui_input("密钥检查", {"execute": False})
     assert "workspace_secret_scan" in output
+
+
+def test_handle_tui_input_secret_scan_parses_staged_and_max_findings(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_report(*, root=None, max_findings=8, staged=False):
+        captured["max_findings"] = max_findings
+        captured["staged"] = staged
+        return {
+            "checks": [{"name": "runtime.workspace_secret_scan", "ok": True, "severity": "pass", "detail": "ok", "hint": ""}],
+            "summary": {"pass": 1, "warn": 0, "error": 0, "healthy": True},
+        }
+
+    monkeypatch.setattr(cli_main, "_collect_secret_scan_report", _fake_report)
+    output = _handle_tui_input("/secret-scan --staged --max-findings 3", {"execute": False})
+    assert "workspace_secret_scan" in output
+    assert captured["staged"] is True
+    assert captured["max_findings"] == 3
 
 
 def test_resolve_tui_numeric_shortcut_prefers_do_when_action_exists(monkeypatch: pytest.MonkeyPatch) -> None:

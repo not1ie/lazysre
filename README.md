@@ -36,9 +36,11 @@ TUI 内常用命令：
 - `/providers`：查看模型配置状态
 - `/doctor`：运行运行环境体检（支持 `/doctor strict`、`/doctor install`）
 - `/secret-scan`：快速检查当前工作区是否存在疑似密钥泄漏（输出脱敏）
+- `/secret-scan --staged`：仅检查当前 Git 暂存区文件（发布前推荐）
 - `chat` 模式支持终端方向键历史输入（readline），并默认跳过敏感内容入历史
 - 口语快捷：直接输入 `继续` / `重试` / `历史` / `帮助` / `扫描` / `简报` 也会自动映射到对应命令
 - 口语快捷：`体检`、`安装检查`、`密钥检查`、`泄漏检查` 也可直接触发 `/doctor` 或 `/secret-scan`
+- 口语快捷：`暂存区泄漏检查` 可直接触发 `/secret-scan --staged`
 - 无斜杠命令：`do 1` / `go 2` / `history 第二条` / `provider gemini` / `ui expert` / `help full` 也可直接识别
 - 错拼容错：`provders`、`pannel next`、`quikstart` 等常见拼写错误会自动纠正
 - 数字快捷：直接输入 `1/2/3...`，若存在对应动作会执行 `/do n`；否则 `1-4` 走 `/go n`
@@ -91,7 +93,7 @@ lazysre --version
 - Provider 错误提示增强：Gemini/OpenAI/Anthropic/兼容网关异常会输出脱敏且可执行的修复建议
 - install-doctor 增加代理环境预检（自动识别 SOCKS 代理并提示 `httpx[socks]`）
 - install-doctor / doctor 增加工作区密钥泄漏预检（workspace_secret_scan，输出脱敏文件:行号）
-- 当前封版基线测试：`330 passed`
+- 当前封版基线测试：`332 passed`
 
 ## 安装方式（开箱即用）
 
@@ -118,6 +120,9 @@ lsre
 python -m lazysre
 # 安装环境自检
 lazysre install-doctor
+# 代码密钥泄漏预检（全仓库 / 仅暂存区）
+lazysre secret-scan
+lazysre secret-scan --staged
 # 一条命令获取本机/远程总览简报
 lazysre brief
 # 零配置环境扫描（安装后也会自动跑一次，不需要 K8s token）
