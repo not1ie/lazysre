@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,6 +58,7 @@ from lazysre.cli.main import (
     _extract_profile_import_request,
     _extract_runbook_var_items_from_text,
     _extract_command_candidates,
+    _looks_like_shell_command,
     _extract_named_field,
     _compose_template_var_items,
     _compose_runbook_var_items,
@@ -65,6 +67,10 @@ from lazysre.cli.main import (
     _normalize_chat_input_text,
     _normalize_natural_language_text,
     _normalize_slash_command_text,
+    _rewrite_simple_quick_phrase_to_command,
+    _render_unknown_slash_command_message,
+    _suggest_unknown_slash_command,
+    _bootstrap_chat_input_history,
     _looks_like_auto_fix_request,
     _looks_like_apply_request,
     _looks_like_approval_queue_request,
@@ -131,6 +137,9 @@ from lazysre.cli.main import (
     _collect_install_doctor_report,
     _write_first_scan_marker,
     _render_cached_startup_brief,
+    _load_tui_runtime_state,
+    _save_tui_runtime_state,
+    _apply_saved_tui_runtime_state,
     _version_info,
     _version_text,
     _build_tui_dashboard_snapshot,
@@ -142,12 +151,14 @@ from lazysre.cli.main import (
     _render_trace_text,
     _render_timeline_text,
     _build_tui_footer_line,
+    _truncate_tui_status_text,
     _build_tui_action_bar,
     _build_tui_help_overlay_lines,
     _build_tui_idle_content_rows,
     _build_tui_panel_hint,
     _build_tui_status_hint_line,
     _build_tui_panel_counts,
+    _render_tui_quick_help_text,
     _build_tui_focus_card,
     _build_tui_prompt_line_and_cursor,
     _build_tui_compact_action_bar,
@@ -156,27 +167,46 @@ from lazysre.cli.main import (
     _build_tui_boot_actions,
     _format_tui_output_for_display,
     _normalize_tui_ui_mode,
+    _toggle_tui_ui_mode,
     _pick_tui_next_command,
+    _maybe_apply_runtime_provider_fallback,
+    _maybe_apply_tui_provider_fallback,
     _parse_tui_escape_sequence,
+    _normalize_tui_key_alias,
     _render_tui_completion_card,
+    _render_tui_simple_result_card,
     _render_tui_success_card,
     _resolve_tui_boot_action_command,
+    _looks_like_ordinal_shortcut,
+    _resolve_tui_numeric_shortcut_command,
     _sanitize_tui_secret_tokens,
+    _should_auto_fallback_to_mock,
     _build_tui_starter_prompts,
     _build_recent_trace_summary,
     _infer_trace_stage,
     _build_tui_panel_tabs,
     _build_tui_sidebar_lines,
+    _tui_welcome_message,
+    _collect_snapshot_recent_commands,
+    _render_history_text,
+    _resolve_tui_empty_submit_command,
     _maybe_auto_bootstrap_for_tui,
     _normalize_runtime_exception_message,
     _normalize_tui_panel_name,
     _switch_tui_panel,
     _cycle_tui_completion,
     _cycle_tui_input_history,
+    _merge_tui_input_history,
+    _load_tui_input_history,
+    _save_tui_input_history,
+    _delete_tui_word_left,
+    _apply_tui_ctrl_edit_key,
+    _build_tui_bootstrap_input_history,
     _build_provider_runtime_report,
     _switch_runtime_provider,
     _tui_completion_candidates,
     _tui_text_display_width,
+    _handle_incident_inline_command,
     _handle_tui_input,
     _classify_quick_action_confidence,
     _derive_closed_loop_plan,
@@ -186,6 +216,7 @@ from lazysre.cli.main import (
     _run_closed_loop_execution,
     _safe_run_ssh_command,
     _safe_run_command,
+    _safe_int,
     _should_launch_assistant,
 )
 from lazysre.cli.llm import (
@@ -198,6 +229,7 @@ from lazysre.cli.policy import assess_command
 from lazysre.cli.runbook import find_runbook
 from lazysre.cli.secrets import SecretStore
 from lazysre.cli.target import TargetEnvironment, TargetEnvStore
+from lazysre.cli.types import DispatchResult
 from lazysre.config import settings
 
 
@@ -211,6 +243,12 @@ def test_rewrite_argv_preserves_subcommand() -> None:
     argv = ["lsre", "pack", "list", "--index", "idx.json"]
     _rewrite_argv_for_default_run(argv)
     assert argv == ["lsre", "pack", "list", "--index", "idx.json"]
+
+
+def test_rewrite_argv_preserves_incident_subcommand() -> None:
+    argv = ["lsre", "incident", "status"]
+    _rewrite_argv_for_default_run(argv)
+    assert argv == ["lsre", "incident", "status"]
 
 
 def test_rewrite_argv_with_global_option_then_instruction() -> None:
@@ -548,6 +586,9 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _looks_like_actions_request("给我推荐动作")
     assert _looks_like_action_run_request("执行第1个建议")
     assert _extract_action_id_from_text("执行第12个动作") == 12
+    assert _extract_action_id_from_text("执行第一步建议") == 1
+    assert _extract_action_id_from_text("运行③号动作") == 3
+    assert _extract_action_id_from_text("apply action #2") == 2
     assert _looks_like_autopilot_request("帮我自动驾驶排查一下")
     assert _looks_like_autopilot_request("一键巡检并诊断")
     assert _looks_like_latest_watch_reference("修复巡检发现的问题")
@@ -587,11 +628,94 @@ def test_normalize_chat_input_text() -> None:
     assert _normalize_slash_command_text("/stauts probe") == "/status probe"
     assert _normalize_slash_command_text("/conect root@192.168.10.101") == "/connect root@192.168.10.101"
     assert _normalize_slash_command_text("/brif") == "/brief"
+    assert _normalize_slash_command_text("/hist") == "/history"
+    assert _normalize_slash_command_text("/rt") == "/retry"
     assert _normalize_natural_language_text("请看模版库") == "请看模板库"
     assert _normalize_natural_language_text("conect root@192.168.10.101") == "connect root@192.168.10.101"
     assert _normalize_natural_language_text("brif") == "brief"
     assert _normalize_chat_input_text("/templete list") == "/template list"
-    assert _normalize_chat_input_text("quikstart 一下") == "quickstart 一下"
+    assert _normalize_chat_input_text("quikstart 一下") == "/quickstart 一下"
+    assert _normalize_chat_input_text("do 1") == "/do 1"
+    assert _normalize_chat_input_text("go 2") == "/go 2"
+    assert _normalize_chat_input_text("history 第二条") == "/history 第二条"
+    assert _normalize_chat_input_text("provider mock") == "/provider mock"
+    assert _normalize_chat_input_text("ui expert") == "/ui expert"
+    assert _normalize_chat_input_text("help full") == "/help full"
+    assert _normalize_chat_input_text("provders") == "/providers"
+    assert _normalize_chat_input_text("pannel next") == "/panel next"
+    assert _normalize_chat_input_text("secretcheck") == "/secret-scan"
+    assert _normalize_chat_input_text("secret scan") == "/secret-scan"
+    assert _normalize_chat_input_text("/secret scan") == "/secret-scan"
+    assert _normalize_chat_input_text("help me check this") == "help me check this"
+
+
+def test_safe_int_accepts_flexible_ordinal_tokens() -> None:
+    assert _safe_int("1") == 1
+    assert _safe_int("#2") == 2
+    assert _safe_int("no.3") == 3
+    assert _safe_int("第4步") == 4
+    assert _safe_int("第一步") == 1
+    assert _safe_int("第十二条") == 12
+    assert _safe_int("③") == 3
+    assert _safe_int("❿") == 10
+    assert _safe_int("检查一下") == 0
+
+
+def test_rewrite_simple_quick_phrase_to_command() -> None:
+    assert _rewrite_simple_quick_phrase_to_command("继续") == "/next"
+    assert _rewrite_simple_quick_phrase_to_command("继续完善") == "/next"
+    assert _rewrite_simple_quick_phrase_to_command("继续排查一下") == "/next"
+    assert _rewrite_simple_quick_phrase_to_command("历史") == "/history"
+    assert _rewrite_simple_quick_phrase_to_command("看历史") == "/history"
+    assert _rewrite_simple_quick_phrase_to_command("重试") == "/retry"
+    assert _rewrite_simple_quick_phrase_to_command("再试一下") == "/retry"
+    assert _rewrite_simple_quick_phrase_to_command("帮助") == "/help"
+    assert _rewrite_simple_quick_phrase_to_command("命令怎么用") == "/help"
+    assert _rewrite_simple_quick_phrase_to_command("环境扫描") == "/scan"
+    assert _rewrite_simple_quick_phrase_to_command("先扫描一下") == "/scan"
+    assert _rewrite_simple_quick_phrase_to_command("简报") == "/brief"
+    assert _rewrite_simple_quick_phrase_to_command("总览一下") == "/brief"
+    assert _rewrite_simple_quick_phrase_to_command("执行轨迹看看") == "/trace"
+    assert _rewrite_simple_quick_phrase_to_command("时间线") == "/timeline"
+    assert _rewrite_simple_quick_phrase_to_command("provider状态") == "/providers"
+    assert _rewrite_simple_quick_phrase_to_command("体检一下") == "/doctor"
+    assert _rewrite_simple_quick_phrase_to_command("安装检查") == "/doctor install"
+    assert _rewrite_simple_quick_phrase_to_command("密钥检查") == "/secret-scan"
+    assert _rewrite_simple_quick_phrase_to_command("/history") == ""
+
+
+def test_suggest_unknown_slash_command() -> None:
+    suggestion = _suggest_unknown_slash_command("/provders")
+    assert suggestion in {"/providers", "/provider"}
+
+
+def test_render_unknown_slash_command_message_contains_help() -> None:
+    msg = _render_unknown_slash_command_message("/foobar")
+    assert "未知命令" in msg
+    assert "/help" in msg
+
+
+def test_bootstrap_chat_input_history_reads_session_file(tmp_path: Path) -> None:
+    session_file = tmp_path / "session.json"
+    session_file.write_text(
+        json.dumps(
+            {
+                "turns": [
+                    {"user": "检查 swarm", "assistant": "ok"},
+                    {"user": "ALL_PROXY=socks5://u:p@example.com:1080", "assistant": "ok"},
+                    {"user": "检查 swarm", "assistant": "dup"},
+                ],
+                "entities": {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    rows = _bootstrap_chat_input_history({"session_file": str(session_file)}, limit=10)
+    assert "检查 swarm" in rows
+    assert any("://***:***@" in item for item in rows)
+    assert rows.count("检查 swarm") == 1
 
 
 def test_extract_apply_step_selection() -> None:
@@ -783,6 +907,7 @@ def test_should_launch_default_tui_with_only_options() -> None:
     assert _should_launch_default_tui(["setup"]) is False
     assert _should_launch_default_tui(["template"]) is False
     assert _should_launch_default_tui(["report"]) is False
+    assert _should_launch_default_tui(["incident"]) is False
     assert _should_launch_default_tui(["runbook"]) is False
     assert _should_launch_default_tui(["approve"]) is False
     assert _should_launch_default_tui(["memory"]) is False
@@ -818,6 +943,7 @@ def test_should_launch_assistant_is_no_longer_default_surface() -> None:
     assert _should_launch_assistant(["setup"]) is False
     assert _should_launch_assistant(["template"]) is False
     assert _should_launch_assistant(["report"]) is False
+    assert _should_launch_assistant(["incident"]) is False
     assert _should_launch_assistant(["runbook"]) is False
     assert _should_launch_assistant(["approve"]) is False
     assert _should_launch_assistant(["memory"]) is False
@@ -877,7 +1003,7 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "hint=" in rendered
     assert "action_bar=" in rendered
     assert "Up/Down 浏览历史" in rendered
-    assert "F1/? 打开帮助" in rendered
+    assert "F1/? 帮助" in rendered
     assert "Starter Prompts" in rendered
 
 
@@ -1112,6 +1238,12 @@ kubectl -n default get pods -l app=payment -w
     commands = _extract_command_candidates(text, max_items=5)
     assert commands[0] == "kubectl -n default rollout restart deploy/payment"
     assert "kubectl -n default get pods -l app=payment -w" in commands
+
+
+def test_looks_like_shell_command_supports_sudo_prefix() -> None:
+    assert _looks_like_shell_command("sudo docker service ls")
+    assert _looks_like_shell_command("sudo kubectl get pods -A")
+    assert not _looks_like_shell_command("sudo 删除服务")
 
 
 def test_read_last_fix_plan_summary(tmp_path: Path) -> None:
@@ -1684,6 +1816,89 @@ def test_collect_install_doctor_report_shape() -> None:
     assert "runtime.lazysre_import" in names
 
 
+def test_collect_proxy_runtime_checks_without_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]:
+        monkeypatch.delenv(key, raising=False)
+
+    checks = cli_main._collect_proxy_runtime_checks()
+    by_name = {str(item.get("name", "")): item for item in checks if isinstance(item, dict)}
+
+    row = by_name["runtime.proxy_env"]
+    assert row["ok"] is True
+    assert row["severity"] == "pass"
+    assert row["detail"] == "(unset)"
+    assert "runtime.proxy_socksio" not in by_name
+
+
+def test_collect_proxy_runtime_checks_requires_socksio_when_socks_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALL_PROXY", "socks5://myuser:mypass@example.com:1080")
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.setattr(cli_main, "_is_socksio_available", lambda: False)
+
+    checks = cli_main._collect_proxy_runtime_checks()
+    by_name = {str(item.get("name", "")): item for item in checks if isinstance(item, dict)}
+
+    env_row = by_name["runtime.proxy_env"]
+    assert "myuser:mypass@" not in str(env_row["detail"])
+    assert "://***:***@" in str(env_row["detail"])
+
+    socks_row = by_name["runtime.proxy_socksio"]
+    assert socks_row["ok"] is False
+    assert socks_row["severity"] == "error"
+    assert "httpx[socks]" in str(socks_row["hint"])
+
+
+def test_collect_proxy_runtime_checks_socksio_not_required_for_http_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
+    for key in ["ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "https_proxy"]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
+    monkeypatch.setattr(cli_main, "_is_socksio_available", lambda: False)
+
+    checks = cli_main._collect_proxy_runtime_checks()
+    by_name = {str(item.get("name", "")): item for item in checks if isinstance(item, dict)}
+    row = by_name["runtime.proxy_socksio"]
+    assert row["ok"] is True
+    assert row["severity"] == "pass"
+    assert "not required" in str(row["detail"])
+
+
+def test_collect_workspace_secret_checks_detects_google_key(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    sample_key = "AIza" + "SyA07WTYW4rP5R30fInBHARD3kxABq8D2wI"
+    (project / "app.py").write_text(f'KEY = "{sample_key}"\n', encoding="utf-8")
+
+    checks = cli_main._collect_workspace_secret_checks(root=project)
+    assert isinstance(checks, list)
+    row = checks[0]
+    assert row["name"] == "runtime.workspace_secret_scan"
+    assert row["ok"] is False
+    assert row["severity"] == "error"
+    findings = row.get("findings", [])
+    assert isinstance(findings, list) and findings
+    first = findings[0]
+    assert first["file"] == "app.py"
+    assert first["line"] == 1
+    assert "AIza***REDACTED***" in str(first["token"])
+
+
+def test_collect_workspace_secret_checks_ignores_demo_markers(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    sample_key = "AIza" + "SyA07WTYW4rP5R30fInBHARD3kxABq8D2wI" + "-demo"
+    (project / "tests.py").write_text(f'KEY = "{sample_key}"\n', encoding="utf-8")
+
+    checks = cli_main._collect_workspace_secret_checks(root=project)
+    row = checks[0]
+    assert row["name"] == "runtime.workspace_secret_scan"
+    assert row["ok"] is True
+    assert row["severity"] == "pass"
+
+
 def test_collect_environment_discovery_scans_without_k8s_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2221,6 +2436,40 @@ def test_build_tui_dashboard_snapshot_reads_marker_and_session(tmp_path: Path, m
     assert any(item.get("command") == "/activity" and item.get("last_status") == "ok" for item in snapshot["quick_action_items"])
 
 
+def test_build_tui_dashboard_snapshot_masks_secrets_in_session_preview(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+    session_file = tmp_path / "session.json"
+    session_file.write_text(
+        json.dumps(
+            {
+                "turns": [
+                    {"user": "我有一个k8s集群，root密码是demo-password", "assistant": "ok"},
+                    {"user": "api key=google-api-key-demo-value", "assistant": "ok"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "lsre-onboarding.json").write_text(
+        json.dumps({"generated_at_utc": "2026-04-10T00:00:00+00:00", "briefing": {}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    snapshot = _build_tui_dashboard_snapshot(
+        {
+            "execute": False,
+            "provider": "mock",
+            "model": "test-model",
+            "session_file": str(session_file),
+            "audit_log": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    assert "demo-password" not in snapshot["last_user"]
+    assert "google-api-key-demo-value" not in snapshot["last_user"]
+    assert any("***REDACTED***" in item for item in snapshot["recent_commands"])
+
+
 def test_render_recent_activity_text_includes_next_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
     (tmp_path / "lsre-watch-last.json").write_text(
@@ -2428,6 +2677,31 @@ def test_build_tui_footer_line_includes_last_user_command() -> None:
     assert "activity=2" in footer
     assert "timeline=1" in footer
     assert "last=/activity" in footer
+
+
+def test_build_tui_footer_line_truncates_and_sanitizes_last_user() -> None:
+    footer = _build_tui_footer_line(
+        snapshot={
+            "mode": "dry-run",
+            "active_provider": "gemini",
+            "usable_targets": ["kubernetes"],
+            "recent_activity": [],
+            "timeline_entries": [],
+        },
+        status="ready",
+        history=[
+            ("You", "检查 key=google-api-key-demo-value 和最近 k8s pod 崩溃原因"),
+        ],
+    )
+    assert "google-api-key-demo-value" not in footer
+    assert "key=***REDACTED***" in footer
+    assert "last=检查 key=***REDACTED***" in footer
+    assert "…" in footer
+
+
+def test_truncate_tui_status_text_collapses_spaces_and_adds_ellipsis() -> None:
+    out = _truncate_tui_status_text("  alpha   beta   gamma   delta  ", max_chars=11)
+    assert out == "alpha beta…"
 
 
 def test_normalize_tui_panel_name_aliases() -> None:
@@ -2670,10 +2944,50 @@ def test_parse_tui_escape_sequence_for_function_style_prefix() -> None:
     assert _parse_tui_escape_sequence("foo[1~") == "<HOME>"
 
 
+def test_parse_tui_escape_sequence_with_modifier_arrow() -> None:
+    assert _parse_tui_escape_sequence("[1;5A") == "<UP>"
+    assert _parse_tui_escape_sequence("[1;3B") == "<DOWN>"
+
+
+def test_normalize_tui_key_alias_for_unicode_arrows() -> None:
+    assert _normalize_tui_key_alias("↑") == "<UP>"
+    assert _normalize_tui_key_alias("↓") == "<DOWN>"
+    assert _normalize_tui_key_alias("←") == "<LEFT>"
+    assert _normalize_tui_key_alias("→") == "<RIGHT>"
+    assert _normalize_tui_key_alias("⬆") == "<UP>"
+    assert _normalize_tui_key_alias("⬇") == "<DOWN>"
+    assert _normalize_tui_key_alias("x") == "x"
+
+
+def test_normalize_tui_key_alias_ignores_ime_modifier_glyphs() -> None:
+    assert _normalize_tui_key_alias("⇧") == ""
+    assert _normalize_tui_key_alias("⌥") == ""
+    assert _normalize_tui_key_alias("⌘") == ""
+    assert _normalize_tui_key_alias("⌃") == ""
+
+
+def test_normalize_tui_key_alias_for_full_escape_sequence() -> None:
+    assert _normalize_tui_key_alias("\x1b[A") == "<UP>"
+    assert _normalize_tui_key_alias("\x1b[1;5A") == "<UP>"
+    assert _normalize_tui_key_alias("[A") == "<UP>"
+    assert _normalize_tui_key_alias("OA") == "<UP>"
+
+
+def test_normalize_tui_key_alias_for_named_curses_keys() -> None:
+    assert _normalize_tui_key_alias("KEY_UP") == "<UP>"
+    assert _normalize_tui_key_alias("KEY_DOWN") == "<DOWN>"
+    assert _normalize_tui_key_alias("KEY_LEFT") == "<LEFT>"
+    assert _normalize_tui_key_alias("KEY_RIGHT") == "<RIGHT>"
+    assert _normalize_tui_key_alias("KEY_HOME") == "<HOME>"
+    assert _normalize_tui_key_alias("KEY_END") == "<END>"
+    assert _normalize_tui_key_alias("KEY_DC") == "<DELETE>"
+
+
 def test_format_tui_output_for_display_removes_internal_trace_lines() -> None:
     raw = "\n".join(
         [
             "[llm_turn] initial_response {...}",
+            "[lm_turn] step_1_followup {...}",
             "[tool_call] get_context",
             "## Status",
             "Diagnosing",
@@ -2685,6 +2999,7 @@ def test_format_tui_output_for_display_removes_internal_trace_lines() -> None:
     )
     cleaned = _format_tui_output_for_display(raw)
     assert "[llm_turn]" not in cleaned
+    assert "[lm_turn]" not in cleaned
     assert "[tool_call]" not in cleaned
     assert "Status:" in cleaned
     assert "kubectl get pods" in cleaned
@@ -2712,7 +3027,25 @@ def test_build_tui_compact_sidebar_lines_contains_guided_blocks() -> None:
 
 def test_build_tui_compact_action_bar_mentions_shift_shortcuts() -> None:
     line = _build_tui_compact_action_bar({"focus_title": "x", "focus_body": "y"})
-    assert "Shift+N/T/U" in line
+    assert "Shift+N/T/U/R" in line
+    assert "/doctor" in line
+    assert "/secret-scan" in line
+
+
+def test_tui_welcome_message_contains_one_minute_setup_and_go4() -> None:
+    text = _tui_welcome_message(
+        {
+            "provider_ready": False,
+            "provider": "auto",
+            "active_provider": "auto->mock",
+            "usable_targets": [],
+            "status": "cold-start",
+            "latest_quick_action": {},
+        }
+    )
+    assert "One Minute Setup" in text
+    assert "/go 1|2|3|4" in text
+    assert "/quickstart" in text
 
 
 def test_build_tui_start_coach_prioritizes_provider_setup() -> None:
@@ -2727,7 +3060,7 @@ def test_build_tui_start_coach_prioritizes_provider_setup() -> None:
         }
     )
     assert coach["phase"] == "connect_llm"
-    assert "/go 3" in str(coach["primary"])
+    assert "/go 1" in str(coach["primary"])
 
 
 def test_resolve_tui_boot_action_command_by_stage() -> None:
@@ -2739,8 +3072,10 @@ def test_resolve_tui_boot_action_command_by_stage() -> None:
         "status": "cold-start",
         "latest_quick_action": {},
     }
-    assert _resolve_tui_boot_action_command(snapshot_connect, 1) == "/provider mock"
-    assert _resolve_tui_boot_action_command(snapshot_connect, 3) == "/provider gemini"
+    assert _resolve_tui_boot_action_command(snapshot_connect, 1) == "/quickstart"
+    assert _resolve_tui_boot_action_command(snapshot_connect, 2) == "/provider mock"
+    assert _resolve_tui_boot_action_command(snapshot_connect, 3) == "/providers"
+    assert _resolve_tui_boot_action_command(snapshot_connect, 4) == "/provider gemini"
 
     snapshot_ready = {
         "provider_ready": True,
@@ -2756,6 +3091,12 @@ def test_resolve_tui_boot_action_command_by_stage() -> None:
     assert _resolve_tui_boot_action_command(snapshot_ready, 1) == "/scan"
     assert _resolve_tui_boot_action_command(snapshot_ready, 2) == "/brief"
     assert _resolve_tui_boot_action_command(snapshot_ready, 3) == "/next"
+    assert _resolve_tui_boot_action_command(snapshot_ready, 4) == "/doctor strict"
+
+
+def test_handle_tui_input_go_show_mentions_four_actions() -> None:
+    output = _handle_tui_input("/go show", {"provider": "auto", "model": "gpt-5.4-mini"})
+    assert "用法：/go 1|2|3|4" in output
 
 
 def test_render_tui_success_card_has_three_sections() -> None:
@@ -2781,11 +3122,45 @@ def test_pick_tui_next_command_prefers_trace_after_failure() -> None:
     assert command == "/trace"
 
 
+def test_pick_tui_next_command_resolves_go_primary_command() -> None:
+    command = _pick_tui_next_command(
+        {
+            "provider_ready": False,
+            "provider": "auto",
+            "active_provider": "auto->mock",
+            "usable_targets": [],
+            "status": "cold-start",
+            "latest_quick_action": {},
+        }
+    )
+    assert command == "/quickstart"
+
+
+def test_pick_tui_next_command_prefers_brief_for_cold_start() -> None:
+    command = _pick_tui_next_command(
+        {
+            "provider_ready": True,
+            "provider": "gemini",
+            "active_provider": "gemini",
+            "usable_targets": ["docker"],
+            "status": "cold-start",
+            "latest_quick_action": {"status": "ok"},
+        }
+    )
+    assert command == "/brief"
+
+
 def test_normalize_tui_ui_mode_defaults_to_simple() -> None:
     assert _normalize_tui_ui_mode("simple") == "simple"
     assert _normalize_tui_ui_mode("expert") == "expert"
     assert _normalize_tui_ui_mode("advanced") == "expert"
     assert _normalize_tui_ui_mode("weird") == "simple"
+
+
+def test_toggle_tui_ui_mode_roundtrip() -> None:
+    assert _toggle_tui_ui_mode("simple") == "expert"
+    assert _toggle_tui_ui_mode("expert") == "simple"
+    assert _toggle_tui_ui_mode("advanced") == "simple"
 
 
 def test_sanitize_tui_secret_tokens_masks_google_key() -> None:
@@ -2796,10 +3171,17 @@ def test_sanitize_tui_secret_tokens_masks_google_key() -> None:
 
 
 def test_sanitize_tui_secret_tokens_masks_password_phrase() -> None:
-    raw = "我有一个k8s集群，ip是192.168.10.1，root密码是Aki030203"
+    raw = "我有一个k8s集群，ip是10.0.0.1，root密码是demo-password"
     masked = _sanitize_tui_secret_tokens(raw)
-    assert "Aki030203" not in masked
+    assert "demo-password" not in masked
     assert "密码=***REDACTED***" in masked
+
+
+def test_sanitize_tui_secret_tokens_masks_proxy_userinfo() -> None:
+    raw = "ALL_PROXY=socks5://myuser:mypass@example.com:1080"
+    masked = _sanitize_tui_secret_tokens(raw)
+    assert "myuser:mypass@" not in masked
+    assert "://***:***@" in masked
 
 
 def test_format_tui_output_for_display_renders_error_card() -> None:
@@ -2810,10 +3192,86 @@ def test_format_tui_output_for_display_renders_error_card() -> None:
     assert "Fallback:" in out
 
 
+def test_format_tui_output_for_display_renders_degraded_card_for_auto_fallback() -> None:
+    out = _format_tui_output_for_display(
+        "[auto-fallback]\nProvider `gemini` 调用失败，已自动降级到 mock（仅建议/低风险模式）。 原因: Gemini API HTTP 400: bad request"
+    )
+    assert "Result: Degraded" in out
+    assert "Do Now:" in out
+    assert "Provider `gemini` 调用失败" in out or "Gemini API HTTP 400" in out
+
+
+def test_maybe_apply_tui_provider_fallback_switches_to_mock() -> None:
+    options = {"provider": "gemini", "model": "gemini-2.5-flash"}
+    note = _maybe_apply_tui_provider_fallback(
+        options,
+        "[auto-fallback]\nProvider `gemini` 调用失败，已自动降级到 mock（仅建议/低风险模式）。",
+    )
+    assert options["provider"] == "mock"
+    assert "gpt" in str(options["model"]).lower()
+    assert "自动切换为 mock" in note
+
+
+def test_maybe_apply_tui_provider_fallback_noop_for_normal_output() -> None:
+    options = {"provider": "gemini", "model": "gemini-2.5-flash"}
+    note = _maybe_apply_tui_provider_fallback(options, "Result: Success\nAll good")
+    assert note == ""
+    assert options["provider"] == "gemini"
+
+
 def test_render_tui_completion_card_keeps_failed_card() -> None:
     out = _render_tui_completion_card("Result: Failed\nReason: bad key", request="check", duration_ms=8)
     assert "Result: Success" not in out
     assert "Result: Failed" in out
+
+
+def test_render_tui_simple_result_card_summarizes_markdown_style_output() -> None:
+    raw = "\n".join(
+        [
+            "Status: Diagnosing",
+            "Reasoning: 已定位到 swarm 副本不足与镜像拉取失败。",
+            "Risk Level: High - service update 可能抖动",
+            "Commands:",
+            "docker service ps lazysre_lazysre --no-trunc",
+            "docker service logs --tail 200 lazysre_lazysre",
+            "docker service update --force lazysre_lazysre",
+        ]
+    )
+    out = _render_tui_simple_result_card(raw, request="检查 swarm")
+    assert "Result: Success" in out
+    assert "Status: Diagnosing" in out
+    assert "Summary:" in out
+    assert "Risk:" in out
+    assert "Commands:" in out
+    assert "docker service update --force lazysre_lazysre" in out
+    assert "Next:" in out
+
+
+def test_render_tui_completion_card_uses_simple_summary_mode() -> None:
+    raw = "\n".join(
+        [
+            "## Status",
+            "Diagnosing",
+            "## Reasoning",
+            "已完成首轮定位",
+            "## Commands",
+            "kubectl get pods -A",
+        ]
+    )
+    out = _render_tui_completion_card(raw, request="检查 k8s", duration_ms=12, ui_mode="simple")
+    assert "Result" in out
+    assert "Status:" in out
+    assert "Summary:" in out
+    assert "Commands:" in out
+    assert "## Reasoning" not in out
+
+
+def test_render_tui_completion_card_expert_keeps_detailed_mode() -> None:
+    raw = "操作已完成\n- pod_count=12\n- warn=0"
+    out = _render_tui_completion_card(raw, request="检查 k8s", duration_ms=9, ui_mode="expert")
+    assert "Result: Success" in out
+    assert "Evidence:" in out
+    assert "Next:" in out
 
 
 def test_handle_tui_input_ui_switches_mode() -> None:
@@ -2821,6 +3279,370 @@ def test_handle_tui_input_ui_switches_mode() -> None:
     res = cli_main._handle_tui_input("/ui expert", options)
     assert "expert" in res
     assert options["tui_ui_mode"] == "expert"
+
+
+def test_render_tui_quick_help_text_contains_core_guidance() -> None:
+    text = _render_tui_quick_help_text(
+        {
+            "mode": "dry-run",
+            "provider": "auto",
+            "active_provider": "auto->mock",
+            "status": "ready",
+            "latest_quick_action": {"status": "ok", "command": "/scan"},
+        }
+    )
+    assert "Quick Help" in text
+    assert "/next" in text
+    assert "/scan" in text
+    assert "/brief" in text
+    assert "/providers" in text
+    assert "/doctor" in text
+    assert "/secret-scan" in text
+    assert "Shift+N/T/U/R" in text
+
+
+def test_handle_tui_input_help_returns_quick_help(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {"mode": "dry-run", "provider": "mock", "active_provider": "mock", "status": "ready"},
+    )
+    out = _handle_tui_input("/help", {"execute": False})
+    assert "Quick Help" in out
+    assert "/next" in out
+    assert "Brand" not in out
+
+
+def test_handle_tui_input_help_full_returns_demo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {"mode": "dry-run", "provider": "mock", "active_provider": "mock", "status": "ready"},
+    )
+    out = _handle_tui_input("/help full", {"execute": False})
+    assert "LazySRE Fullscreen TUI" in out
+    assert "Brand" in out
+
+
+def test_tui_runtime_state_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    state_file = tmp_path / "lsre-tui-state.json"
+    monkeypatch.setattr(cli_main, "_tui_state_file", lambda: state_file)
+
+    _save_tui_runtime_state(panel="providers", ui_mode="expert")
+    state = _load_tui_runtime_state()
+    assert state["panel"] == "providers"
+    assert state["ui_mode"] == "expert"
+
+
+def test_apply_saved_tui_runtime_state_updates_options(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    state_file = tmp_path / "lsre-tui-state.json"
+    monkeypatch.setattr(cli_main, "_tui_state_file", lambda: state_file)
+    _save_tui_runtime_state(panel="timeline", ui_mode="expert")
+
+    options: dict[str, object] = {"tui_panel": "overview", "tui_ui_mode": "simple"}
+    _apply_saved_tui_runtime_state(options)
+    assert options["tui_panel"] == "timeline"
+    assert options["tui_ui_mode"] == "expert"
+
+
+def test_switch_tui_panel_persists_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    persisted: dict[str, object] = {}
+    monkeypatch.setattr(cli_main, "_persist_tui_runtime_state", lambda opts: persisted.update(opts))
+
+    options: dict[str, object] = {"tui_panel": "overview", "tui_ui_mode": "simple"}
+    output = _switch_tui_panel(options, "providers")
+    assert "已切换左侧面板" in output
+    assert options["tui_panel"] == "providers"
+    assert persisted.get("tui_panel") == "providers"
+
+
+def test_handle_tui_input_retry_uses_last_input() -> None:
+    options = {"execute": False, "tui_last_input": "/mode show"}
+    output = _handle_tui_input("/retry", options)
+    assert "重试上一条: /mode show" in output
+    assert "当前模式: dry-run" in output
+
+
+def test_handle_tui_input_retry_falls_back_to_recent_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {"recent_commands": ["/mode show"]},
+    )
+    output = _handle_tui_input("/retry", {"execute": False})
+    assert "重试上一条: /mode show" in output
+    assert "当前模式: dry-run" in output
+
+
+def test_handle_tui_input_history_show(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {"recent_commands": ["/mode show"], "recent_commands_full": ["/scan", "/mode show", "检查 swarm"]},
+    )
+    output = _handle_tui_input("/history", {"execute": False})
+    assert "History (latest first)" in output
+    assert "- 1. 检查 swarm" in output
+    assert "- 3. /scan" in output
+
+
+def test_handle_tui_input_history_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {
+            "recent_commands": ["/mode show"],
+            "recent_commands_full": ["/scan", "/mode show", "检查 swarm", "检查 k8s pod"],
+        },
+    )
+    output = _handle_tui_input("/history k8s", {"execute": False})
+    assert "History Search: k8s" in output
+    assert "检查 k8s pod" in output
+    assert "/scan" not in output
+
+
+def test_render_history_text_no_match() -> None:
+    output = _render_history_text(["/scan", "检查 swarm"], query="k8s")
+    assert "没有匹配结果" in output
+    assert "/history 查看全部历史" in output
+
+
+def test_handle_tui_input_history_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {"recent_commands": ["/mode show"], "recent_commands_full": ["/scan", "/mode show", "检查 swarm"]},
+    )
+    output = _handle_tui_input("/history 2", {"execute": False})
+    assert "重放历史[2]: /mode show" in output
+    assert "当前模式: dry-run" in output
+
+
+def test_handle_tui_input_history_replay_accepts_ordinal_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {"recent_commands": ["/mode show"], "recent_commands_full": ["/scan", "/mode show", "检查 swarm"]},
+    )
+    output = _handle_tui_input("/history 第二条", {"execute": False})
+    assert "重放历史[2]: /mode show" in output
+    assert "当前模式: dry-run" in output
+
+
+def test_collect_snapshot_recent_commands_prefers_full() -> None:
+    rows = _collect_snapshot_recent_commands(
+        {"recent_commands": ["/mode show"], "recent_commands_full": ["/scan", "/mode show", "检查 swarm"]},
+        limit=12,
+    )
+    assert rows == ["/scan", "/mode show", "检查 swarm"]
+
+
+def test_handle_tui_input_unknown_slash_command_returns_hint() -> None:
+    output = _handle_tui_input("/foobar", {"execute": False})
+    assert "未知命令" in output
+    assert "/help" in output
+
+
+def test_handle_tui_input_quick_phrase_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {"recent_commands": ["/scan", "/mode show"]},
+    )
+    output = _handle_tui_input("历史", {"execute": False})
+    assert "History (latest first)" in output
+    assert "/mode show" in output
+
+
+def test_handle_tui_input_quick_phrase_next(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_main, "_build_tui_dashboard_snapshot", lambda options: {"status": "ready"})
+    monkeypatch.setattr(cli_main, "_pick_tui_next_command", lambda snapshot: "/mode show")
+    output = _handle_tui_input("继续", {"execute": False})
+    assert "自动执行下一步: /mode show" in output
+    assert "当前模式: dry-run" in output
+
+
+def test_handle_tui_input_do_accepts_ordinal_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: list[int] = []
+
+    def _fake_run_quick_action_item(*, options: dict[str, object], action_id: int, execute_mode: bool):
+        called.append(action_id)
+        return True, "Quick Action Result\n- ok"
+
+    monkeypatch.setattr(cli_main, "_run_quick_action_item", _fake_run_quick_action_item)
+
+    output = _handle_tui_input("/do 第一步", {"execute": False})
+    assert "Quick Action Result" in output
+    assert called == [1]
+
+
+def test_handle_tui_input_bare_do_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: list[int] = []
+
+    def _fake_run_quick_action_item(*, options: dict[str, object], action_id: int, execute_mode: bool):
+        called.append(action_id)
+        return True, "Quick Action Result\n- ok"
+
+    monkeypatch.setattr(cli_main, "_run_quick_action_item", _fake_run_quick_action_item)
+
+    output = _handle_tui_input("do 1", {"execute": False})
+    assert "Quick Action Result" in output
+    assert called == [1]
+
+
+def test_handle_tui_input_go_accepts_circled_number(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_main, "_build_tui_dashboard_snapshot", lambda options: {"status": "ready"})
+    monkeypatch.setattr(
+        cli_main,
+        "_resolve_tui_boot_action_command",
+        lambda snapshot, action_id: "/mode show" if action_id == 3 else "",
+    )
+    output = _handle_tui_input("/go ③", {"execute": False})
+    assert "执行引导动作: /mode show" in output
+    assert "当前模式: dry-run" in output
+
+
+def test_handle_tui_input_bare_provider_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_main, "_switch_runtime_provider", lambda options, provider_name: f"switch:{provider_name}")
+    out = _handle_tui_input("provider mock", {"execute": False, "provider": "auto"})
+    assert out == "switch:mock"
+
+
+def test_handle_tui_input_secret_scan_renders_doctor_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_collect_workspace_secret_checks",
+        lambda root=None, max_findings=8: [
+            {
+                "name": "runtime.workspace_secret_scan",
+                "ok": False,
+                "severity": "error",
+                "detail": "detected 1 suspicious token(s): src/app.py:7",
+                "hint": "rotate now",
+            }
+        ],
+    )
+    output = _handle_tui_input("/secret-scan", {"execute": False})
+    assert "workspace_secret_scan" in output
+    assert "detected 1 suspicious token" in output
+
+
+def test_handle_tui_input_secret_scan_with_tail_still_runs_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_collect_workspace_secret_checks",
+        lambda root=None, max_findings=8: [{"name": "runtime.workspace_secret_scan", "ok": True, "severity": "pass", "detail": "ok", "hint": ""}],
+    )
+    output = _handle_tui_input("/secret-scan --json", {"execute": False})
+    assert "workspace_secret_scan" in output
+
+
+def test_handle_tui_input_doctor_install_renders_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_collect_install_doctor_report",
+        lambda: {
+            "checks": [{"name": "runtime.python_version", "ok": True, "severity": "pass", "detail": "3.11", "hint": ""}],
+            "summary": {"pass": 1, "warn": 0, "error": 0, "healthy": True},
+        },
+    )
+    output = _handle_tui_input("/doctor install", {"execute": False})
+    assert "runtime.python_version" in output
+
+
+def test_handle_tui_input_quick_phrase_secret_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_collect_workspace_secret_checks",
+        lambda root=None, max_findings=8: [{"name": "runtime.workspace_secret_scan", "ok": True, "severity": "pass", "detail": "ok", "hint": ""}],
+    )
+    output = _handle_tui_input("密钥检查", {"execute": False})
+    assert "workspace_secret_scan" in output
+
+
+def test_resolve_tui_numeric_shortcut_prefers_do_when_action_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {"quick_action_items": [{"id": "1", "command": "/trace"}]},
+    )
+    assert _resolve_tui_numeric_shortcut_command("1", options={"execute": False}) == "/do 1"
+
+
+def test_resolve_tui_numeric_shortcut_falls_back_to_go(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_main, "_build_tui_dashboard_snapshot", lambda options: {"quick_action_items": []})
+    assert _resolve_tui_numeric_shortcut_command("2", options={"execute": False}) == "/go 2"
+    assert _resolve_tui_numeric_shortcut_command("9", options={"execute": False}) == ""
+
+
+def test_resolve_tui_numeric_shortcut_accepts_ordinal_variants(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {"quick_action_items": [{"id": "1", "command": "/trace"}]},
+    )
+    assert _resolve_tui_numeric_shortcut_command("①", options={"execute": False}) == "/do 1"
+    assert _resolve_tui_numeric_shortcut_command("#1", options={"execute": False}) == "/do 1"
+    assert _resolve_tui_numeric_shortcut_command("第1步", options={"execute": False}) == "/do 1"
+    assert _resolve_tui_numeric_shortcut_command("no.1", options={"execute": False}) == "/do 1"
+
+
+def test_resolve_tui_numeric_shortcut_rejects_non_ordinal_phrase(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_main, "_build_tui_dashboard_snapshot", lambda options: {"quick_action_items": []})
+    assert _resolve_tui_numeric_shortcut_command("我有一个k8s集群", options={"execute": False}) == ""
+
+
+def test_looks_like_ordinal_shortcut_detection() -> None:
+    assert _looks_like_ordinal_shortcut("③")
+    assert _looks_like_ordinal_shortcut("第1步")
+    assert _looks_like_ordinal_shortcut("#2")
+    assert _looks_like_ordinal_shortcut("no.3")
+    assert not _looks_like_ordinal_shortcut("继续排查")
+    assert not _looks_like_ordinal_shortcut("我有一个k8s集群")
+
+
+def test_resolve_tui_empty_submit_command_for_new_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_main, "_pick_tui_next_command", lambda snapshot: "/next")
+    command = _resolve_tui_empty_submit_command(
+        snapshot={"status": "cold-start"},
+        history=[("LazySRE", "welcome")],
+    )
+    assert command == "/next"
+
+
+def test_resolve_tui_empty_submit_command_ignores_after_user_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_main, "_pick_tui_next_command", lambda snapshot: "/next")
+    command = _resolve_tui_empty_submit_command(
+        snapshot={"status": "ready"},
+        history=[("LazySRE", "welcome"), ("You", "检查环境")],
+    )
+    assert command == ""
+
+
+def test_handle_incident_inline_command_open_note_close(tmp_path: Path) -> None:
+    path = tmp_path / "incident.json"
+    opened = _handle_incident_inline_command("/incident open 支付服务延迟", path=path)
+    assert "Incident" in opened
+    assert "status: open" in opened
+    noted = _handle_incident_inline_command("/incident note 已执行scan", path=path)
+    assert "Incident" in noted
+    closed = _handle_incident_inline_command("/incident close 已恢复", path=path)
+    assert "status: closed" in closed
+
+
+def test_handle_incident_inline_command_uses_default_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path), raising=False)
+    opened = _handle_incident_inline_command("/incident open 默认路径")
+    assert "status: open" in opened
+    assert (tmp_path / "lsre-incident.json").exists()
+
+
+def test_handle_tui_input_incident_respects_incident_file_option(tmp_path: Path) -> None:
+    path = tmp_path / "custom-incident.json"
+    options = {"incident_file": str(path)}
+    output = _handle_tui_input("/incident open tui incident", options)
+    assert "status: open" in output
+    assert path.exists()
 
 
 def test_build_tui_prompt_line_and_cursor_handles_mixed_cn_en() -> None:
@@ -2840,6 +3662,119 @@ def test_normalize_runtime_exception_message_for_socks_proxy_error() -> None:
     assert "fix:" in msg
     assert "httpx[socks]" in msg
     assert "ALL_PROXY" in msg
+
+
+def test_normalize_runtime_exception_message_redacts_google_api_key() -> None:
+    raw = (
+        "Client error '400 Bad Request' for url "
+        "'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        "?key=google-api-key-demo-value'"
+    )
+    msg = _normalize_runtime_exception_message(RuntimeError(raw))
+    assert "google-api-key-demo-value" not in msg
+    assert "key=***REDACTED***" in msg
+
+
+def test_should_auto_fallback_to_mock_detects_provider_runtime_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LAZYSRE_DISABLE_MOCK_FALLBACK", raising=False)
+    assert _should_auto_fallback_to_mock(
+        provider_mode="gemini",
+        error=RuntimeError("Gemini API HTTP 400: API key not valid"),
+    )
+    assert not _should_auto_fallback_to_mock(
+        provider_mode="mock",
+        error=RuntimeError("Gemini API HTTP 400: API key not valid"),
+    )
+
+
+def test_should_auto_fallback_to_mock_respects_disable_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LAZYSRE_DISABLE_MOCK_FALLBACK", "1")
+    assert not _should_auto_fallback_to_mock(
+        provider_mode="gemini",
+        error=RuntimeError("Gemini API HTTP 400: API key not valid"),
+    )
+
+
+def test_maybe_apply_runtime_provider_fallback_switches_session_to_mock() -> None:
+    options = {"provider": "gemini", "model": "gemini-2.5-flash"}
+    result = DispatchResult(
+        final_text="[auto-fallback]\nProvider `gemini` 调用失败",
+        events=[
+            cli_main.DispatchEvent(
+                kind="system",
+                message="provider_fallback",
+                data={
+                    "from": "gemini",
+                    "to": "mock",
+                    "reason": "Gemini API HTTP 400: API key not valid. key=google-api-key-demo-value",
+                },
+            )
+        ],
+    )
+
+    note = _maybe_apply_runtime_provider_fallback(options, result)
+    assert options["provider"] == "mock"
+    assert options["model"] == cli_main.resolve_model_name("openai", settings.model_name)
+    assert "google-api-key-demo-value" not in note
+    assert "切换到 `mock`" in note
+
+
+def test_maybe_apply_runtime_provider_fallback_no_event_is_noop() -> None:
+    options = {"provider": "gemini", "model": "gemini-2.5-flash"}
+    result = DispatchResult(final_text="ok", events=[])
+    note = _maybe_apply_runtime_provider_fallback(options, result)
+    assert note == ""
+    assert options["provider"] == "gemini"
+
+
+def test_dispatch_auto_fallback_to_mock(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class _PrimaryLLM:
+        pass
+
+    class _FakeDispatcher:
+        def __init__(self, *, llm, **kwargs):  # noqa: ANN003
+            self._llm = llm
+
+        async def run(self, instruction: str) -> DispatchResult:
+            if isinstance(self._llm, cli_main.MockFunctionCallingLLM):
+                return DispatchResult(final_text="mock response", events=[])
+            raise RuntimeError("Gemini API HTTP 400: API key not valid. key=google-api-key-demo-value")
+
+    def _fake_build_cli_llm(provider: str, model: str):
+        if provider == "mock":
+            return "mock", "gpt-5.4-mini", cli_main.MockFunctionCallingLLM()
+        return "gemini", "gemini-2.5-flash", _PrimaryLLM()
+
+    monkeypatch.setattr(cli_main, "Dispatcher", _FakeDispatcher)
+    monkeypatch.setattr(cli_main, "_build_cli_llm", _fake_build_cli_llm)
+    monkeypatch.delenv("LAZYSRE_DISABLE_MOCK_FALLBACK", raising=False)
+
+    result = asyncio.run(
+        cli_main._dispatch(
+            instruction="检查环境",
+            execute=False,
+            approve=False,
+            interactive_approval=False,
+            approval_mode="balanced",
+            audit_log=str(tmp_path / "audit.jsonl"),
+            lock_file=str(tmp_path / "lock.json"),
+            deny_tool=[],
+            deny_prefix=[],
+            tool_pack=["builtin"],
+            remote_gateway=[],
+            model="gpt-5.4-mini",
+            provider="gemini",
+            max_steps=3,
+            text_stream=None,
+            conversation_context="",
+            memory_context="",
+        )
+    )
+    assert "[auto-fallback]" in result.final_text
+    assert "mock response" in result.final_text
+    assert "google-api-key-demo-value" not in result.final_text
+    assert result.events
+    assert result.events[0].message == "provider_fallback"
 
 
 def test_render_tui_demo_text_shows_swarm_posture_block() -> None:
@@ -2979,6 +3914,7 @@ def test_build_tui_action_bar_changes_by_panel() -> None:
     assert "/do 1" in activity_bar
     assert "/trace" in timeline_bar
     assert "/providers" in provider_bar
+    assert "/secret-scan" in provider_bar
     assert "overview" in timeline_bar
 
 
@@ -3240,6 +4176,26 @@ def test_handle_tui_input_do_runs_quick_action(monkeypatch: pytest.MonkeyPatch) 
     assert calls[0]["execute_mode"] is False
 
 
+def test_handle_tui_input_numeric_shortcut_runs_do(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "_build_tui_dashboard_snapshot",
+        lambda options: {"focus_title": "Trace", "focus_body": "ok", "quick_action_items": [{"id": "1", "command": "/trace"}]},
+    )
+    monkeypatch.setattr(cli_main, "_run_suggested_command", lambda command_text, *, options, execute_mode: (True, "Trace OK"))
+    output = _handle_tui_input("1", {"execute": False})
+    assert "Quick Action Result" in output
+    assert "Trace OK" in output
+
+
+def test_handle_tui_input_numeric_shortcut_runs_go(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_main, "_build_tui_dashboard_snapshot", lambda options: {"quick_action_items": []})
+    monkeypatch.setattr(cli_main, "_resolve_tui_boot_action_command", lambda snapshot, action_id: "/mode show")
+    output = _handle_tui_input("1", {"execute": False})
+    assert "执行引导动作: /mode show" in output
+    assert "当前模式: dry-run" in output
+
+
 def test_handle_tui_input_do_failed_action_prioritizes_trace(monkeypatch: pytest.MonkeyPatch) -> None:
     snapshots = [
         {
@@ -3282,6 +4238,105 @@ def test_cycle_tui_input_history_roundtrip() -> None:
     assert text3 == "检查 swarm"
     assert idx3 == 2
     assert seed3 == ""
+
+
+def test_cycle_tui_input_history_prefix_filter_roundtrip() -> None:
+    history = ["/scan", "检查 swarm", "检查 k8s", "/brief"]
+    text1, idx1, seed1 = _cycle_tui_input_history("检", input_history=history, history_index=-1, history_seed="", direction="up")
+    text2, idx2, seed2 = _cycle_tui_input_history(text1, input_history=history, history_index=idx1, history_seed=seed1, direction="up")
+    text3, idx3, seed3 = _cycle_tui_input_history(text2, input_history=history, history_index=idx2, history_seed=seed2, direction="down")
+    text4, idx4, seed4 = _cycle_tui_input_history(text3, input_history=history, history_index=idx3, history_seed=seed3, direction="down")
+
+    assert text1 == "检查 k8s"
+    assert text2 == "检查 swarm"
+    assert text3 == "检查 k8s"
+    assert text4 == "检"
+    assert idx4 == -1
+    assert seed4 == "检"
+
+
+def test_cycle_tui_input_history_prefix_filter_case_insensitive() -> None:
+    history = ["/scan", "/Status", "/brief"]
+    text1, idx1, seed1 = _cycle_tui_input_history("/s", input_history=history, history_index=-1, history_seed="", direction="up")
+    text2, idx2, seed2 = _cycle_tui_input_history(text1, input_history=history, history_index=idx1, history_seed=seed1, direction="up")
+
+    assert text1 == "/Status"
+    assert text2 == "/scan"
+    assert seed2 == "/s"
+
+
+def test_cycle_tui_input_history_prefix_filter_no_match_keeps_seed() -> None:
+    history = ["/scan", "/status", "/brief"]
+    text, idx, seed = _cycle_tui_input_history("/xyz", input_history=history, history_index=-1, history_seed="", direction="up")
+
+    assert text == "/xyz"
+    assert idx == -1
+    assert seed == "/xyz"
+
+
+def test_merge_tui_input_history_dedupes_and_keeps_latest_order() -> None:
+    merged = _merge_tui_input_history(
+        ["/scan", "/brief", "/scan"],
+        ["/providers", "/brief", "检查 swarm"],
+        max_entries=20,
+    )
+    assert merged[-4:] == ["/scan", "/providers", "/brief", "检查 swarm"]
+
+
+def test_tui_input_history_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "lsre-tui-input-history.txt"
+    monkeypatch.setattr(cli_main, "_tui_input_history_file", lambda: path)
+
+    _save_tui_input_history(["/scan", "key=google-api-key-demo-value", "/brief"])
+    rows = _load_tui_input_history()
+
+    assert "/scan" in rows
+    assert "/brief" in rows
+    assert all("google-api-key-demo-value" not in item for item in rows)
+    assert any("key=***REDACTED***" in item for item in rows)
+
+
+def test_delete_tui_word_left_handles_spaces_and_mixed_text() -> None:
+    text, cursor = _delete_tui_word_left("检查 k8s pod", len("检查 k8s pod"))
+    assert text == "检查 k8s "
+    assert cursor == len("检查 k8s ")
+
+
+def test_apply_tui_ctrl_edit_key_basic_ops() -> None:
+    t1, c1, ok1 = _apply_tui_ctrl_edit_key(key="\x01", input_text="abcd", cursor_index=3)  # Ctrl+A
+    assert ok1 is True and t1 == "abcd" and c1 == 0
+
+    t2, c2, ok2 = _apply_tui_ctrl_edit_key(key="\x05", input_text="abcd", cursor_index=1)  # Ctrl+E
+    assert ok2 is True and t2 == "abcd" and c2 == 4
+
+    t3, c3, ok3 = _apply_tui_ctrl_edit_key(key="\x15", input_text="abcde", cursor_index=2)  # Ctrl+U
+    assert ok3 is True and t3 == "cde" and c3 == 0
+
+    t4, c4, ok4 = _apply_tui_ctrl_edit_key(key="\x0b", input_text="abcde", cursor_index=2)  # Ctrl+K
+    assert ok4 is True and t4 == "ab" and c4 == 2
+
+    t5, c5, ok5 = _apply_tui_ctrl_edit_key(key="\x17", input_text="检查 k8s pod", cursor_index=len("检查 k8s pod"))  # Ctrl+W
+    assert ok5 is True and t5 == "检查 k8s " and c5 == len("检查 k8s ")
+
+    t6, c6, ok6 = _apply_tui_ctrl_edit_key(key="x", input_text="abc", cursor_index=2)
+    assert ok6 is False and t6 == "abc" and c6 == 2
+
+
+def test_build_tui_bootstrap_input_history_includes_recent_and_defaults() -> None:
+    history = _build_tui_bootstrap_input_history(
+        {
+            "recent_commands": ["检查k8s", "/scan", "ALL_PROXY=socks5://u:p@x:1080"],
+            "recommended_commands": ["/brief", "/providers", "/scan"],
+        }
+    )
+
+    assert "检查k8s" in history
+    assert "/scan" in history
+    assert "/brief" in history
+    assert "/next" in history
+    assert "/history" in history
+    assert "/retry" in history
+    assert any("://***:***@" in item for item in history)
 
 
 def test_cycle_tui_completion_keeps_original_prefix_across_tabs() -> None:

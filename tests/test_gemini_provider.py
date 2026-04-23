@@ -24,3 +24,13 @@ def test_build_gemini_http_error_surfaces_detail_without_secrets() -> None:
     assert "API key not valid" in message
     assert "key=***REDACTED***" in message
     assert "google-api-key-demo-value" not in message
+    assert "/provider mock" in message
+
+
+def test_sanitize_secret_text_masks_token_and_bearer() -> None:
+    raw = "failed token=demo-secret-token Authorization: Bearer very-secret-token-value"
+    masked = _sanitize_secret_text(raw)
+    assert "demo-secret-token" not in masked
+    assert "very-secret-token-value" not in masked
+    assert "token=***REDACTED***" in masked
+    assert "Bearer ***REDACTED***" in masked

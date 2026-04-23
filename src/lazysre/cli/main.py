@@ -47,6 +47,7 @@ from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.session import SessionStore
 from lazysre.cli.memory import IncidentMemoryStore, MemoryCase, format_memory_context
+from lazysre.cli.incident import IncidentStore, IncidentRecord, render_incident_markdown
 from lazysre.cli.secrets import SecretStore
 from lazysre.cli.runbook import (
     RunbookStore,
@@ -67,7 +68,7 @@ from lazysre.cli.remediation_templates import (
 from lazysre.cli.target import TargetEnvStore, probe_target_environment
 from lazysre.cli.target_profiles import ClusterProfileStore
 from lazysre.cli.tools import build_default_registry
-from lazysre.cli.types import ExecResult
+from lazysre.cli.types import DispatchEvent, DispatchResult, ExecResult
 from lazysre.cli.tools.marketplace import (
     LockedPack,
     ToolPackLockStore,
@@ -109,6 +110,7 @@ target_app = typer.Typer(help="Target environment profile management.")
 target_profile_app = typer.Typer(help="Multi-cluster target profile management.")
 history_app = typer.Typer(help="Session history management.")
 memory_app = typer.Typer(help="Long-term incident memory management.")
+incident_app = typer.Typer(help="Incident lifecycle management.")
 runbook_app = typer.Typer(help="Workflow runbook templates.")
 template_app = typer.Typer(help="One-click remediation templates.")
 
@@ -126,6 +128,7 @@ def root(
     audit_log: Annotated[str, typer.Option(help="Audit jsonl path for command execution records.")] = ".data/lsre-audit.jsonl",
     lock_file: Annotated[str, typer.Option(help="Tool pack lock file path.")] = ".data/lsre-tool-lock.json",
     session_file: Annotated[str, typer.Option(help="Session memory file path.")] = ".data/lsre-session.json",
+    incident_file: Annotated[str, typer.Option(help="Incident lifecycle store path.")] = str((Path(settings.data_dir) / "lsre-incident.json").expanduser()),
     deny_tool: Annotated[list[str], typer.Option("--deny-tool", help="Block specific tools by name, can be repeated.")] = [],
     deny_prefix: Annotated[list[str], typer.Option("--deny-prefix", help="Block tools by prefix, can be repeated.")] = [],
     tool_pack: Annotated[list[str], typer.Option("--tool-pack", help="Tool pack spec. e.g. builtin or module:pkg.mod[:factory].")] = ["builtin"],
@@ -147,6 +150,7 @@ def root(
         "audit_log": audit_log,
         "lock_file": lock_file,
         "session_file": session_file,
+        "incident_file": incident_file,
         "deny_tool": list(deny_tool),
         "deny_prefix": list(deny_prefix),
         "tool_pack": list(tool_pack),
@@ -1385,6 +1389,8 @@ def _merged_options(
         base["lock_file"] = ".data/lsre-tool-lock.json"
     if "session_file" not in base:
         base["session_file"] = ".data/lsre-session.json"
+    if "incident_file" not in base:
+        base["incident_file"] = str((Path(settings.data_dir) / "lsre-incident.json").expanduser())
     if "deny_tool" not in base:
         base["deny_tool"] = []
     if "deny_prefix" not in base:
@@ -1421,7 +1427,8 @@ def _run_once(
     model: str,
     provider: str,
     max_steps: int,
-) -> None:
+    runtime_options: dict[str, object] | None = None,
+) -> DispatchResult:
     context_window = ContextWindowManager()
     session = SessionStore(Path(session_file))
     session_hint = session.build_context_hint(instruction)
@@ -1511,6 +1518,11 @@ def _run_once(
             _render_compact_result(result, title="LazySRE")
     else:
         typer.echo(result.final_text)
+    if runtime_options is not None:
+        note = _maybe_apply_runtime_provider_fallback(runtime_options, result)
+        if note:
+            typer.echo(note)
+    return result
 
 
 def _run_fix(
@@ -1538,7 +1550,8 @@ def _run_fix(
     model: str,
     provider: str,
     max_steps: int,
-) -> None:
+    runtime_options: dict[str, object] | None = None,
+) -> DispatchResult:
     context_window = ContextWindowManager()
     session = SessionStore(Path(session_file))
     session_hint = session.build_context_hint(instruction)
@@ -1646,10 +1659,18 @@ def _run_fix(
 
     if not apply:
         typer.echo("计划已生成。若需分步执行，请加 --apply。")
-        return
+        if runtime_options is not None:
+            note = _maybe_apply_runtime_provider_fallback(runtime_options, result)
+            if note:
+                typer.echo(note)
+        return result
     if not plan.apply_commands:
         typer.echo("未从计划中识别到可执行命令，已跳过执行。")
-        return
+        if runtime_options is not None:
+            note = _maybe_apply_runtime_provider_fallback(runtime_options, result)
+            if note:
+                typer.echo(note)
+        return result
 
     exec_summary = _execute_fix_plan_steps(
         plan=plan,
@@ -1688,6 +1709,11 @@ def _run_fix(
         typer.echo("\n可回滚命令：")
         for cmd in plan.rollback_commands:
             typer.echo(f"- {cmd}")
+    if runtime_options is not None:
+        note = _maybe_apply_runtime_provider_fallback(runtime_options, result)
+        if note:
+            typer.echo(note)
+    return result
 
 
 async def _dispatch(
@@ -1718,33 +1744,59 @@ async def _dispatch(
         raise typer.BadParameter("approval_mode must be one of strict/balanced/permissive")
     _, resolved_model, llm = _build_cli_llm(provider=mode, model=model)
 
-    dispatcher = Dispatcher(
-        llm=llm,
-        registry=build_default_registry(
-            permission_context=ToolPermissionContext.from_iterables(
-                deny_names=deny_tool,
-                deny_prefixes=deny_prefix,
+    def _new_dispatcher(*, selected_llm, selected_model: str) -> Dispatcher:
+        return Dispatcher(
+            llm=selected_llm,
+            registry=build_default_registry(
+                permission_context=ToolPermissionContext.from_iterables(
+                    deny_names=deny_tool,
+                    deny_prefixes=deny_prefix,
+                ),
+                tool_packs=tool_pack,
+                remote_gateways=remote_gateway,
+                lock_file=Path(lock_file),
             ),
-            tool_packs=tool_pack,
-            remote_gateways=remote_gateway,
-            lock_file=Path(lock_file),
-        ),
-        executor=SafeExecutor(
-            dry_run=(not execute),
-            approval_mode=ap_mode,
-            approval_granted=approve,
-            approval_callback=_build_approval_callback(enabled=interactive_approval and execute),
-            audit_logger=AuditLogger(Path(audit_log)),
-        ),
-        model=resolved_model,
-        max_steps=max(1, min(max_steps, 12)),
-        text_stream=text_stream,
-        system_prompt=_build_system_prompt(
-            conversation_context=conversation_context,
-            memory_context=memory_context,
-        ),
-    )
-    return await dispatcher.run(instruction)
+            executor=SafeExecutor(
+                dry_run=(not execute),
+                approval_mode=ap_mode,
+                approval_granted=approve,
+                approval_callback=_build_approval_callback(enabled=interactive_approval and execute),
+                audit_logger=AuditLogger(Path(audit_log)),
+            ),
+            model=selected_model,
+            max_steps=max(1, min(max_steps, 12)),
+            text_stream=text_stream,
+            system_prompt=_build_system_prompt(
+                conversation_context=conversation_context,
+                memory_context=memory_context,
+            ),
+        )
+
+    try:
+        return await _new_dispatcher(selected_llm=llm, selected_model=resolved_model).run(instruction)
+    except Exception as exc:
+        if not _should_auto_fallback_to_mock(provider_mode=mode, error=exc):
+            raise
+        reason = _normalize_runtime_exception_message(exc)
+        try:
+            _, fallback_model, fallback_llm = _build_cli_llm(provider="mock", model=model)
+            fallback_result = await _new_dispatcher(selected_llm=fallback_llm, selected_model=fallback_model).run(instruction)
+        except Exception:
+            raise exc
+        fallback_note = (
+            f"Provider `{mode}` 调用失败，已自动降级到 mock（仅建议/低风险模式）。"
+            f" 原因: {reason[:220]}"
+        )
+        fallback_result.events.insert(
+            0,
+            DispatchEvent(
+                kind="system",
+                message="provider_fallback",
+                data={"from": mode, "to": "mock", "reason": reason[:220]},
+            ),
+        )
+        fallback_result.final_text = f"[auto-fallback]\n{fallback_note}\n\n{fallback_result.final_text}"
+        return fallback_result
 
 
 def _build_approval_callback(*, enabled: bool):
@@ -1971,7 +2023,7 @@ def target_profile_import(
     try:
         result = store.import_payload(raw, merge=merge)
     except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise typer.BadParameter(_safe_exception_text(exc)) from exc
 
     activated = ""
     activate_value = activate.strip()
@@ -2103,6 +2155,325 @@ def memory_search(
     _render_memory_cases(rows, title=f"Incident Memory Search: {query}")
 
 
+@incident_app.command("open")
+def incident_open(
+    ctx: typer.Context,
+    title: Annotated[str, typer.Argument(help="Incident title.")],
+    severity: Annotated[str, typer.Option("--severity", help="Incident severity: low|medium|high|critical.")] = "high",
+    assignee: Annotated[str, typer.Option("--assignee", help="Incident owner/assignee.")] = "-",
+    summary: Annotated[str, typer.Option("--summary", help="Incident summary.")] = "",
+    source: Annotated[str, typer.Option("--source", help="Incident source label.")] = "manual",
+    tag: Annotated[list[str], typer.Option("--tag", help="Incident tags, can repeat.")] = [],
+    incident_file: Annotated[str | None, typer.Option("--incident-file", help="Override incident store path.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = IncidentStore(_resolve_incident_file(ctx, incident_file))
+    try:
+        rec = store.open_incident(
+            title=title,
+            severity=severity,
+            assignee=assignee,
+            summary=summary,
+            source=source,
+            tags=list(tag),
+        )
+    except RuntimeError as exc:
+        raise typer.BadParameter(_safe_exception_text(exc)) from None
+    if as_json or (not _console):
+        typer.echo(json.dumps(rec.to_dict(), ensure_ascii=False, indent=2))
+        return
+    typer.echo(_render_incident_status_text(rec))
+
+
+@incident_app.command("status")
+def incident_status(
+    ctx: typer.Context,
+    incident_file: Annotated[str | None, typer.Option("--incident-file", help="Override incident store path.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = IncidentStore(_resolve_incident_file(ctx, incident_file))
+    rec = store.active()
+    if as_json or (not _console):
+        typer.echo(json.dumps(rec.to_dict() if rec else {"active": None}, ensure_ascii=False, indent=2))
+        return
+    typer.echo(_render_incident_status_text(rec))
+
+
+@incident_app.command("list")
+def incident_list(
+    ctx: typer.Context,
+    limit: Annotated[int, typer.Option("--limit", help="Number of incidents to display.")] = 10,
+    incident_file: Annotated[str | None, typer.Option("--incident-file", help="Override incident store path.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = IncidentStore(_resolve_incident_file(ctx, incident_file))
+    rows = store.list_recent(limit=max(1, limit))
+    if as_json or (not _console):
+        typer.echo(json.dumps([item.to_dict() for item in rows], ensure_ascii=False, indent=2))
+        return
+    if not rows:
+        typer.echo("Incident list\n- no incidents yet.")
+        return
+    lines = ["Incident list"]
+    for item in rows:
+        lines.append(
+            f"- {item.id} [{item.status}/{item.severity}] assignee={item.assignee} title={item.title}"
+        )
+    typer.echo("\n".join(lines))
+
+
+@incident_app.command("note")
+def incident_note(
+    ctx: typer.Context,
+    text: Annotated[str, typer.Argument(help="Incident note text.")],
+    author: Annotated[str, typer.Option("--author", help="Note author label.")] = "user",
+    incident_file: Annotated[str | None, typer.Option("--incident-file", help="Override incident store path.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = IncidentStore(_resolve_incident_file(ctx, incident_file))
+    try:
+        rec = store.add_note(text, author=author)
+    except RuntimeError as exc:
+        raise typer.BadParameter(_safe_exception_text(exc)) from None
+    if as_json or (not _console):
+        typer.echo(json.dumps(rec.to_dict(), ensure_ascii=False, indent=2))
+        return
+    typer.echo(_render_incident_status_text(rec))
+
+
+@incident_app.command("assign")
+def incident_assign(
+    ctx: typer.Context,
+    assignee: Annotated[str, typer.Argument(help="Assignee name.")],
+    incident_file: Annotated[str | None, typer.Option("--incident-file", help="Override incident store path.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = IncidentStore(_resolve_incident_file(ctx, incident_file))
+    try:
+        rec = store.set_assignee(assignee)
+    except RuntimeError as exc:
+        raise typer.BadParameter(_safe_exception_text(exc)) from None
+    if as_json or (not _console):
+        typer.echo(json.dumps(rec.to_dict(), ensure_ascii=False, indent=2))
+        return
+    typer.echo(_render_incident_status_text(rec))
+
+
+@incident_app.command("severity")
+def incident_severity(
+    ctx: typer.Context,
+    level: Annotated[str, typer.Argument(help="Severity: low|medium|high|critical.")],
+    incident_file: Annotated[str | None, typer.Option("--incident-file", help="Override incident store path.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = IncidentStore(_resolve_incident_file(ctx, incident_file))
+    try:
+        rec = store.set_severity(level)
+    except RuntimeError as exc:
+        raise typer.BadParameter(_safe_exception_text(exc)) from None
+    if as_json or (not _console):
+        typer.echo(json.dumps(rec.to_dict(), ensure_ascii=False, indent=2))
+        return
+    typer.echo(_render_incident_status_text(rec))
+
+
+@incident_app.command("timeline")
+def incident_timeline(
+    ctx: typer.Context,
+    limit: Annotated[int, typer.Option("--limit", help="Number of timeline events to show.")] = 12,
+    incident_file: Annotated[str | None, typer.Option("--incident-file", help="Override incident store path.")] = None,
+) -> None:
+    store = IncidentStore(_resolve_incident_file(ctx, incident_file))
+    rec = store.active()
+    if not rec:
+        typer.echo("Incident Timeline\n- no active incident.")
+        return
+    typer.echo(_render_incident_timeline_text(rec, limit=max(1, limit)))
+
+
+@incident_app.command("close")
+def incident_close(
+    ctx: typer.Context,
+    resolution: Annotated[str, typer.Option("--resolution", help="Resolution summary when closing incident.")] = "",
+    incident_file: Annotated[str | None, typer.Option("--incident-file", help="Override incident store path.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = IncidentStore(_resolve_incident_file(ctx, incident_file))
+    try:
+        rec = store.close_incident(resolution=resolution)
+    except RuntimeError as exc:
+        raise typer.BadParameter(_safe_exception_text(exc)) from None
+    if as_json or (not _console):
+        typer.echo(json.dumps(rec.to_dict(), ensure_ascii=False, indent=2))
+        return
+    typer.echo(_render_incident_status_text(rec))
+
+
+@incident_app.command("export")
+def incident_export(
+    ctx: typer.Context,
+    output: Annotated[str, typer.Option("--output", help="Output markdown path.")] = "",
+    incident_file: Annotated[str | None, typer.Option("--incident-file", help="Override incident store path.")] = None,
+) -> None:
+    store = IncidentStore(_resolve_incident_file(ctx, incident_file))
+    rec = store.active()
+    if not rec:
+        rows = store.list_recent(limit=1)
+        rec = rows[0] if rows else None
+    if not rec:
+        typer.echo("No incident found to export.")
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out_path = Path(output.strip() or str(Path(settings.data_dir) / f"{rec.id.lower()}-{stamp}.md"))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(render_incident_markdown(rec), encoding="utf-8")
+    typer.echo(f"Incident exported: {out_path}")
+
+
+def _resolve_incident_file(ctx: typer.Context, incident_file: str | None) -> Path:
+    if incident_file and incident_file.strip():
+        return Path(incident_file).expanduser()
+    obj = dict(ctx.obj or {})
+    candidate = str(obj.get("incident_file", "")).strip()
+    if candidate:
+        return Path(candidate).expanduser()
+    return _default_incident_file_path()
+
+
+def _default_incident_file_path() -> Path:
+    return (Path(settings.data_dir) / "lsre-incident.json").expanduser()
+
+
+def _resolve_incident_inline_path(options: dict[str, object]) -> Path:
+    candidate = str(options.get("incident_file", "")).strip()
+    if candidate:
+        return Path(candidate).expanduser()
+    return _default_incident_file_path()
+
+
+def _render_incident_status_text(rec: IncidentRecord | None) -> str:
+    if rec is None:
+        return "Incident\n- no active incident.\n- use: /incident open <title>"
+    lines = [
+        "Incident",
+        f"- id: {rec.id}",
+        f"- title: {rec.title}",
+        f"- status: {rec.status}",
+        f"- severity: {rec.severity}",
+        f"- assignee: {rec.assignee}",
+        f"- updated: {rec.updated_at_utc}",
+    ]
+    if rec.summary:
+        lines.append(f"- summary: {rec.summary[:180]}")
+    if rec.resolution:
+        lines.append(f"- resolution: {rec.resolution[:180]}")
+    lines.append("- commands: /incident note <text> | /incident assign <name> | /incident close")
+    return "\n".join(lines)
+
+
+def _render_incident_timeline_text(rec: IncidentRecord, *, limit: int = 12) -> str:
+    lines = [f"Incident Timeline ({rec.id})"]
+    if not rec.timeline:
+        lines.append("- (empty)")
+        return "\n".join(lines)
+    for item in rec.timeline[-max(1, limit):]:
+        lines.append(
+            f"- {item.get('at_utc', '-')}: {item.get('kind', '-')}: {item.get('message', '')}"
+        )
+    return "\n".join(lines)
+
+
+def _handle_incident_inline_command(text: str, *, path: Path | None = None) -> str:
+    raw = str(text or "").strip()
+    if not raw.lower().startswith("/incident"):
+        return ""
+    store = IncidentStore(path or _default_incident_file_path())
+    tail = raw[len("/incident") :].strip()
+    if not tail or tail in {"show", "status"}:
+        return _render_incident_status_text(store.active())
+    if tail.startswith("open "):
+        title = tail[len("open ") :].strip()
+        if not title:
+            return "用法：/incident open <title>"
+        try:
+            rec = store.open_incident(title=title, severity="high", source="chat")
+        except RuntimeError as exc:
+            return f"incident open failed: {_safe_exception_text(exc)}"
+        return _render_incident_status_text(rec)
+    if tail.startswith("note "):
+        note = tail[len("note ") :].strip()
+        if not note:
+            return "用法：/incident note <text>"
+        try:
+            rec = store.add_note(note, author="chat")
+        except RuntimeError as exc:
+            return f"incident note failed: {_safe_exception_text(exc)}"
+        return _render_incident_status_text(rec)
+    if tail.startswith("assign "):
+        assignee = tail[len("assign ") :].strip()
+        if not assignee:
+            return "用法：/incident assign <name>"
+        try:
+            rec = store.set_assignee(assignee)
+        except RuntimeError as exc:
+            return f"incident assign failed: {_safe_exception_text(exc)}"
+        return _render_incident_status_text(rec)
+    if tail.startswith("severity "):
+        level = tail[len("severity ") :].strip()
+        if not level:
+            return "用法：/incident severity <low|medium|high|critical>"
+        try:
+            rec = store.set_severity(level)
+        except RuntimeError as exc:
+            return f"incident severity failed: {_safe_exception_text(exc)}"
+        return _render_incident_status_text(rec)
+    if tail in {"timeline", "trace"}:
+        rec = store.active()
+        if not rec:
+            return "Incident Timeline\n- no active incident."
+        return _render_incident_timeline_text(rec, limit=12)
+    if tail.startswith("close"):
+        resolution = tail[len("close") :].strip()
+        try:
+            rec = store.close_incident(resolution=resolution)
+        except RuntimeError as exc:
+            return f"incident close failed: {_safe_exception_text(exc)}"
+        return _render_incident_status_text(rec)
+    if tail.startswith("list"):
+        rows = store.list_recent(limit=8)
+        if not rows:
+            return "Incident list\n- no incidents yet."
+        lines = ["Incident list"]
+        for item in rows:
+            lines.append(f"- {item.id} [{item.status}/{item.severity}] {item.title}")
+        return "\n".join(lines)
+    if tail.startswith("export"):
+        rec = store.active()
+        if not rec:
+            rows = store.list_recent(limit=1)
+            rec = rows[0] if rows else None
+        if not rec:
+            return "No incident found to export."
+        arg = tail[len("export") :].strip()
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        out_path = Path(arg or f".data/{rec.id.lower()}-{stamp}.md")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(render_incident_markdown(rec), encoding="utf-8")
+        return f"Incident exported: {out_path}"
+    return (
+        "Incident command usage:\n"
+        "- /incident status\n"
+        "- /incident open <title>\n"
+        "- /incident note <text>\n"
+        "- /incident assign <name>\n"
+        "- /incident severity <level>\n"
+        "- /incident timeline\n"
+        "- /incident close [resolution]\n"
+        "- /incident list\n"
+        "- /incident export [output.md]"
+    )
+
+
 @runbook_app.command("list")
 def runbook_list(
     runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
@@ -2163,7 +2534,7 @@ def runbook_add(
     try:
         default_vars = parse_runbook_vars(var)
     except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise typer.BadParameter(_safe_exception_text(exc)) from exc
     template = RunbookTemplate(
         name=name.strip().lower(),
         title=title.strip(),
@@ -2176,7 +2547,7 @@ def runbook_add(
     try:
         store.upsert(template)
     except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise typer.BadParameter(_safe_exception_text(exc)) from exc
     typer.echo(f"Saved runbook: {template.name} ({template.mode})")
 
 
@@ -2211,7 +2582,7 @@ def runbook_export(
     try:
         payload = store.export_payload(names=list(name), scope=scope)
     except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise typer.BadParameter(_safe_exception_text(exc)) from exc
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     out_path = Path(output.strip() or f".data/lsre-runbooks-export-{stamp}.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2239,7 +2610,7 @@ def runbook_import(
     try:
         result = store.import_payload(raw, merge=merge)
     except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise typer.BadParameter(_safe_exception_text(exc)) from exc
     typer.echo(
         "Imported runbooks: "
         f"imported={result.get('imported', 0)} "
@@ -2308,7 +2679,7 @@ def runbook_run(
             profile_file=Path(settings.target_profile_file),
         )
     except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise typer.BadParameter(_safe_exception_text(exc)) from exc
     _execute_runbook(
         template=template,
         instruction=instruction,
@@ -2342,7 +2713,7 @@ def runbook_render(
             profile_file=Path(settings.target_profile_file),
         )
     except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise typer.BadParameter(_safe_exception_text(exc)) from exc
     rendered = template.instruction.format(**resolved)
     if extra.strip():
         rendered = f"{rendered}\n\n[runbook-extra]\n{extra.strip()}"
@@ -2576,7 +2947,7 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
     try:
         tokens = shlex.split(text)
     except ValueError as exc:
-        raise ValueError(f"invalid quoting: {exc}") from exc
+        raise ValueError(f"invalid quoting: {_safe_exception_text(exc)}") from exc
     if not tokens:
         return {"action": "list", "custom_only": False, "runbook_file": settings.runbook_store_file}
 
@@ -2815,7 +3186,7 @@ def _parse_chat_report_command(tail: str) -> dict[str, object]:
         try:
             tokens = shlex.split(text)
         except ValueError as exc:
-            raise ValueError(f"invalid quoting: {exc}") from exc
+            raise ValueError(f"invalid quoting: {_safe_exception_text(exc)}") from exc
 
     result: dict[str, object] = {
         "fmt": "markdown",
@@ -3023,6 +3394,7 @@ target_app.add_typer(target_profile_app, name="profile")
 app.add_typer(target_app, name="target")
 app.add_typer(history_app, name="history")
 app.add_typer(memory_app, name="memory")
+app.add_typer(incident_app, name="incident")
 app.add_typer(runbook_app, name="runbook")
 app.add_typer(template_app, name="template")
 
@@ -6263,7 +6635,7 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
     try:
         tokens = shlex.split(command_text)
     except ValueError as exc:
-        typer.echo(f"无法解析行动命令: {exc}")
+        typer.echo(f"无法解析行动命令: {_safe_exception_text(exc)}")
         return False
     if not tokens:
         typer.echo("行动命令为空。")
@@ -6281,7 +6653,7 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
         try:
             parsed = _parse_chat_template_command(shlex.join(tokens[1:]))
         except ValueError as exc:
-            typer.echo(f"template action parse failed: {exc}")
+            typer.echo(f"template action parse failed: {_safe_exception_text(exc)}")
             return False
         action = str(parsed.get("action", "list"))
         if action == "list":
@@ -6881,10 +7253,94 @@ def _extract_watch_suggested_commands(snapshots: list[dict[str, object]]) -> lis
 
 
 def _safe_int(value: str) -> int:
-    try:
-        return int(str(value).strip())
-    except Exception:
+    raw = str(value or "").strip()
+    if not raw:
         return 0
+    try:
+        return int(raw)
+    except Exception:
+        pass
+    normalized = re.sub(r"\s+", "", raw).lower()
+    prefixes = ("第", "#", "no.", "no")
+    suffixes = (
+        "个建议",
+        "个动作",
+        "个行动",
+        "个推荐",
+        "建议",
+        "动作",
+        "行动",
+        "推荐",
+        "步",
+        "条",
+        "项",
+        "次",
+        "个",
+        "号",
+    )
+    for prefix in prefixes:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    changed = True
+    while changed and normalized:
+        changed = False
+        for suffix in suffixes:
+            if normalized.endswith(suffix):
+                normalized = normalized[: -len(suffix)]
+                changed = True
+                break
+    if not normalized:
+        return 0
+    if re.fullmatch(r"[0-9]+", normalized):
+        try:
+            return int(normalized)
+        except Exception:
+            return 0
+    circled_map: dict[str, int] = {}
+    for idx, ch in enumerate("①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳", 1):
+        circled_map[ch] = idx
+    for idx, ch in enumerate("❶❷❸❹❺❻❼❽❾❿", 1):
+        circled_map[ch] = idx
+    if normalized in circled_map:
+        return circled_map[normalized]
+    zh_digit = {
+        "零": 0,
+        "〇": 0,
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    if normalized == "十":
+        return 10
+    if "十" in normalized:
+        parts = normalized.split("十")
+        if len(parts) != 2:
+            return 0
+        left, right = parts
+        if left == "":
+            tens = 1
+        elif left in zh_digit:
+            tens = zh_digit[left]
+        else:
+            return 0
+        if right == "":
+            ones = 0
+        elif right in zh_digit:
+            ones = zh_digit[right]
+        else:
+            return 0
+        return tens * 10 + ones
+    if normalized in zh_digit:
+        return zh_digit[normalized]
+    return 0
 
 
 def _default_memory_db_path() -> Path:
@@ -7616,6 +8072,46 @@ def _render_quick_actions_text(options: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _render_tui_history_text(options: dict[str, object], *, query: str = "") -> str:
+    snapshot = _build_tui_dashboard_snapshot(options)
+    rows = _collect_snapshot_recent_commands(snapshot, limit=12)
+    return _render_history_text(rows, query=query)
+
+
+def _render_history_text(rows: list[str], *, query: str = "") -> str:
+    clean_rows = [str(item).strip() for item in rows if str(item).strip()]
+    if not clean_rows:
+        return "History\n- 暂无历史输入。先输入一句话或执行 /scan。"
+    needle = str(query or "").strip().lower()
+    if needle:
+        filtered = [item for item in clean_rows if needle in item.lower()]
+        if not filtered:
+            return f"History Search: {query}\n- 没有匹配结果。可先输入 /history 查看全部历史。"
+        lines = [f"History Search: {query} (latest first)"]
+        for idx, command in enumerate(reversed(filtered), 1):
+            lines.append(f"- {idx}. {command}")
+        lines.extend(["", "Usage", "- /history", f"- /history {query}", "- /history 1", "- /retry"])
+        return "\n".join(lines)
+    lines = ["History (latest first)"]
+    for idx, command in enumerate(reversed(clean_rows), 1):
+        lines.append(f"- {idx}. {command}")
+    lines.extend(["", "Usage", "- /history", "- /history <keyword>", "- /history 1", "- /retry"])
+    return "\n".join(lines)
+
+
+def _collect_snapshot_recent_commands(snapshot: dict[str, object], *, limit: int = 12) -> list[str]:
+    cap = max(1, min(int(limit), 100))
+    recent_commands_full = snapshot.get("recent_commands_full", [])
+    if not isinstance(recent_commands_full, list):
+        recent_commands_full = []
+    recent_commands = snapshot.get("recent_commands", [])
+    if not isinstance(recent_commands, list):
+        recent_commands = []
+    source = recent_commands_full or recent_commands
+    rows = [str(item).strip() for item in source if str(item).strip()]
+    return rows[-cap:]
+
+
 def _render_quick_action_result(
     *,
     action_id: int,
@@ -7916,7 +8412,7 @@ def _collect_install_doctor_report() -> dict[str, object]:
                 "name": "runtime.lazysre_import",
                 "ok": False,
                 "severity": "error",
-                "detail": str(exc)[:220],
+                "detail": _safe_exception_text(exc)[:220],
                 "hint": "执行 python -m pip install lazysre 或重新安装项目",
             }
         )
@@ -7990,6 +8486,9 @@ def _collect_install_doctor_report() -> dict[str, object]:
             }
         )
 
+    checks.extend(_collect_proxy_runtime_checks())
+    checks.extend(_collect_workspace_secret_checks())
+
     summary = _summarize_doctor_checks(checks)
     return {
         "checks": checks,
@@ -8007,13 +8506,207 @@ def _safe_run_command(command: list[str], *, timeout_sec: int) -> dict[str, obje
             check=False,
         )
     except Exception as exc:
-        return {"ok": False, "stdout": "", "stderr": str(exc), "exit_code": -1}
+        return {"ok": False, "stdout": "", "stderr": _safe_exception_text(exc), "exit_code": -1}
     return {
         "ok": completed.returncode == 0,
         "stdout": (completed.stdout or "").strip(),
         "stderr": (completed.stderr or "").strip(),
         "exit_code": int(completed.returncode),
     }
+
+
+def _collect_proxy_runtime_checks() -> list[dict[str, object]]:
+    checks: list[dict[str, object]] = []
+    proxy_values = _read_proxy_env_values()
+    if not proxy_values:
+        checks.append(
+            {
+                "name": "runtime.proxy_env",
+                "ok": True,
+                "severity": "pass",
+                "detail": "(unset)",
+                "hint": "",
+            }
+        )
+        return checks
+
+    merged = ", ".join(f"{name}={_sanitize_tui_secret_tokens(value)}" for name, value in proxy_values.items())
+    checks.append(
+        {
+            "name": "runtime.proxy_env",
+            "ok": True,
+            "severity": "pass",
+            "detail": merged[:240],
+            "hint": "",
+        }
+    )
+
+    has_socks_proxy = any(_looks_like_socks_proxy(value) for value in proxy_values.values())
+    socksio_ok = _is_socksio_available()
+    if has_socks_proxy:
+        checks.append(
+            {
+                "name": "runtime.proxy_socksio",
+                "ok": socksio_ok,
+                "severity": "pass" if socksio_ok else "error",
+                "detail": "socksio installed" if socksio_ok else "socksio missing",
+                "hint": "" if socksio_ok else "检测到 SOCKS 代理，请执行 python3 -m pip install \"httpx[socks]\"",
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "runtime.proxy_socksio",
+                "ok": True,
+                "severity": "pass",
+                "detail": "not required (no socks proxy)",
+                "hint": "",
+            }
+        )
+    return checks
+
+
+def _collect_workspace_secret_checks(*, root: Path | None = None, max_findings: int = 8) -> list[dict[str, object]]:
+    workspace = (root or Path.cwd()).resolve()
+    findings = _scan_workspace_for_secrets(workspace=workspace, limit=max_findings)
+    if not findings:
+        return [
+            {
+                "name": "runtime.workspace_secret_scan",
+                "ok": True,
+                "severity": "pass",
+                "detail": "no suspicious secrets found",
+                "hint": "",
+            }
+        ]
+    preview = "; ".join(f"{item['file']}:{item['line']}" for item in findings[:3])
+    return [
+        {
+            "name": "runtime.workspace_secret_scan",
+            "ok": False,
+            "severity": "error",
+            "detail": f"detected {len(findings)} suspicious token(s): {preview}",
+            "hint": "发现疑似密钥，请立即轮换并清理 Git 历史后再发布。",
+            "findings": findings,
+        }
+    ]
+
+
+def _scan_workspace_for_secrets(*, workspace: Path, limit: int = 8) -> list[dict[str, object]]:
+    root = Path(workspace).resolve()
+    if (not root.exists()) or (not root.is_dir()):
+        return []
+    ignore_dirs = {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".data",
+        "dist",
+        "build",
+    }
+    patterns = {
+        "google_api_key": re.compile(r"AIza[0-9A-Za-z_-]{20,}"),
+        "openai_api_key": re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b"),
+        "anthropic_api_key": re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
+    }
+    false_positive_markers = (
+        "redacted",
+        "example",
+        "sample",
+        "dummy",
+        "placeholder",
+        "fake",
+        "test-",
+        "test_",
+        "demo-",
+        "-demo",
+        " demo",
+        "xxxx",
+        "***",
+    )
+    findings: list[dict[str, object]] = []
+    for path in root.rglob("*"):
+        if len(findings) >= max(1, int(limit)):
+            break
+        if path.is_dir():
+            if path.name in ignore_dirs:
+                # prune by skipping known heavy dirs quickly
+                continue
+            continue
+        if any(part in ignore_dirs for part in path.parts):
+            continue
+        try:
+            if path.stat().st_size > 1024 * 1024:
+                continue
+        except Exception:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not text.strip():
+            continue
+        rel = str(path.relative_to(root))
+        for line_no, raw_line in enumerate(text.splitlines(), start=1):
+            if len(findings) >= max(1, int(limit)):
+                break
+            line = str(raw_line or "")
+            if not line.strip():
+                continue
+            lowered = line.lower()
+            if any(marker in lowered for marker in false_positive_markers):
+                continue
+            matched_type = ""
+            matched_value = ""
+            for token_type, pattern in patterns.items():
+                found = pattern.search(line)
+                if found:
+                    matched_type = token_type
+                    matched_value = found.group(0)
+                    break
+            if not matched_type:
+                continue
+            findings.append(
+                {
+                    "type": matched_type,
+                    "file": rel,
+                    "line": line_no,
+                    "token": _sanitize_tui_secret_tokens(matched_value),
+                }
+            )
+    return findings
+
+
+def _read_proxy_env_values() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for upper, lower in (
+        ("ALL_PROXY", "all_proxy"),
+        ("HTTPS_PROXY", "https_proxy"),
+        ("HTTP_PROXY", "http_proxy"),
+    ):
+        raw = str(os.getenv(upper, "") or os.getenv(lower, "")).strip()
+        if raw:
+            values[upper] = raw
+    return values
+
+
+def _looks_like_socks_proxy(value: str) -> bool:
+    raw = str(value or "").strip().lower()
+    return raw.startswith("socks://") or raw.startswith("socks5://") or raw.startswith("socks4://")
+
+
+def _is_socksio_available() -> bool:
+    try:
+        import socksio  # noqa: F401
+
+        return True
+    except Exception:
+        return False
 
 
 def _run_first_run_setup(
@@ -8474,6 +9167,57 @@ def _chat_state_file() -> Path:
     return Path(settings.data_dir) / "lsre-chat-state.json"
 
 
+def _tui_state_file() -> Path:
+    return Path(settings.data_dir) / "lsre-tui-state.json"
+
+
+def _load_tui_runtime_state() -> dict[str, str]:
+    path = _tui_state_file()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    panel = _normalize_tui_panel_name(str(payload.get("panel", "")).strip())
+    ui_mode = _normalize_tui_ui_mode(str(payload.get("ui_mode", "")).strip())
+    result: dict[str, str] = {}
+    if panel:
+        result["panel"] = panel
+    if ui_mode:
+        result["ui_mode"] = ui_mode
+    return result
+
+
+def _save_tui_runtime_state(*, panel: str, ui_mode: str) -> None:
+    path = _tui_state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "panel": _normalize_tui_panel_name(panel),
+        "ui_mode": _normalize_tui_ui_mode(ui_mode),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _persist_tui_runtime_state(options: dict[str, object]) -> None:
+    _save_tui_runtime_state(
+        panel=str(options.get("tui_panel", "overview")),
+        ui_mode=str(options.get("tui_ui_mode", "simple")),
+    )
+
+
+def _apply_saved_tui_runtime_state(options: dict[str, object]) -> None:
+    state = _load_tui_runtime_state()
+    panel = str(state.get("panel", "")).strip()
+    ui_mode = str(state.get("ui_mode", "")).strip()
+    if panel:
+        options["tui_panel"] = panel
+    if ui_mode:
+        options["tui_ui_mode"] = ui_mode
+
+
 def _load_chat_runtime_state(default_execute: bool) -> bool:
     path = _chat_state_file()
     if not path.exists():
@@ -8542,7 +9286,7 @@ def _maybe_auto_bootstrap_for_tui(options: dict[str, object]) -> dict[str, objec
         report = _collect_environment_discovery(timeout_sec=timeout_sec, secrets_file=None)
         _write_first_scan_marker(report)
     except Exception as exc:
-        return {"triggered": True, "written": False, "error": str(exc)[:180]}
+        return {"triggered": True, "written": False, "error": _safe_exception_text(exc)[:180]}
     return {"triggered": True, "written": True, "timeout_sec": timeout_sec}
 
 
@@ -9376,9 +10120,12 @@ def _append_command(items: list[str], seen: set[str], value: str, *, max_items: 
 
 def _looks_like_shell_command(text: str) -> bool:
     stripped = str(text or "").strip()
-    lowered = stripped.lower()
+    normalized = stripped
+    while normalized.lower().startswith("sudo "):
+        normalized = normalized[5:].lstrip()
+    lowered = normalized.lower()
     if (
-        re.search(r"[\u4e00-\u9fff]", stripped)
+        re.search(r"[\u4e00-\u9fff]", normalized)
         and not lowered.startswith(("lazysre ", "lsre ", "python -m lazysre"))
     ):
         return False
@@ -9450,8 +10197,11 @@ def _render_chat_short_help() -> None:
         "- /activity: 查看最近巡检、修复计划和审计轨迹，并给出建议下一步",
         "- /focus: 查看当前最值得关注的异常/阻塞与建议动作",
         "- /do [n]: 查看快捷建议；/do 1 直接执行第1条建议",
+        "- 数字快捷：直接输入 1/2/3...，若存在对应动作则等价于 /do n（无动作时 1-4 等价 /go n）",
         "- /timeline: 查看最近执行时间线（命令、状态、dry-run/exec）",
         "- /trace: 查看最近一次操作链路的摘要（成功/失败、dry-run/exec、top tools）",
+        "- /history [关键词|n]: 查看最近输入；/history 关键字 可筛选；/history 1 重放；/retry 直接重试上一条",
+        "- 口语快捷：直接输入 继续/重试/历史/帮助/扫描/简报，也会自动映射到对应命令",
         "- /panel [overview|activity|timeline|providers|next|1-4]: 切换 TUI 左侧面板",
         "- /brief [user@host]: 汇总本机 scan 和可选远程目标，直接给一份 AI 总览简报",
         "- /scan: 零配置自动扫描本机 Docker/Swarm/K8s/Prometheus（不需要 K8s token）",
@@ -9498,6 +10248,7 @@ def _render_chat_short_help() -> None:
         "- /runbook run <name> [--apply] [k=v]: 执行 runbook（fix 模板可直接 apply）",
         "- /runbook <name> [--apply] [k=v]: 执行 runbook（简写）",
         "- /report [--format json] [--no-doctor] [--push-to-git]: 导出复盘报告",
+        "- /incident status|open|note|assign|severity|timeline|close|list|export: 事故生命周期管理",
         "- /fix <问题>: 进入修复计划模式",
         "- /apply: 执行最近一次修复计划",
         "- /undo: 执行最近一次修复计划的回滚命令",
@@ -9508,7 +10259,7 @@ def _render_chat_short_help() -> None:
         "- 自然语言策略：先只跑只读步骤再执行写操作 / 解释第2步为什么执行",
         "- /memory: 查看最近故障记忆",
         "- /memory <query>: 检索相似历史案例",
-        "- TUI 里可用 Up/Down 浏览输入历史，Ctrl-L 或 /clear 清空屏幕，1-4/F2 切换面板",
+        "- TUI 里可用 Up/Down 浏览输入历史（支持前缀筛选），Ctrl-L 或 /clear 清空屏幕，1-4/F2 切换面板，F3 切换 UI",
         "- exit / quit: 退出",
     ]
     text = "\n".join(lines)
@@ -9535,12 +10286,13 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     if session_turns:
         tail = session_turns[-1]
         if isinstance(tail, dict):
-            last_user = str(tail.get("user", "")).strip()
-    recent_commands = [
-        str(turn.get("user", "")).strip()
-        for turn in session_turns[-3:]
+            last_user = _sanitize_tui_secret_tokens(str(tail.get("user", "")).strip())
+    recent_commands_full = [
+        _sanitize_tui_secret_tokens(str(turn.get("user", "")).strip())
+        for turn in session_turns[-12:]
         if isinstance(turn, dict) and str(turn.get("user", "")).strip()
     ]
+    recent_commands = recent_commands_full[-3:]
     provider_checks = _build_provider_setup_checks(secrets_file=None)
     configured_providers = [
         str(row.get("provider", name))
@@ -9642,7 +10394,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "ui_mode": _normalize_tui_ui_mode(str(options.get("tui_ui_mode", "simple"))),
         "mode": "execute" if bool(options.get("execute", False)) else "dry-run",
         "provider": str(options.get("provider", "auto")),
-        "model": str(options.get("model", settings.model_name)),
+        "model": str(provider_report.get("resolved_model", options.get("model", settings.model_name))),
         "status": str(briefing.get("status", "cold-start")),
         "headline": str(briefing.get("headline", "")).strip() or "输入 /scan 或 /brief，LazySRE 会先给你一份现场总览。",
         "environment_profile": str(briefing.get("profile_label", landscape.get("label", ""))).strip(),
@@ -9662,6 +10414,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "session_turns": len(session_turns),
         "last_user": last_user[:120],
         "recent_commands": recent_commands[-3:],
+        "recent_commands_full": recent_commands_full[-12:],
         "recent_activity": recent_activity,
         "recent_activity_commands": recent_activity_commands,
         "swarm_posture": recent_activity_context.get("swarm_posture", {}) if isinstance(recent_activity_context.get("swarm_posture", {}), dict) else {},
@@ -9688,6 +10441,8 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
             "/do 1",
             "/timeline",
             "/trace",
+            "/history",
+            "/retry",
             "/panel next",
             "/refresh",
             "/providers",
@@ -9754,6 +10509,8 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     action_bar = _build_tui_action_bar(snapshot)
     panel_hint = str(snapshot.get("panel_hint", "")).strip()
     state_card = _build_tui_state_card(snapshot)
+    coach = _build_tui_start_coach(snapshot)
+    boot_actions = _build_tui_boot_actions(snapshot)
     logo_lines = _build_tui_logo_lines()
     lines = [
         "╭─ ◉ LazySRE Fullscreen TUI ───────────────────────────────────────╮",
@@ -9767,6 +10524,11 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         f"│ focus={state_card.get('focus', '-')}",
         f"│ quick={state_card.get('quick', '-')}",
         f"│ next={state_card.get('next', '-')}",
+        "├─ Start Coach ───────────────────────────────────────────────────┤",
+        f"│ phase={coach.get('phase_label', '-')}",
+        f"│ headline={coach.get('headline', '-')}",
+        f"│ primary={coach.get('primary', '/next')}",
+        *[f"│ action: {item}" for item in boot_actions[:4]],
         "├─ Environment ───────────────────────────────────────────────────┤",
         f"│ profile={snapshot.get('environment_profile', '-') or '-'}",
         f"│ summary={snapshot.get('environment_summary', '-') or '-'}",
@@ -9844,7 +10606,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
         *[f"│ {item}" for item in shortcuts],
         "├─ Conversation ──────────────────────────────────────────────────┤",
         "│ 直接输入自然语言，例如：检查当前服务器 / 修复 swarm 副本不足",
-        "│ Tab 自动补全命令，Up/Down 浏览历史，Ctrl-L 清屏，F1/? 打开帮助。",
+        "│ Tab 自动补全命令，Up/Down 浏览历史（前缀筛选），Ctrl-L 清屏，F1/? 帮助，F3 切换 UI。",
         "╰─────────────────────────────────────────────────────────────────╯",
     ]
     return "\n".join(lines)
@@ -9852,6 +10614,7 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
 
 def _run_tui(options: dict[str, object], *, demo: bool) -> None:
     _maybe_auto_bootstrap_for_tui(options)
+    _apply_saved_tui_runtime_state(options)
     snapshot = _build_tui_dashboard_snapshot(options)
     term = str(os.getenv("TERM", "")).strip().lower()
     if term in {"dumb", "unknown", ""}:
@@ -9928,8 +10691,10 @@ def _execute_tui_turn(
     cursor_index: int = 0,
 ) -> None:
     safe_text = _sanitize_tui_secret_tokens(raw_text)
+    options["tui_last_input"] = safe_text
     if (not input_history) or (input_history[-1] != safe_text):
         input_history.append(safe_text)
+    _save_tui_input_history(input_history)
     history.append(("You", safe_text))
     phase = _infer_tui_phase_from_input(raw_text)
     output, elapsed_ms = _run_tui_request_with_progress(
@@ -9942,13 +10707,17 @@ def _execute_tui_turn(
         raw_text=raw_text,
         options=options,
     )
+    fallback_note = _maybe_apply_tui_provider_fallback(options, output)
     display_output = _format_tui_output_for_display(output)
     display_output = _render_tui_completion_card(
         display_output,
         request=safe_text,
         duration_ms=elapsed_ms,
+        ui_mode=_normalize_tui_ui_mode(str(options.get("tui_ui_mode", snapshot.get("ui_mode", "simple")))),
     )
     history.append(("LazySRE", display_output.strip() or "(no output)"))
+    if fallback_note:
+        history.append(("System", fallback_note))
     snapshot.update(_build_tui_dashboard_snapshot(options))
 
 
@@ -9970,7 +10739,10 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
     status = "ready"
     completion_index = -1
     completion_seed = ""
-    input_history: list[str] = []
+    input_history = _merge_tui_input_history(
+        _build_tui_bootstrap_input_history(snapshot),
+        _load_tui_input_history(),
+    )
     history_index = -1
     history_seed = ""
     overlay = ""
@@ -10004,6 +10776,19 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 escape_key = _read_tui_escape_key(stdscr)
                 if escape_key is not None:
                     key = escape_key
+            key = _normalize_tui_key_alias(key)
+            input_text, cursor_index, ctrl_handled = _apply_tui_ctrl_edit_key(
+                key=key,
+                input_text=input_text,
+                cursor_index=cursor_index,
+            )
+            if ctrl_handled:
+                overlay = ""
+                completion_index = -1
+                completion_seed = ""
+                history_index = -1
+                history_seed = ""
+                continue
             if (not input_text) and key == "?":
                 overlay = "" if overlay == "help" else "help"
                 status = "help" if overlay else "ready"
@@ -10017,6 +10802,25 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 input_text = ""
                 cursor_index = 0
                 if not raw_text:
+                    auto_cmd = _resolve_tui_empty_submit_command(snapshot=snapshot, history=history)
+                    if auto_cmd:
+                        _execute_tui_turn(
+                            stdscr,
+                            raw_text=auto_cmd,
+                            options=options,
+                            snapshot=snapshot,
+                            history=history,
+                            input_history=input_history,
+                            input_text=input_text,
+                            cursor_index=cursor_index,
+                        )
+                        status = "ready"
+                        overlay = ""
+                        completion_index = -1
+                        completion_seed = ""
+                        history_index = -1
+                        history_seed = ""
+                        cursor_index = 0
                     continue
                 if raw_text.lower() in {"exit", "quit", ":q", "/exit", "/quit"}:
                     break
@@ -10116,13 +10920,14 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
                 ui_mode = _normalize_tui_ui_mode(str(options.get("tui_ui_mode", "simple")))
                 if ui_mode == "expert":
                     options["tui_panel"] = _panel_name_from_shortcut(key)
+                    _persist_tui_runtime_state(options)
                     snapshot.update(_build_tui_dashboard_snapshot(options))
                     history.append(("LazySRE", f"左侧面板已切换到 {snapshot.get('sidebar_panel', 'overview')}。"))
                     status = f"panel:{snapshot.get('sidebar_panel', 'overview')}"
                     overlay = ""
                     continue
-            if (not input_text) and key in {"N", "T", "U"}:
-                quick_map = {"N": "/next", "T": "/trace", "U": "/undo"}
+            if (not input_text) and key in {"N", "T", "U", "R"}:
+                quick_map = {"N": "/next", "T": "/trace", "U": "/undo", "R": "/retry"}
                 quick_cmd = quick_map.get(key, "")
                 if quick_cmd:
                     _execute_tui_turn(
@@ -10191,9 +10996,17 @@ def _run_curses_tui(stdscr, options: dict[str, object], snapshot: dict[str, obje
             status = "help" if overlay else "ready"
         elif key == curses.KEY_F2:
             options["tui_panel"] = _next_tui_panel(str(options.get("tui_panel", snapshot.get("sidebar_panel", "overview"))))
+            _persist_tui_runtime_state(options)
             snapshot.update(_build_tui_dashboard_snapshot(options))
             history.append(("LazySRE", f"左侧面板已切换到 {snapshot.get('sidebar_panel', 'overview')}。"))
             status = f"panel:{snapshot.get('sidebar_panel', 'overview')}"
+            overlay = ""
+        elif key == curses.KEY_F3:
+            options["tui_ui_mode"] = _toggle_tui_ui_mode(str(options.get("tui_ui_mode", snapshot.get("ui_mode", "simple"))))
+            _persist_tui_runtime_state(options)
+            snapshot.update(_build_tui_dashboard_snapshot(options))
+            history.append(("LazySRE", f"UI 模式已切换到 {snapshot.get('ui_mode', 'simple')}。"))
+            status = f"ui:{snapshot.get('ui_mode', 'simple')}"
             overlay = ""
         elif key == curses.KEY_BACKSPACE:
             if cursor_index > 0:
@@ -10248,7 +11061,7 @@ def _draw_tui(
     active_provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
     mode = str(snapshot.get("mode", "-")).strip() or "-"
     title = (
-        f" {logo} | {status} | {mode}/{active_provider} | ui={ui_mode} | F1 help | Tab complete | Esc quit "
+        f" {logo} | {status} | {mode}/{active_provider} | ui={ui_mode} | F1 help | F2 panel | F3 ui | Tab complete | Esc quit "
     )
     _tui_addnstr(stdscr, 0, 0, title.ljust(width), width - 1)
     for y in range(1, height - 2):
@@ -10354,7 +11167,8 @@ def _build_tui_compact_sidebar_lines(snapshot: dict[str, object], *, width: int)
         "Start",
         "- 直接输入自然语言",
         *[f"- {item}" for item in boot_actions[:3]],
-        "- Shift+N/T/U 快速闭环",
+        "- Shift+N/T/U/R 快速闭环",
+        "- F3 切换 simple/expert",
         "",
         "Runtime",
         f"- provider: {provider}",
@@ -10390,6 +11204,7 @@ def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) 
         "- Shift+N = /next",
         "- Shift+T = /trace",
         "- Shift+U = /undo",
+        "- Shift+R = /retry",
         "",
         "Try",
         *[f"- {item}" for item in prompts],
@@ -10408,7 +11223,11 @@ def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) 
 
 def _build_tui_compact_action_bar(snapshot: dict[str, object]) -> str:
     next_hint = str(_build_tui_state_card(snapshot).get("next", "")).strip() or "/do 1"
-    return f"actions> Enter 发送 · ↑/↓ 历史 · Tab 补全 · Shift+N/T/U · /ui expert · {next_hint}"
+    return (
+        "actions> Enter(空)=下一步 · 数字=动作 · ↑/↓ 历史(前缀筛选) · Tab 补全 · "
+        "Shift+N/T/U/R · F3切UI · /history · /doctor · /secret-scan · /ui expert · "
+        f"{next_hint}"
+    )
 
 
 def _build_tui_compact_hint_line(snapshot: dict[str, object]) -> str:
@@ -10446,10 +11265,10 @@ def _build_tui_start_coach(snapshot: dict[str, object]) -> dict[str, object]:
         return {
             "phase": "connect_llm",
             "phase_label": "连接模型",
-            "headline": "先连上一个模型 Provider",
-            "primary": "/go 3",
-            "hint": "hint> 先选 provider。未配置 key 可先用 /provider mock 体验，再 /login 配真实 key。",
-            "steps": ["/go 3", "/providers"],
+            "headline": "先跑一键就绪，再连接模型",
+            "primary": "/go 1",
+            "hint": "hint> 先执行 /quickstart 自动补齐环境；完成后再 /providers 或 /provider gemini。",
+            "steps": ["/go 1", "/go 3", "/providers"],
         }
     if target_count == 0:
         return {
@@ -10491,13 +11310,31 @@ def _build_tui_start_coach(snapshot: dict[str, object]) -> dict[str, object]:
 def _pick_tui_next_command(snapshot: dict[str, object]) -> str:
     coach = _build_tui_start_coach(snapshot)
     primary = str(coach.get("primary", "")).strip()
+    resolved_primary = _resolve_tui_coach_primary_command(snapshot, primary)
+    if resolved_primary:
+        return resolved_primary
     candidates = [
+        resolved_primary,
         primary,
         str(_build_tui_state_card(snapshot).get("next", "")).strip(),
         "/do 1",
         "/scan",
     ]
-    tokens = ["/do 1", "/scan", "/brief", "/trace", "/timeline", "/drift", "/providers", "/activity", "/focus"]
+    tokens = [
+        "/do 1",
+        "/scan",
+        "/brief",
+        "/trace",
+        "/timeline",
+        "/drift",
+        "/providers",
+        "/provider mock",
+        "/provider gemini",
+        "/quickstart",
+        "/doctor strict",
+        "/activity",
+        "/focus",
+    ]
     for raw in candidates:
         if not raw:
             continue
@@ -10508,32 +11345,48 @@ def _pick_tui_next_command(snapshot: dict[str, object]) -> str:
     return "/do 1"
 
 
+def _resolve_tui_coach_primary_command(snapshot: dict[str, object], primary: str) -> str:
+    value = str(primary or "").strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    if lowered.startswith("/go "):
+        action_id = _safe_int(lowered[len("/go ") :].strip())
+        if action_id > 0:
+            return _resolve_tui_boot_action_command(snapshot, action_id)
+    if lowered in {"/provider mock", "/provider gemini", "/providers", "/quickstart", "/scan", "/brief", "/trace", "/timeline", "/doctor strict", "/do 1"}:
+        return lowered
+    return ""
+
+
 def _build_tui_boot_actions(snapshot: dict[str, object]) -> list[str]:
     coach = _build_tui_start_coach(snapshot)
     phase = str(coach.get("phase", "")).strip()
     provider_ready = bool(snapshot.get("provider_ready"))
     if (not provider_ready) or phase == "connect_llm":
         return [
-            "1) /provider mock（先可用）",
-            "2) /providers（看就绪状态）",
-            "3) /provider gemini（切到 Gemini）",
+            "1) /quickstart（一键补齐基础环境）",
+            "2) /provider mock（先可用）",
+            "3) /providers（看就绪状态）",
+            "4) /provider gemini（切到 Gemini）",
         ]
     return [
         "1) /scan（自动探测环境）",
         "2) /brief（生成总览简报）",
         "3) /next（执行建议动作）",
+        "4) /doctor strict（严格体检）",
     ]
 
 
 def _resolve_tui_boot_action_command(snapshot: dict[str, object], action_id: int) -> str:
-    if action_id not in {1, 2, 3}:
+    if action_id not in {1, 2, 3, 4}:
         return ""
     coach = _build_tui_start_coach(snapshot)
     phase = str(coach.get("phase", "")).strip()
     provider_ready = bool(snapshot.get("provider_ready"))
     if (not provider_ready) or phase == "connect_llm":
-        return {1: "/provider mock", 2: "/providers", 3: "/provider gemini"}.get(action_id, "")
-    return {1: "/scan", 2: "/brief", 3: "/next"}.get(action_id, "")
+        return {1: "/quickstart", 2: "/provider mock", 3: "/providers", 4: "/provider gemini"}.get(action_id, "")
+    return {1: "/scan", 2: "/brief", 3: "/next", 4: "/doctor strict"}.get(action_id, "")
 
 
 def _render_tui_start_card(options: dict[str, object]) -> str:
@@ -10550,18 +11403,53 @@ def _render_tui_start_card(options: dict[str, object]) -> str:
             *(["- 下一步:"] + [f"  - {item}" for item in steps[:3]] if steps else []),
             "",
             "One Minute Setup",
-            *[f"- {item}" for item in actions[:3]],
+            *[f"- {item}" for item in actions[:4]],
             "",
             "输入 /next 自动执行优先动作，或直接说你的需求。",
-            "也可输入 /go 1|2|3 快速执行引导动作。",
+            "也可输入 /go 1|2|3|4 快速执行引导动作。",
             "高级用户可输入 /ui expert 切换专家视图。",
+        ]
+    )
+
+
+def _render_tui_quick_help_text(snapshot: dict[str, object]) -> str:
+    state_card = _build_tui_state_card(snapshot)
+    coach = _build_tui_start_coach(snapshot)
+    provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
+    mode = str(snapshot.get("mode", "-")).strip() or "-"
+    return "\n".join(
+        [
+            "Quick Help",
+            f"- 当前: mode={mode} provider={provider}",
+            f"- 阶段: {coach.get('phase_label', '-')}",
+            f"- 建议下一步: {state_card.get('next', '/next')}",
+            "",
+            "Core Commands",
+            "- /next: 执行当前建议下一步",
+            "- /scan: 自动探测环境",
+            "- /brief: 生成总览简报",
+            "- /do 1: 执行第1条建议动作",
+            "- /trace /timeline: 看执行链路",
+            "- /providers: 查看模型就绪状态",
+            "- /doctor: 运行环境体检（支持 /doctor strict /doctor install）",
+            "- /secret-scan: 检查当前工作区是否存在疑似密钥泄漏",
+            "",
+            "Input Shortcuts",
+            "- 直接输入自然语言",
+            "- 口语短句：继续/重试/历史/帮助/扫描/简报",
+            "- ↑/↓ 历史（支持前缀筛选）",
+            "- Tab 补全，Ctrl-A/E/U/K/W 编辑",
+            "- Shift+N/T/U/R 快捷闭环，F2 切面板，F3 切 UI",
+            "",
+            "Tip",
+            "- 按 F1 或 ? 可打开全屏帮助面板。",
         ]
     )
 
 
 def _format_tui_output_for_display(text: str) -> str:
     lines = str(text or "").splitlines()
-    internal_prefixes = ("[llm_turn]", "[tool_call]", "[tool_output]", "[llm.turn]")
+    internal_prefixes = ("[llm_turn]", "[lm_turn]", "[tool_call]", "[tool_output]", "[llm.turn]")
     cleaned: list[str] = []
     in_code = False
     for raw in lines:
@@ -10590,6 +11478,8 @@ def _format_tui_output_for_display(text: str) -> str:
             compressed.append("")
     result = "\n".join(compressed).strip() or str(text or "").strip()
     normalized = _sanitize_tui_secret_tokens(result)
+    if _looks_like_tui_degraded_output(normalized):
+        return _render_tui_degraded_card(normalized)
     if _looks_like_tui_error_output(normalized):
         return _render_tui_error_card(normalized)
     return normalized
@@ -10606,12 +11496,14 @@ def _infer_tui_phase_from_input(text: str) -> str:
     return "thinking"
 
 
-def _render_tui_completion_card(text: str, *, request: str, duration_ms: int) -> str:
+def _render_tui_completion_card(text: str, *, request: str, duration_ms: int, ui_mode: str = "simple") -> str:
     content = str(text or "").strip() or "(no output)"
     if content.lower().startswith("result: failed"):
         body = content
     elif _looks_like_tui_error_output(content):
         body = content
+    elif _normalize_tui_ui_mode(ui_mode) == "simple":
+        body = _render_tui_simple_result_card(content, request=request)
     else:
         body = _render_tui_success_card(content, request=request)
     return "\n".join(
@@ -10634,6 +11526,127 @@ def _looks_like_tui_error_output(text: str) -> bool:
         or ("traceback" in lowered)
         or ("exception:" in lowered)
     )
+
+
+def _looks_like_tui_degraded_output(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    return "[auto-fallback]" in lowered or "provider_fallback" in lowered
+
+
+def _render_tui_degraded_card(text: str) -> str:
+    message = str(text or "").strip()
+    detail = message.replace("[auto-fallback]", "").strip()
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    reason = "-"
+    for line in lines:
+        if "原因:" in line:
+            reason = line.split("原因:", 1)[-1].strip() or "-"
+            break
+    if reason == "-" and lines:
+        reason = lines[0]
+    return "\n".join(
+        [
+            "Result: Degraded",
+            "Reason: 当前 provider 调用失败，已自动降级到 mock 继续执行。",
+            f"Detail: {reason[:220]}",
+            "Do Now:",
+            "- /providers（检查 provider 就绪状态）",
+            "- /login --provider <openai|anthropic|gemini|deepseek|qwen|kimi>",
+            "Fallback:",
+            "- /provider mock（继续排障）",
+            "- /next",
+        ]
+    )
+
+
+def _maybe_apply_tui_provider_fallback(options: dict[str, object], output_text: str) -> str:
+    if not _looks_like_tui_degraded_output(output_text):
+        return ""
+    current = str(options.get("provider", "auto")).strip().lower() or "auto"
+    if current == "mock":
+        return ""
+    options["provider"] = "mock"
+    options["model"] = resolve_model_name("openai", settings.model_name)
+    return "已将当前会话 provider 自动切换为 mock，避免后续重复降级。可随时用 /provider <name> 切回真实模型。"
+
+
+def _maybe_apply_runtime_provider_fallback(options: dict[str, object], result: DispatchResult) -> str:
+    fallback_event: DispatchEvent | None = None
+    for event in list(result.events or []):
+        if str(event.message or "").strip().lower() == "provider_fallback":
+            fallback_event = event
+            break
+    if fallback_event is None:
+        return ""
+    current = str(options.get("provider", "auto")).strip().lower() or "auto"
+    target = "mock"
+    reason = ""
+    if isinstance(fallback_event.data, dict):
+        target = str(fallback_event.data.get("to", "mock")).strip().lower() or "mock"
+        reason = _sanitize_tui_secret_tokens(str(fallback_event.data.get("reason", "")).strip())
+    if current == target:
+        return ""
+    options["provider"] = target
+    if target == "mock":
+        options["model"] = resolve_model_name("openai", settings.model_name)
+    else:
+        options["model"] = resolve_model_name(target, str(options.get("model", settings.model_name)))
+    reason_text = f" 原因: {reason[:180]}" if reason else ""
+    return (
+        f"检测到 provider 自动降级，已将当前会话切换到 `{target}`，避免后续重复失败。"
+        "可随时用 `/provider <name>` 切回真实模型。"
+        f"{reason_text}"
+    )
+
+
+def _render_tui_simple_result_card(text: str, *, request: str) -> str:
+    content = str(text or "").strip()
+    status = _extract_named_field(content, ["status", "状态"]) or "Completed"
+    risk = _extract_named_field(content, ["risk level", "风险等级"])
+    summary = _extract_named_field(content, ["reasoning", "诊断", "结论", "summary", "摘要"])
+    commands: list[str] = []
+    seen_commands: set[str] = set()
+    for item in _extract_command_candidates(content, max_items=8):
+        if (not _looks_like_shell_command(item)) or (item in seen_commands):
+            continue
+        seen_commands.add(item)
+        commands.append(item)
+        if len(commands) >= 3:
+            break
+    if len(commands) < 3:
+        for raw in content.splitlines():
+            line = raw.strip().strip("`")
+            if (not _looks_like_shell_command(line)) or (line in seen_commands):
+                continue
+            seen_commands.add(line)
+            commands.append(line)
+            if len(commands) >= 3:
+                break
+    if not summary:
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        for line in lines:
+            lowered = line.lower()
+            if lowered.startswith(("result:", "status:", "reason:", "impact:", "do now:", "fallback:")):
+                continue
+            if line.endswith(":"):
+                continue
+            if line.startswith("- "):
+                continue
+            summary = line
+            break
+    summary_text = _truncate_tui_status_text(summary or "已完成。", max_chars=160)
+    next_actions = _infer_tui_next_actions_from_text(content, request=request)[:2]
+    rows = [
+        "Result: Success",
+        f"Status: {status[:64]}",
+        f"Summary: {summary_text}",
+    ]
+    if risk:
+        rows.append(f"Risk: {_truncate_tui_status_text(risk, max_chars=96)}")
+    if commands:
+        rows.extend(["Commands:", *[f"- {item}" for item in commands]])
+    rows.extend(["Next:", *[f"- {item}" for item in next_actions]])
+    return "\n".join(rows)
 
 
 def _render_tui_error_card(text: str) -> str:
@@ -10704,6 +11717,7 @@ def _sanitize_tui_secret_tokens(text: str) -> str:
     value = re.sub(r"([?&]token=)[^&\s]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
     value = re.sub(r"(\bkey=)[^\s,;]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
     value = re.sub(r"(\btoken=)[^\s,;]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"(://)([^/@:\s]+):([^/@\s]+)@", r"\1***:***@", value)
     value = re.sub(
         r"(?i)\b(password|passwd|pwd|api[_-]?key|secret)\b\s*[:=]?\s*([^\s,;]+)",
         lambda m: f"{m.group(1)}=***REDACTED***",
@@ -10718,6 +11732,11 @@ def _normalize_tui_ui_mode(raw: str) -> str:
     if value in {"expert", "pro", "advanced"}:
         return "expert"
     return "simple"
+
+
+def _toggle_tui_ui_mode(current: str) -> str:
+    mode = _normalize_tui_ui_mode(current)
+    return "expert" if mode == "simple" else "simple"
 
 
 def _tui_char_display_width(value: str) -> int:
@@ -10803,16 +11822,21 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
         "Core",
         "- 直接输入自然语言，例如：检查当前服务器 / 修复 swarm 副本不足",
         "- /start 查看当前阶段与建议动作，/next 自动执行下一步",
-        "- /go 1|2|3 执行开机即用引导动作（扫描/总览/连接模型）",
+        "- /go 1|2|3|4 执行开机即用引导动作（扫描/总览/连接模型/一键修环境）",
         "- /do 1 执行当前最优先建议，/focus /activity /trace /timeline 查看上下文",
+        "- /retry 重试上一条输入；/history 查看并重放历史输入",
+        "- 数字快捷：直接输入 1/2/3... 可执行对应 /do n（无动作时 1-4 走 /go n）",
+        "- 首屏输入框留空直接按 Enter，会自动执行当前建议下一步",
         "- /scan 零配置探测本机 Docker/Swarm/K8s/Prometheus",
         "- /drift 查看环境基线漂移（新增/缺失目标、基线过期）",
         "",
         "Keys",
-        "- Tab 自动补全，Up/Down 浏览输入历史",
+        "- Tab 自动补全，Up/Down 浏览输入历史（输入前缀可筛选）",
         "- 终端若不识别方向键，可用 Ctrl+P / Ctrl+N 浏览历史",
+        "- Ctrl+A/E 光标跳到行首/行尾；Ctrl+U/K 删除左侧/右侧；Ctrl+W 删除前一个词",
         "- Left/Right/Home/End 移动光标，Delete 删除光标后字符",
-        "- 1-4 或 F2 切换左侧面板",
+        "- 1-4 或 F2 切换左侧面板，F3 切换 simple/expert",
+        "- Shift+R 直接重试上一条输入",
         "- F1 或 ? 打开/关闭帮助",
         "- Ctrl-L 清屏，Esc 关闭帮助或退出 TUI",
         "",
@@ -10826,6 +11850,9 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
         "- /trace",
         "- /timeline",
         "- /drift",
+        "- /doctor",
+        "- /doctor install",
+        "- /secret-scan",
         "- /providers",
         "- /scan",
         "- /ui simple|expert",
@@ -10872,7 +11899,7 @@ def _draw_tui_help_overlay(stdscr, *, snapshot: dict[str, object], width: int, h
     visible_lines = content_lines[: max(0, overlay_height - 4)]
     for idx, line in enumerate(visible_lines, top + 1):
         _tui_addnstr(stdscr, idx, left + 2, line, content_width)
-    footer = "F1/? close"
+    footer = "F1/? close · F3 ui"
     _tui_addnstr(stdscr, bottom - 1, left + 2, footer, content_width)
 
 
@@ -10925,6 +11952,10 @@ def _read_tui_escape_key(stdscr) -> str | None:
 
 def _parse_tui_escape_sequence(raw: str) -> str | None:
     seq = str(raw or "")
+    if seq.startswith("\x1b"):
+        seq = seq[1:]
+    # Normalize modifier forms like "[1;5A" -> "[A" (Ctrl/Alt/Shift arrows).
+    seq = re.sub(r"^\[(?:\d+;)+\d+([A-Za-z])$", r"[\1", seq)
     mapping = {
         "[A": "<UP>",
         "OA": "<UP>",
@@ -10948,6 +11979,43 @@ def _parse_tui_escape_sequence(raw: str) -> str | None:
         if seq.endswith(key):
             return value
     return None
+
+
+def _normalize_tui_key_alias(raw: str) -> str:
+    key = str(raw or "")
+    parsed = _parse_tui_escape_sequence(key)
+    if parsed:
+        return parsed
+    named_key_alias = {
+        "KEY_UP": "<UP>",
+        "KEY_DOWN": "<DOWN>",
+        "KEY_LEFT": "<LEFT>",
+        "KEY_RIGHT": "<RIGHT>",
+        "KEY_HOME": "<HOME>",
+        "KEY_END": "<END>",
+        "KEY_DC": "<DELETE>",
+        "KEY_BACKSPACE": "\x7f",
+    }
+    if key in named_key_alias:
+        return named_key_alias[key]
+    # Ignore common IME/system modifier glyphs that can leak into curses input.
+    if key in {"⇧", "⌥", "⌘", "⌃"}:
+        return ""
+    alias = {
+        "↑": "<UP>",
+        "↓": "<DOWN>",
+        "←": "<LEFT>",
+        "→": "<RIGHT>",
+        "⬆": "<UP>",
+        "⬇": "<DOWN>",
+        "⬅": "<LEFT>",
+        "➡": "<RIGHT>",
+        "↖": "<HOME>",
+        "↘": "<END>",
+        "⌫": "\x7f",
+        "⌦": "<DELETE>",
+    }
+    return alias.get(key, key)
 
 
 def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list[str]:
@@ -11044,7 +12112,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
             lines.extend(["", "Recommended:"])
             for item in recommended[:4]:
                 lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
-        lines.extend(["", "1-4/F2: switch panel"])
+        lines.extend(["", "1-4/F2: switch panel", "F3: toggle ui mode"])
         return lines
     if panel == "timeline":
         if not recent_commands and not timeline_entries:
@@ -11061,7 +12129,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
             lines.extend(["", "Execution Timeline:"])
             for item in timeline_entries[:5]:
                 lines.extend(_wrap_tui_text_lines(f"- {item}", width=width))
-        lines.extend(["", "Commands:", "- /trace", "- /timeline", "- /activity", "- /panel next", "- 1-4/F2 切换"])
+        lines.extend(["", "Commands:", "- /trace", "- /timeline", "- /activity", "- /panel next", "- 1-4/F2 切换", "- F3 切换UI"])
         return lines
     if panel == "providers":
         report = snapshot.get("provider_report", {})
@@ -11091,7 +12159,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
                     label = str(row.get("label", name))
                     ready = "PASS" if bool(row.get("ok")) else "FAIL"
                     lines.extend(_wrap_tui_text_lines(f"- {label}: {ready}", width=width))
-        lines.extend(["", "Commands:", "- /providers", "- /provider <name>", "- /panel next", "- 1-4/F2 切换"])
+        lines.extend(["", "Commands:", "- /providers", "- /provider <name>", "- /panel next", "- 1-4/F2 切换", "- F3 切换UI"])
         return lines
     headline = str(snapshot.get("headline", "")).strip()
     if headline:
@@ -11198,7 +12266,7 @@ def _build_tui_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list
     lines.extend(["", "Shortcuts:"])
     for item in shortcuts[:6]:
         lines.extend(_wrap_tui_text_lines(str(item), width=width))
-    lines.extend(["", "Tab: autocomplete", "1-4/F2: switch panel"])
+    lines.extend(["", "Tab: autocomplete", "1-4/F2: switch panel", "F3: toggle ui"])
     return lines
 
 
@@ -11252,6 +12320,16 @@ def _has_tui_user_history(history: list[tuple[str, str]]) -> bool:
     return any(str(speaker) == "You" and str(text).strip() for speaker, text in history)
 
 
+def _resolve_tui_empty_submit_command(
+    *,
+    snapshot: dict[str, object],
+    history: list[tuple[str, str]],
+) -> str:
+    if _has_tui_user_history(history):
+        return ""
+    return _pick_tui_next_command(snapshot)
+
+
 def _build_tui_idle_content_rows(snapshot: dict[str, object], *, width: int) -> list[str]:
     prompts = _build_tui_starter_prompts(snapshot)
     quick_state = _build_latest_quick_action_badge(snapshot)
@@ -11290,6 +12368,8 @@ def _build_tui_idle_content_rows(snapshot: dict[str, object], *, width: int) -> 
         "- /focus",
         "- /activity",
         "- /trace",
+        "- /history",
+        "- /retry",
     ]
     rows: list[str] = []
     for entry in sections:
@@ -11333,8 +12413,17 @@ def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history:
     if drift_status in {"changed", "stale"}:
         parts.append(f"drift={drift_status}")
     if last_you:
-        parts.append(f"last={last_you[:48]}")
+        safe_last = _sanitize_tui_secret_tokens(last_you)
+        parts.append(f"last={_truncate_tui_status_text(safe_last, max_chars=22)}")
     return " | ".join(parts)
+
+
+def _truncate_tui_status_text(text: str, *, max_chars: int = 22) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    limit = max(6, int(max_chars))
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
 
 
 def _build_tui_panel_hint(panel: str) -> str:
@@ -11394,10 +12483,10 @@ def _build_tui_action_bar(snapshot: dict[str, object]) -> str:
     if latest_status == "fail":
         return f"{base} · /trace · /timeline · /do 1"
     panel_actions = {
-        "overview": "/do 1 | /focus | /drift",
+        "overview": "/do 1 | /focus | /drift | /doctor",
         "activity": "/do 1 | /activity | /swarm --logs",
         "timeline": "/trace | /timeline | /panel next",
-        "providers": "/providers | /provider <name> | /panel next",
+        "providers": "/providers | /provider <name> | /secret-scan",
     }
     return f"{base} · {panel_actions.get(panel, panel_actions['overview'])}"
 
@@ -11487,28 +12576,43 @@ def _switch_tui_panel(options: dict[str, object], requested: str) -> str:
         return f"当前左侧面板: {panel}"
     if raw in {"next", "cycle"}:
         options["tui_panel"] = _next_tui_panel(str(options.get("tui_panel", "overview")))
+        _persist_tui_runtime_state(options)
         return f"已切换左侧面板: {options['tui_panel']}"
     if raw in {"1", "2", "3", "4"}:
         options["tui_panel"] = _panel_name_from_shortcut(raw)
+        _persist_tui_runtime_state(options)
         return f"已切换左侧面板: {options['tui_panel']}"
     panel = _normalize_tui_panel_name(raw)
     if panel == "overview" and raw not in {"overview", "summary", "home"}:
         return "用法：/panel overview|activity|timeline|providers|next"
     options["tui_panel"] = panel
+    _persist_tui_runtime_state(options)
     return f"已切换左侧面板: {panel}"
 
 
 def _tui_welcome_message(snapshot: dict[str, object] | None = None) -> str:
     logo = "\n".join(_build_tui_logo_lines())
     coach_primary = "/next"
+    coach_headline = "先拿到当前环境总览"
+    actions: list[str] = []
+    focus = "-"
     if isinstance(snapshot, dict):
         coach = _build_tui_start_coach(snapshot)
         coach_primary = str(coach.get("primary", "/next")).strip() or "/next"
-    return (
-        f"{logo}\n"
-        f"输入一句话描述问题，或输入 {coach_primary} 自动执行当前建议动作。"
-        "按 F1 查看帮助。"
-    )
+        coach_headline = str(coach.get("headline", coach_headline)).strip() or coach_headline
+        actions = _build_tui_boot_actions(snapshot)[:4]
+        state = _build_tui_state_card(snapshot)
+        focus = str(state.get("focus", "-")).strip() or "-"
+    lines = [
+        logo,
+        f"目标: {coach_headline}",
+        f"焦点: {focus}",
+        "One Minute Setup:",
+        *[f"- {item}" for item in actions],
+        f"输入一句话描述问题，或输入 {coach_primary} 自动执行当前建议动作。",
+        "也可输入 /go 1|2|3|4 快速执行引导动作，按 F1 查看帮助。",
+    ]
+    return "\n".join(lines)
 
 
 def _build_tui_logo_lines(*, compact: bool = False) -> list[str]:
@@ -11530,19 +12634,123 @@ def _cycle_tui_input_history(
 ) -> tuple[str, int, str]:
     if not input_history:
         return input_text, -1, ""
-    if direction == "up":
-        if history_index == -1:
-            history_seed = input_text
-            history_index = len(input_history) - 1
-        elif history_index > 0:
-            history_index -= 1
-        return input_history[history_index], history_index, history_seed
+    seed = history_seed
     if history_index == -1:
-        return input_text, history_index, history_seed
-    if history_index < len(input_history) - 1:
-        history_index += 1
-        return input_history[history_index], history_index, history_seed
-    return history_seed, -1, history_seed
+        seed = input_text
+    prefix = str(seed or "").strip().lower()
+
+    def _matches(row: str) -> bool:
+        value = str(row or "").strip().lower()
+        if not prefix:
+            return True
+        return value.startswith(prefix)
+
+    if direction == "up":
+        start = len(input_history) if history_index == -1 else max(0, history_index)
+        for idx in range(start - 1, -1, -1):
+            if _matches(input_history[idx]):
+                return input_history[idx], idx, seed
+        return input_text, -1, seed
+
+    if history_index == -1:
+        return input_text, history_index, seed
+    for idx in range(history_index + 1, len(input_history)):
+        if _matches(input_history[idx]):
+            return input_history[idx], idx, seed
+    return seed, -1, seed
+
+
+def _build_tui_bootstrap_input_history(snapshot: dict[str, object]) -> list[str]:
+    recent_commands = _collect_snapshot_recent_commands(snapshot, limit=20)
+    recommended = snapshot.get("recommended_commands", [])
+    if not isinstance(recommended, list):
+        recommended = []
+    seeds = [
+        *[str(item).strip() for item in recent_commands if str(item).strip()],
+        *[str(item).strip() for item in recommended if str(item).strip()],
+        "/quickstart",
+        "/scan",
+        "/brief",
+        "/next",
+        "/providers",
+        "/history",
+        "/retry",
+    ]
+    cleaned: list[str] = []
+    for item in seeds:
+        safe_item = _sanitize_tui_secret_tokens(item)
+        if not safe_item or safe_item in cleaned:
+            continue
+        cleaned.append(safe_item)
+    return cleaned[-20:]
+
+
+def _tui_input_history_file() -> Path:
+    return Path(settings.data_dir) / "lsre-tui-input-history.txt"
+
+
+def _merge_tui_input_history(*sources: list[str], max_entries: int = 220) -> list[str]:
+    rows: list[str] = []
+    limit = max(20, int(max_entries))
+    for source in sources:
+        for item in source:
+            safe = _sanitize_tui_secret_tokens(str(item or "").strip())
+            if not safe:
+                continue
+            if safe in rows:
+                rows.remove(safe)
+            rows.append(safe)
+    return rows[-limit:]
+
+
+def _load_tui_input_history(*, max_entries: int = 220) -> list[str]:
+    path = _tui_input_history_file()
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    return _merge_tui_input_history(lines, max_entries=max_entries)
+
+
+def _save_tui_input_history(input_history: list[str], *, max_entries: int = 220) -> None:
+    rows = _merge_tui_input_history(input_history, max_entries=max_entries)
+    path = _tui_input_history_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = "\n".join(rows).strip()
+        path.write_text((payload + "\n") if payload else "", encoding="utf-8")
+    except Exception:
+        return
+
+
+def _delete_tui_word_left(input_text: str, cursor_index: int) -> tuple[str, int]:
+    text = str(input_text or "")
+    cursor = max(0, min(int(cursor_index), len(text)))
+    idx = cursor
+    while idx > 0 and text[idx - 1].isspace():
+        idx -= 1
+    while idx > 0 and (not text[idx - 1].isspace()):
+        idx -= 1
+    return text[:idx] + text[cursor:], idx
+
+
+def _apply_tui_ctrl_edit_key(*, key: str, input_text: str, cursor_index: int) -> tuple[str, int, bool]:
+    text = str(input_text or "")
+    cursor = max(0, min(int(cursor_index), len(text)))
+    if key == "\x01":  # Ctrl+A
+        return text, 0, True
+    if key == "\x05":  # Ctrl+E
+        return text, len(text), True
+    if key == "\x15":  # Ctrl+U (kill left)
+        return text[cursor:], 0, True
+    if key == "\x0b":  # Ctrl+K (kill right)
+        return text[:cursor], cursor, True
+    if key == "\x17":  # Ctrl+W (delete word left)
+        next_text, next_cursor = _delete_tui_word_left(text, cursor)
+        return next_text, next_cursor, True
+    return text, cursor, False
 
 
 def _cycle_tui_completion(
@@ -11582,6 +12790,10 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/provider auto",
             "/provider mock",
             "/start",
+            "/go 1",
+            "/go 2",
+            "/go 3",
+            "/go 4",
             "/next",
             "/ui simple",
             "/ui expert",
@@ -11598,9 +12810,18 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/panel providers",
             "/panel next",
             "/doctor fix",
+            "/doctor",
+            "/doctor strict",
+            "/doctor install",
+            "/secret-scan",
             "/quickstart",
             "/status probe",
             "/refresh",
+            "/incident status",
+            "/incident open 支付服务延迟",
+            "/incident note 已切换流量",
+            "/incident timeline",
+            "/incident close 已恢复",
         ]
     )
     seed = str(prefix or "").strip().lower()
@@ -11626,7 +12847,7 @@ def _capture_plain_output(callback) -> str:
 
 
 def _normalize_runtime_exception_message(exc: Exception) -> str:
-    message = str(exc).strip() or exc.__class__.__name__
+    message = _sanitize_tui_secret_tokens(str(exc).strip() or exc.__class__.__name__)
     lower = message.lower()
     if ("using socks proxy" in lower) and ("socksio" in lower):
         return (
@@ -11635,7 +12856,57 @@ def _normalize_runtime_exception_message(exc: Exception) -> str:
             "`python3 -m pip install \"httpx[socks]\"`。\n"
             "如你不需要代理，清理环境变量 `ALL_PROXY/HTTPS_PROXY/HTTP_PROXY` 后重试。"
         )
+    if ("generativelanguage.googleapis.com" in lower) and ("400 bad request" in lower or "http 400" in lower):
+        return (
+            f"{message}\n"
+            "fix: Gemini 返回 400。请依次检查："
+            "1) API Key 是否属于当前项目并已启用 Gemini API；"
+            "2) 当前网络/代理是否可访问 Google API；"
+            "3) 先执行 `/provider mock` 保持流程可用。"
+        )
+    if ("http 401" in lower) or ("http 403" in lower) or ("unauthorized" in lower) or ("forbidden" in lower):
+        return (
+            f"{message}\n"
+            "fix: 认证或权限失败。请检查 API Key 权限、配额/计费状态、IP/区域限制。"
+        )
     return message
+
+
+def _safe_exception_text(exc: Exception) -> str:
+    return _sanitize_tui_secret_tokens(str(exc).strip() or exc.__class__.__name__)
+
+
+def _should_auto_fallback_to_mock(*, provider_mode: str, error: Exception) -> bool:
+    if str(os.getenv("LAZYSRE_DISABLE_MOCK_FALLBACK", "")).strip() == "1":
+        return False
+    mode = str(provider_mode or "").strip().lower()
+    if mode == "mock":
+        return False
+    if isinstance(error, typer.BadParameter):
+        return False
+    message = _normalize_runtime_exception_message(error).lower()
+    tokens = (
+        "api key",
+        "http 400",
+        "http 401",
+        "http 403",
+        "unauthorized",
+        "forbidden",
+        "quota",
+        "rate limit",
+        "using socks proxy",
+        "proxy",
+        "socks",
+        "connection",
+        "name or service not known",
+        "temporary failure",
+        "dns",
+        "ssl",
+        "tls",
+        "timed out",
+        "timeout",
+    )
+    return any(token in message for token in tokens)
 
 
 def _resolve_runtime_provider_label(provider: str, *, secrets_file: Path | None = None) -> str:
@@ -11740,25 +13011,31 @@ def _switch_runtime_provider(options: dict[str, object], provider_name: str, *, 
 
 def _handle_tui_input(text: str, options: dict[str, object]) -> str:
     normalized = _normalize_chat_input_text(text)
+    quick_command = _rewrite_simple_quick_phrase_to_command(normalized)
+    if quick_command:
+        normalized = quick_command
     lowered = normalized.lower()
-    if lowered in {"1", "2", "3"}:
-        lowered = f"/go {lowered}"
-        normalized = lowered
+    numeric_shortcut = _resolve_tui_numeric_shortcut_command(lowered, options=options)
+    if numeric_shortcut:
+        normalized = numeric_shortcut
+        lowered = numeric_shortcut
+    if normalized.startswith("/") and (not _extract_slash_command_name(normalized) in _KNOWN_SLASH_COMMANDS):
+        return _render_unknown_slash_command_message(normalized)
     if lowered in {"/start", "/guide"}:
         return _render_tui_start_card(options)
     if lowered in {"/go", "/go show"}:
         snapshot = _build_tui_dashboard_snapshot(options)
         actions = _build_tui_boot_actions(snapshot)
-        return "\n".join(["One Minute Setup", *[f"- {item}" for item in actions[:3]], "用法：/go 1|2|3"])
+        return "\n".join(["One Minute Setup", *[f"- {item}" for item in actions[:4]], "用法：/go 1|2|3|4"])
     if lowered.startswith("/go "):
         raw = lowered[len("/go ") :].strip()
         action_id = _safe_int(raw)
         if action_id <= 0:
-            return "用法：/go 1|2|3"
+            return "用法：/go 1|2|3|4"
         snapshot = _build_tui_dashboard_snapshot(options)
         command = _resolve_tui_boot_action_command(snapshot, action_id)
         if not command:
-            return "用法：/go 1|2|3"
+            return "用法：/go 1|2|3|4"
         rendered = _handle_tui_input(command, options)
         return f"执行引导动作: {command}\n\n{rendered}"
     if lowered in {"/next", "/continue"}:
@@ -11775,9 +13052,42 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
         if raw not in {"simple", "expert", "pro", "advanced"}:
             return "用法：/ui simple 或 /ui expert"
         options["tui_ui_mode"] = mode
+        _persist_tui_runtime_state(options)
         return f"已切换 UI 模式: {mode}"
     if lowered in {"/help", "help", "?"}:
+        return _render_tui_quick_help_text(_build_tui_dashboard_snapshot(options))
+    if lowered in {"/help full", "/help all", "/h full"}:
         return _render_tui_demo_text(_build_tui_dashboard_snapshot(options))
+    if lowered in {"/history", "/history show"}:
+        return _render_tui_history_text(options)
+    if lowered.startswith("/history "):
+        history_arg = normalized[len("/history ") :].strip()
+        index = _safe_int(history_arg)
+        if index <= 0:
+            return _render_tui_history_text(options, query=history_arg)
+        snapshot = _build_tui_dashboard_snapshot(options)
+        rows = _collect_snapshot_recent_commands(snapshot, limit=12)
+        replay_rows = list(reversed(rows))
+        if index > len(replay_rows):
+            return f"历史序号超出范围（当前 {len(replay_rows)} 条）。"
+        command = replay_rows[index - 1]
+        if (not command) or command.startswith("/history"):
+            return "该历史项不可重放，请选择其他序号。"
+        rendered = _handle_tui_input(command, options)
+        return f"重放历史[{index}]: {command}\n\n{rendered}"
+    if lowered in {"/retry", "/r"}:
+        last_input = str(options.get("tui_last_input", "")).strip()
+        if not last_input:
+            snapshot = _build_tui_dashboard_snapshot(options)
+            rows = _collect_snapshot_recent_commands(snapshot, limit=12)
+            if rows:
+                last_input = rows[-1]
+        if (not last_input) or (last_input.lower() in {"/retry", "/r"}):
+            return "没有可重试的上一条输入。先输入一句话，或执行 /history 查看历史。"
+        rendered = _handle_tui_input(last_input, options)
+        return f"重试上一条: {last_input}\n\n{rendered}"
+    if lowered.startswith("/incident"):
+        return _handle_incident_inline_command(normalized, path=_resolve_incident_inline_path(options))
     if lowered in {"/actions", "/actions show"}:
         return _render_quick_actions_text(options)
     if lowered.startswith("/actions "):
@@ -11808,6 +13118,59 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
         return _switch_tui_panel(options, "show")
     if lowered.startswith("/panel "):
         return _switch_tui_panel(options, normalized[len("/panel ") :].strip())
+    if lowered.startswith("/secret-scan") or lowered in {"/secrets", "/doctor secrets", "/doctor secret"}:
+        def _render_secret_scan() -> None:
+            checks = _collect_workspace_secret_checks()
+            report = {
+                "checks": checks,
+                "summary": _summarize_doctor_checks(checks),
+            }
+            report["gate"] = _build_doctor_gate(report, strict=False)
+            _render_doctor_report(report)
+
+        return _capture_plain_output(_render_secret_scan)
+    if lowered.startswith("/doctor"):
+        doctor_text = lowered
+
+        def _render_install_doctor() -> None:
+            report = _collect_install_doctor_report()
+            report["gate"] = _build_doctor_gate(report, strict=False)
+            _render_doctor_report(report)
+
+        if (" install" in doctor_text) or ("--install" in doctor_text):
+            return _capture_plain_output(_render_install_doctor)
+
+        auto_fix = (" fix" in doctor_text) or ("--auto-fix" in doctor_text)
+        strict_mode = (" strict" in doctor_text) or ("--strict" in doctor_text)
+        write_backup = (" backup" in doctor_text) or ("--write-backup" in doctor_text)
+
+        def _render_doctor() -> None:
+            target_store = TargetEnvStore()
+            target = target_store.load()
+            autofix_payload: dict[str, object] | None = None
+            if auto_fix:
+                autofix_payload = _apply_doctor_autofix(
+                    target_store,
+                    target,
+                    write_backup=write_backup,
+                )
+                target = target_store.load()
+            report = _collect_doctor_report(
+                target=target,
+                timeout_sec=6,
+                dry_run_probe=False,
+                audit_log=Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))),
+            )
+            if autofix_payload is not None:
+                report["autofix"] = autofix_payload
+            summary_obj = report.get("summary", {})
+            if isinstance(summary_obj, dict):
+                summary_obj["strict_mode"] = strict_mode
+                summary_obj["strict_healthy"] = _doctor_is_healthy(summary_obj, strict=strict_mode)
+            report["gate"] = _build_doctor_gate(report, strict=strict_mode)
+            _render_doctor_report(report)
+
+        return _capture_plain_output(_render_doctor)
     if lowered in {"/providers", "/provider", "/provider show"}:
         return _capture_plain_output(lambda: _render_provider_runtime_report(_build_provider_runtime_report(options)))
     if lowered.startswith("/provider "):
@@ -11939,6 +13302,38 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
     )
 
 
+def _resolve_tui_numeric_shortcut_command(text: str, *, options: dict[str, object]) -> str:
+    raw = str(text or "").strip().lower()
+    if (not raw) or (not _looks_like_ordinal_shortcut(raw)):
+        return ""
+    action_id = _safe_int(raw)
+    if action_id <= 0:
+        return ""
+    snapshot = _build_tui_dashboard_snapshot(options)
+    quick_items = snapshot.get("quick_action_items", [])
+    if isinstance(quick_items, list):
+        for item in quick_items:
+            if not isinstance(item, dict):
+                continue
+            if _safe_int(str(item.get("id", "")).strip()) == action_id:
+                return f"/do {action_id}"
+    if action_id in {1, 2, 3, 4}:
+        return f"/go {action_id}"
+    return ""
+
+
+def _looks_like_ordinal_shortcut(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    pattern = (
+        r"^(?:#|no\.?|第)?\s*"
+        r"[0-9零〇一二三四五六七八九十两①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳❶❷❸❹❺❻❼❽❾❿]+"
+        r"\s*(?:步|条|项|号|个|建议|动作|行动|推荐)?$"
+    )
+    return bool(re.fullmatch(pattern, raw, flags=re.IGNORECASE))
+
+
 def _normalize_natural_language_text(text: str) -> str:
     normalized = str(text or "")
     replacements = [
@@ -11961,6 +13356,245 @@ def _normalize_natural_language_text(text: str) -> str:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
     normalized = normalized.replace("模版", "模板")
     return normalized
+
+
+def _rewrite_simple_quick_phrase_to_command(text: str) -> str:
+    raw = str(text or "").strip()
+    if (not raw) or raw.startswith("/"):
+        return ""
+    lowered = raw.lower().strip()
+    compact = re.sub(r"[\s，。,.!?！？:：;；]+", "", lowered)
+
+    mapping: dict[str, str] = {
+        "继续": "/next",
+        "继续吧": "/next",
+        "继续一下": "/next",
+        "继续完善": "/next",
+        "继续优化": "/next",
+        "继续打磨": "/next",
+        "继续排查": "/next",
+        "继续处理": "/next",
+        "继续执行": "/next",
+        "下一步": "/next",
+        "next": "/next",
+        "continue": "/next",
+        "goon": "/next",
+        "重试": "/retry",
+        "再试一次": "/retry",
+        "retry": "/retry",
+        "retrylast": "/retry",
+        "历史": "/history",
+        "输入历史": "/history",
+        "最近输入": "/history",
+        "history": "/history",
+        "帮助": "/help",
+        "help": "/help",
+        "怎么用": "/help",
+        "命令列表": "/help",
+        "扫描": "/scan",
+        "环境扫描": "/scan",
+        "scan": "/scan",
+        "总览": "/brief",
+        "简报": "/brief",
+        "brief": "/brief",
+        "执行轨迹": "/trace",
+        "trace": "/trace",
+        "时间线": "/timeline",
+        "timeline": "/timeline",
+        "模型状态": "/providers",
+        "provider状态": "/providers",
+        "providers": "/providers",
+        "体检": "/doctor",
+        "健康检查": "/doctor",
+        "doctor": "/doctor",
+        "安装检查": "/doctor install",
+        "安装体检": "/doctor install",
+        "密钥检查": "/secret-scan",
+        "泄漏检查": "/secret-scan",
+        "secretcheck": "/secret-scan",
+        "secretscan": "/secret-scan",
+    }
+    direct = mapping.get(compact, "")
+    if direct:
+        return direct
+
+    next_prefixes = (
+        "继续",
+        "下一步",
+        "再继续",
+        "continue",
+        "next",
+    )
+    retry_prefixes = (
+        "重试",
+        "再试",
+        "再来一次",
+        "retry",
+    )
+    history_prefixes = (
+        "历史",
+        "看历史",
+        "看看历史",
+        "输入历史",
+        "最近输入",
+        "history",
+    )
+    help_prefixes = (
+        "帮助",
+        "help",
+        "怎么用",
+        "怎么使用",
+        "命令",
+        "指令",
+        "用法",
+    )
+    scan_prefixes = (
+        "扫描",
+        "环境扫描",
+        "scan",
+        "先扫描",
+    )
+    brief_prefixes = (
+        "简报",
+        "总览",
+        "brief",
+    )
+    trace_prefixes = (
+        "轨迹",
+        "执行轨迹",
+        "trace",
+    )
+    timeline_prefixes = (
+        "时间线",
+        "timeline",
+    )
+    provider_prefixes = (
+        "模型状态",
+        "provider状态",
+        "providers",
+        "provider",
+    )
+    doctor_prefixes = (
+        "体检",
+        "健康检查",
+        "doctor",
+        "安装检查",
+        "安装体检",
+    )
+    secret_scan_prefixes = (
+        "密钥检查",
+        "泄漏检查",
+        "secretcheck",
+        "secretscan",
+    )
+    if any(compact.startswith(prefix) for prefix in next_prefixes):
+        return "/next"
+    if any(compact.startswith(prefix) for prefix in retry_prefixes):
+        return "/retry"
+    if any(compact.startswith(prefix) for prefix in history_prefixes):
+        return "/history"
+    if any(compact.startswith(prefix) for prefix in help_prefixes):
+        return "/help"
+    if any(compact.startswith(prefix) for prefix in scan_prefixes):
+        return "/scan"
+    if any(compact.startswith(prefix) for prefix in brief_prefixes):
+        return "/brief"
+    if any(compact.startswith(prefix) for prefix in trace_prefixes):
+        return "/trace"
+    if any(compact.startswith(prefix) for prefix in timeline_prefixes):
+        return "/timeline"
+    if any(compact.startswith(prefix) for prefix in provider_prefixes):
+        return "/providers"
+    if any(compact.startswith(prefix) for prefix in secret_scan_prefixes):
+        return "/secret-scan"
+    if any(compact.startswith(prefix) for prefix in doctor_prefixes):
+        if compact.startswith("安装"):
+            return "/doctor install"
+        return "/doctor"
+    return ""
+
+
+_KNOWN_SLASH_COMMANDS: tuple[str, ...] = (
+    "help",
+    "h",
+    "mode",
+    "context",
+    "ctx",
+    "reset",
+    "login",
+    "logout",
+    "init",
+    "quickstart",
+    "brief",
+    "scan",
+    "swarm",
+    "watch",
+    "actions",
+    "autopilot",
+    "connect",
+    "remote",
+    "remediate",
+    "tui",
+    "setup",
+    "status",
+    "doctor",
+    "runbook",
+    "report",
+    "incident",
+    "template",
+    "fix",
+    "approve",
+    "undo",
+    "memory",
+    "apply",
+    "activity",
+    "focus",
+    "do",
+    "timeline",
+    "trace",
+    "drift",
+    "ui",
+    "start",
+    "next",
+    "go",
+    "providers",
+    "provider",
+    "secret-scan",
+    "refresh",
+    "panel",
+    "history",
+    "retry",
+    "r",
+)
+
+
+def _extract_slash_command_name(text: str) -> str:
+    raw = str(text or "").strip()
+    if (not raw) or (not raw.startswith("/")):
+        return ""
+    parts = raw.split(maxsplit=1)
+    command = parts[0][1:].strip().lower()
+    return command
+
+
+def _suggest_unknown_slash_command(text: str) -> str:
+    command = _extract_slash_command_name(text)
+    if (not command) or (command in _KNOWN_SLASH_COMMANDS):
+        return ""
+    match = get_close_matches(command, list(_KNOWN_SLASH_COMMANDS), n=1, cutoff=0.72)
+    if not match:
+        return ""
+    return f"/{match[0]}"
+
+
+def _render_unknown_slash_command_message(text: str) -> str:
+    command = _extract_slash_command_name(text)
+    if not command:
+        return ""
+    suggestion = _suggest_unknown_slash_command(text)
+    if suggestion:
+        return f"未知命令: /{command}\n你是不是想输入: {suggestion}\n输入 /help 查看全部命令。"
+    return f"未知命令: /{command}\n输入 /help 查看全部命令。"
 
 
 def _normalize_slash_command_text(text: str) -> str:
@@ -11993,53 +13627,26 @@ def _normalize_slash_command_text(text: str) -> str:
         "remediatee": "remediate",
         "hepl": "help",
         "ux": "ui",
+        "inc": "incident",
+        "hist": "history",
+        "his": "history",
+        "rt": "retry",
+        "secretscan": "secret-scan",
+        "secretcheck": "secret-scan",
+        "secret": "secret-scan",
     }
-    known = [
-        "help",
-        "h",
-        "mode",
-        "context",
-        "ctx",
-        "reset",
-        "login",
-        "init",
-        "quickstart",
-        "brief",
-        "scan",
-        "swarm",
-        "watch",
-        "actions",
-        "autopilot",
-        "connect",
-        "remote",
-        "remediate",
-        "tui",
-        "setup",
-        "status",
-        "doctor",
-        "runbook",
-        "report",
-        "template",
-        "fix",
-        "approve",
-        "undo",
-        "memory",
-        "apply",
-        "activity",
-        "focus",
-        "do",
-        "timeline",
-        "ui",
-        "start",
-        "next",
-    ]
+    known = list(_KNOWN_SLASH_COMMANDS)
     corrected = aliases.get(command, "")
     if not corrected:
         match = get_close_matches(command, known, n=1, cutoff=0.78)
         if match:
             corrected = match[0]
     if (not corrected) or (corrected == command):
-        return raw
+        corrected = command
+    if corrected == "secret-scan":
+        normalized_tail = tail.strip().lower()
+        if normalized_tail in {"", "scan", "check", "检查", "扫描"}:
+            return "/secret-scan"
     if tail:
         return f"/{corrected} {tail}"
     return f"/{corrected}"
@@ -12051,7 +13658,123 @@ def _normalize_chat_input_text(text: str) -> str:
         return raw
     if raw.startswith("/"):
         return _normalize_slash_command_text(raw)
+    bare = _normalize_bare_command_text(raw)
+    if bare.startswith("/"):
+        return _normalize_slash_command_text(bare)
     return _normalize_natural_language_text(raw)
+
+
+def _normalize_bare_command_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if (not raw) or raw.startswith("/"):
+        return raw
+    parts = raw.split(maxsplit=1)
+    head = parts[0].strip().lower()
+    tail = parts[1].strip() if len(parts) > 1 else ""
+    aliases = {
+        "qs": "quickstart",
+        "quick-start": "quickstart",
+        "quikstart": "quickstart",
+        "stauts": "status",
+        "staus": "status",
+        "templete": "template",
+        "templte": "template",
+        "runbok": "runbook",
+        "aprove": "approve",
+        "memroy": "memory",
+        "sacn": "scan",
+        "actons": "actions",
+        "auto-pilot": "autopilot",
+        "conect": "connect",
+        "brif": "brief",
+        "remedate": "remediate",
+        "remediatee": "remediate",
+        "hepl": "help",
+        "ux": "ui",
+        "inc": "incident",
+        "hist": "history",
+        "his": "history",
+        "rt": "retry",
+        "secretscan": "secret-scan",
+        "secretcheck": "secret-scan",
+        "secret": "secret-scan",
+    }
+    command = aliases.get(head, head)
+    if command not in _KNOWN_SLASH_COMMANDS:
+        match = get_close_matches(command, list(_KNOWN_SLASH_COMMANDS), n=1, cutoff=0.82)
+        if not match:
+            return raw
+        command = match[0]
+    if command == "secret-scan":
+        normalized_tail = tail.strip().lower()
+        if normalized_tail in {"", "scan", "check", "检查", "扫描"}:
+            return "/secret-scan"
+    # Avoid hijacking natural language phrases like "help me ...".
+    if command in {"help", "h"} and tail and tail.lower() not in {"full", "all"}:
+        return raw
+    return f"/{command}{(' ' + tail) if tail else ''}"
+
+
+def _bootstrap_chat_input_history(options: dict[str, object], *, limit: int = 20) -> list[str]:
+    cap = max(1, min(limit, 100))
+    session_file = Path(str(options.get("session_file", ".data/lsre-session.json"))).expanduser()
+    try:
+        turns = SessionStore(session_file).recent_turns(limit=cap)
+    except Exception:
+        turns = []
+    rows: list[str] = []
+    for item in turns:
+        if not isinstance(item, dict):
+            continue
+        user = _sanitize_tui_secret_tokens(str(item.get("user", "")).strip())
+        if (not user) or (user in rows):
+            continue
+        rows.append(user)
+    return rows[-cap:]
+
+
+def _chat_readline_history_file() -> Path:
+    return Path(settings.data_dir) / "lsre-readline-history.txt"
+
+
+def _enable_chat_readline_history(*, max_entries: int = 300) -> None:
+    try:
+        import readline  # type: ignore
+    except Exception:
+        return
+    path = _chat_readline_history_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        readline.read_history_file(str(path))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        return
+    try:
+        readline.set_history_length(max(50, int(max_entries)))
+    except Exception:
+        pass
+
+
+def _append_chat_readline_history(line: str) -> None:
+    text = str(line or "").strip()
+    if not text:
+        return
+    # Never persist potential secrets to local readline history.
+    if _sanitize_tui_secret_tokens(text) != text:
+        return
+    try:
+        import readline  # type: ignore
+    except Exception:
+        return
+    try:
+        count = int(readline.get_current_history_length())
+        last = readline.get_history_item(count) if count > 0 else None
+        if last != text:
+            readline.add_history(text)
+        readline.write_history_file(str(_chat_readline_history_file()))
+    except Exception:
+        return
 
 
 def _assistant_chat_loop(options: dict[str, object]) -> None:
@@ -12063,6 +13786,8 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
     _maybe_offer_one_click_env_fix(options)
     runtime_execute = _load_chat_runtime_state(bool(options["execute"]))
     _render_mode_hint(runtime_execute)
+    _enable_chat_readline_history()
+    chat_input_history = _bootstrap_chat_input_history(options)
     while True:
         try:
             line = typer.prompt("lsre")
@@ -12072,12 +13797,54 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
         text = line.strip()
         if not text:
             continue
+        _append_chat_readline_history(text)
         normalized_text = _normalize_chat_input_text(text)
         if normalized_text != text:
             typer.echo(f"已自动纠正输入：{normalized_text}")
             text = normalized_text
+        numeric_shortcut = _resolve_tui_numeric_shortcut_command(text, options=options)
+        if numeric_shortcut:
+            typer.echo(f"已识别数字快捷：{text} -> {numeric_shortcut}")
+            text = numeric_shortcut
+        quick_command = _rewrite_simple_quick_phrase_to_command(text)
+        if quick_command:
+            typer.echo(f"已识别快捷口语：{text} -> {quick_command}")
+            text = quick_command
         if text.lower() in {"exit", "quit"}:
             break
+        if text.startswith("/") and (not _extract_slash_command_name(text) in _KNOWN_SLASH_COMMANDS):
+            typer.echo(_render_unknown_slash_command_message(text))
+            continue
+        if text.lower() in {"/history", "/history show"}:
+            typer.echo(_render_history_text(chat_input_history[-12:]))
+            continue
+        if text.lower().startswith("/history "):
+            history_arg = text[len("/history ") :].strip()
+            index = _safe_int(history_arg)
+            if index <= 0:
+                typer.echo(_render_history_text(chat_input_history[-12:], query=history_arg))
+                continue
+            replay_rows = list(reversed(chat_input_history))
+            if index > len(replay_rows):
+                typer.echo(f"历史序号超出范围（当前 {len(replay_rows)} 条）。")
+                continue
+            command = replay_rows[index - 1]
+            if (not command) or command.startswith("/history"):
+                typer.echo("该历史项不可重放，请选择其他序号。")
+                continue
+            typer.echo(f"重放历史[{index}]: {command}")
+            text = command
+        if text.lower() in {"/retry", "/r"}:
+            if not chat_input_history:
+                typer.echo("没有可重试的上一条输入。先输入一句话，或执行 /history 查看历史。")
+                continue
+            text = chat_input_history[-1]
+            typer.echo(f"重试上一条: {text}")
+        safe_history_item = _sanitize_tui_secret_tokens(text)
+        if safe_history_item and safe_history_item.lower() not in {"/retry", "/r"}:
+            if (not chat_input_history) or (chat_input_history[-1] != safe_history_item):
+                chat_input_history.append(safe_history_item)
+                chat_input_history = chat_input_history[-30:]
         if _looks_like_help_request(text):
             _render_chat_short_help()
             continue
@@ -12095,6 +13862,9 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             continue
         if text.lower() in {"/help", "/h"}:
             _render_chat_short_help()
+            continue
+        if text.lower().startswith("/incident"):
+            typer.echo(_handle_incident_inline_command(text, path=_resolve_incident_inline_path(options)))
             continue
         if text.lower() in {"/actions", "/actions show"}:
             typer.echo(_render_quick_actions_text({**options, "execute": runtime_execute}))
@@ -12275,6 +14045,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                     model=str(options["model"]),
                     provider=str(options["provider"]),
                     max_steps=int(options["max_steps"]),
+                    runtime_options=options,
                 )
             continue
         if text.lower().startswith("/remediate"):
@@ -12479,7 +14250,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             try:
                 command = _parse_chat_runbook_command(tail)
             except ValueError as exc:
-                typer.echo(f"runbook 命令格式错误: {exc}")
+                typer.echo(f"runbook 命令格式错误: {_safe_exception_text(exc)}")
                 continue
             action = str(command.get("action", ""))
             if action == "list":
@@ -12501,7 +14272,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                         force=bool(command.get("force", False)),
                     )
                 except typer.BadParameter as exc:
-                    typer.echo(f"runbook add failed: {exc}")
+                    typer.echo(f"runbook add failed: {_safe_exception_text(exc)}")
                 continue
             if action == "remove":
                 try:
@@ -12511,7 +14282,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                         yes=bool(command.get("yes", False)),
                     )
                 except typer.BadParameter as exc:
-                    typer.echo(f"runbook remove failed: {exc}")
+                    typer.echo(f"runbook remove failed: {_safe_exception_text(exc)}")
                 continue
             if action == "export":
                 try:
@@ -12522,7 +14293,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                         runbook_file=str(command.get("runbook_file", settings.runbook_store_file)),
                     )
                 except typer.BadParameter as exc:
-                    typer.echo(f"runbook export failed: {exc}")
+                    typer.echo(f"runbook export failed: {_safe_exception_text(exc)}")
                 continue
             if action == "import":
                 try:
@@ -12532,7 +14303,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                         runbook_file=str(command.get("runbook_file", settings.runbook_store_file)),
                     )
                 except typer.BadParameter as exc:
-                    typer.echo(f"runbook import failed: {exc}")
+                    typer.echo(f"runbook import failed: {_safe_exception_text(exc)}")
                 continue
 
             runbook_name = str(command.get("name", ""))
@@ -12557,7 +14328,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                     profile_file=Path(settings.target_profile_file),
                 )
             except ValueError as exc:
-                typer.echo(str(exc))
+                typer.echo(_safe_exception_text(exc))
                 continue
 
             if action == "show":
@@ -12587,7 +14358,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             try:
                 report_cmd = _parse_chat_report_command(tail)
             except ValueError as exc:
-                typer.echo(f"report 命令格式错误: {exc}")
+                typer.echo(f"report 命令格式错误: {_safe_exception_text(exc)}")
                 continue
             try:
                 result = _export_incident_report(
@@ -12604,7 +14375,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                     git_message=str(report_cmd.get("git_message", "")),
                 )
             except typer.BadParameter as exc:
-                typer.echo(f"report 生成失败: {exc}")
+                typer.echo(f"report 生成失败: {_safe_exception_text(exc)}")
                 continue
             typer.echo(f"Report exported: {result['out_path']}")
             archived = str(result.get("archived_path", "")).strip()
@@ -12619,7 +14390,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             try:
                 parsed = _parse_chat_template_command(tail)
             except ValueError as exc:
-                typer.echo(f"template 命令格式错误: {exc}")
+                typer.echo(f"template 命令格式错误: {_safe_exception_text(exc)}")
                 continue
             action = str(parsed.get("action", "list"))
             if action == "list":
@@ -12633,7 +14404,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 try:
                     template_show(name=name)
                 except typer.BadParameter as exc:
-                    typer.echo(str(exc))
+                    typer.echo(_safe_exception_text(exc))
                 continue
             _run_remediation_template(
                 template_name=str(parsed.get("name", "")),
@@ -12892,6 +14663,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 model=str(options["model"]),
                 provider=str(options["provider"]),
                 max_steps=int(options["max_steps"]),
+                runtime_options=options,
             )
             continue
 
@@ -12913,6 +14685,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             model=str(options["model"]),
             provider=str(options["provider"]),
             max_steps=int(options["max_steps"]),
+            runtime_options=options,
         )
 
 
@@ -13019,6 +14792,7 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
                 model=str(options["model"]),
                 provider=str(options["provider"]),
                 max_steps=int(options["max_steps"]),
+                runtime_options=options,
             )
         return True
     if _looks_like_action_run_request(text):
@@ -13515,7 +15289,14 @@ def _execute_read_only_commands(
             command = shlex.split(command_text)
         except ValueError as exc:
             skipped += 1
-            items.append({"command": command_text, "ok": False, "skipped": True, "reason": str(exc)})
+            items.append(
+                {
+                    "command": command_text,
+                    "ok": False,
+                    "skipped": True,
+                    "reason": _safe_exception_text(exc),
+                }
+            )
             continue
         decision = assess_command(command, approval_mode=approval_mode)
         if decision.risk_level != "low":
@@ -13607,7 +15388,10 @@ def _execute_remote_fix_plan_steps(
         try:
             command = shlex.split(command_text)
         except ValueError as exc:
-            typer.echo(f"[remote step {idx}/{total}] 无法解析命令，跳过: {command_text} ({exc})")
+            typer.echo(
+                f"[remote step {idx}/{total}] 无法解析命令，跳过: {command_text} "
+                f"({_safe_exception_text(exc)})"
+            )
             continue
         if not command:
             continue
@@ -14037,7 +15821,10 @@ def _execute_fix_plan_steps(
         try:
             command = shlex.split(command_text)
         except ValueError as exc:
-            typer.echo(f"[step {idx}/{total}] 无法解析命令，跳过: {command_text} ({exc})")
+            typer.echo(
+                f"[step {idx}/{total}] 无法解析命令，跳过: {command_text} "
+                f"({_safe_exception_text(exc)})"
+            )
             continue
         if not command:
             continue
@@ -15006,7 +16793,7 @@ def _maybe_handle_target_profile_natural_intent(text: str) -> bool:
         try:
             result = store.import_payload(raw, merge=bool(req.get("merge", True)))
         except ValueError as exc:
-            typer.echo(str(exc))
+            typer.echo(_safe_exception_text(exc))
             return True
         activate_value = str(req.get("activate", "")).strip()
         activated = ""
@@ -15729,12 +17516,13 @@ def _extract_action_id_from_text(text: str) -> int:
     raw = str(text or "").strip()
     if not raw:
         return 0
+    number_token = r"[#0-9零〇一二三四五六七八九十两①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳❶❷❸❹❺❻❼❽❾❿]+"
     patterns = [
-        r"(?:执行|运行|处理|应用)\s*(?:第)?\s*(\d+)\s*(?:个)?\s*(?:建议|动作|行动|推荐)",
-        r"(?:建议|动作|行动|推荐)\s*(?:第)?\s*(\d+)",
-        r"(?:run|apply)\s+(?:action\s+)?(\d+)",
-        r"action\s+(\d+)",
-        r"^(\d+)$",
+        rf"(?:执行|运行|处理|应用)\s*(?:第)?\s*({number_token})\s*(?:个|号)?\s*(?:建议|动作|行动|推荐|步骤?)",
+        rf"(?:建议|动作|行动|推荐|步骤?)\s*(?:第)?\s*({number_token})(?:号)?",
+        rf"(?:run|apply)\s+(?:action\s+)?({number_token})",
+        rf"action\s+({number_token})",
+        rf"^({number_token})$",
     ]
     for pattern in patterns:
         match = re.search(pattern, raw, flags=re.IGNORECASE)
@@ -16228,7 +18016,7 @@ def _persist_successful_fix_case(
         )
         typer.echo(f"已写入长期记忆库：{store.path}")
     except Exception as exc:
-        typer.echo(f"长期记忆写入失败（已忽略）: {exc}")
+        typer.echo(f"长期记忆写入失败（已忽略）: {_safe_exception_text(exc)}")
 
 
 def _extract_markdown_section(text: str, section_name: str) -> str:
@@ -16359,6 +18147,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "install-doctor",
         "setup",
         "report",
+        "incident",
         "template",
         "runbook",
         "pack",
@@ -16429,6 +18218,7 @@ def _should_launch_default_tui(tokens: list[str]) -> bool:
         "install-doctor",
         "setup",
         "report",
+        "incident",
         "template",
         "runbook",
         "pack",
@@ -16498,6 +18288,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "install-doctor",
         "setup",
         "report",
+        "incident",
         "template",
         "runbook",
         "pack",

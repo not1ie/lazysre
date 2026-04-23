@@ -56,13 +56,23 @@ def _build_gemini_http_error(exc: httpx.HTTPStatusError) -> str:
     response = exc.response
     status = response.status_code if response is not None else "unknown"
     detail = _extract_gemini_error_detail(response)
+    detail_lower = str(detail).lower()
     hints: list[str] = []
     if status == 400:
-        hints.append("检查 API Key 是否有效、项目是否已启用 Gemini API、模型名是否可用。")
+        if "api key not valid" in detail_lower or "invalid api key" in detail_lower:
+            hints.append("API Key 无效或不属于当前项目，请在 AI Studio 重新生成并替换。")
+        elif "permission denied" in detail_lower or "not enabled" in detail_lower:
+            hints.append("当前项目可能未启用 Gemini API，请先在 GCP/AI Studio 打开 Gemini API。")
+        else:
+            hints.append("检查 API Key 是否有效、项目是否已启用 Gemini API、模型名是否可用。")
+        hints.append("可先切到 mock 保持流程可用：/provider mock")
     elif status in {401, 403}:
         hints.append("检查 API Key 权限、项目配额/计费与地域策略。")
+        hints.append("若启用了代理，请确认代理允许访问 generativelanguage.googleapis.com。")
     elif status == 429:
         hints.append("请求过于频繁或配额不足，稍后重试并检查配额。")
+    elif status in {500, 502, 503, 504}:
+        hints.append("Gemini 服务暂时不可用，建议稍后重试或临时切换到 mock。")
     hint_text = f" hint: {' '.join(hints)}" if hints else ""
     return f"Gemini API HTTP {status}: {detail}{hint_text}"
 
@@ -92,4 +102,7 @@ def _sanitize_secret_text(text: str) -> str:
     value = re.sub(r"AIza[0-9A-Za-z_-]{10,}", "AIza***REDACTED***", value)
     value = re.sub(r"([?&]key=)[^&\s]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
     value = re.sub(r"(\bkey=)[^\s,;]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"([?&]token=)[^&\s]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"(\btoken=)[^\s,;]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._-]{10,}", "Bearer ***REDACTED***", value)
     return value

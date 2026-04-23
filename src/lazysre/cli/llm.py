@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -84,19 +85,29 @@ class OpenAIResponsesLLM(FunctionCallingLLM):
         payload["max_output_tokens"] = 800
         if text_stream:
             payload["stream"] = True
-            return await _stream_openai_turn(
-                payload=payload,
-                headers=headers,
-                text_stream=text_stream,
-            )
+            try:
+                return await _stream_openai_turn(
+                    payload=payload,
+                    headers=headers,
+                    text_stream=text_stream,
+                )
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(_build_http_status_error(provider="OpenAI", exc=exc)) from exc
+            except httpx.HTTPError as exc:
+                raise RuntimeError(_build_provider_network_error(provider="OpenAI", exc=exc)) from exc
 
         async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/responses",
-                json=payload,
-                headers=headers,
-            )
-            resp.raise_for_status()
+            try:
+                resp = await client.post(
+                    "https://api.openai.com/v1/responses",
+                    json=payload,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(_build_http_status_error(provider="OpenAI", exc=exc)) from exc
+            except httpx.HTTPError as exc:
+                raise RuntimeError(_build_provider_network_error(provider="OpenAI", exc=exc)) from exc
             data = resp.json()
         return _parse_openai_turn(data)
 
@@ -155,12 +166,17 @@ class AnthropicMessagesLLM(FunctionCallingLLM):
             "content-type": "application/json",
         }
         async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                json=payload,
-                headers=headers,
-            )
-            resp.raise_for_status()
+            try:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    json=payload,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(_build_http_status_error(provider="Anthropic", exc=exc)) from exc
+            except httpx.HTTPError as exc:
+                raise RuntimeError(_build_provider_network_error(provider="Anthropic", exc=exc)) from exc
             data = resp.json()
 
         self._messages = messages + [{"role": "assistant", "content": data.get("content", [])}]
@@ -228,12 +244,17 @@ class GeminiFunctionCallingLLM(FunctionCallingLLM):
             payload["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
 
         async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{resolved_model}:generateContent",
-                params={"key": self._api_key},
-                json=payload,
-            )
-            resp.raise_for_status()
+            try:
+                resp = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{resolved_model}:generateContent",
+                    params={"key": self._api_key},
+                    json=payload,
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(_build_gemini_http_error(exc)) from exc
+            except httpx.HTTPError as exc:
+                raise RuntimeError(_build_provider_network_error(provider="Gemini", exc=exc)) from exc
             data = resp.json()
 
         candidate_content = _extract_gemini_candidate_content(data)
@@ -312,12 +333,17 @@ class OpenAICompatibleFunctionCallingLLM(FunctionCallingLLM):
             "Content-Type": "application/json",
         }
         async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                f"{self._base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-            )
-            resp.raise_for_status()
+            try:
+                resp = await client.post(
+                    f"{self._base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(_build_http_status_error(provider=self._provider, exc=exc)) from exc
+            except httpx.HTTPError as exc:
+                raise RuntimeError(_build_provider_network_error(provider=self._provider, exc=exc)) from exc
             data = resp.json()
 
         turn = _parse_openai_compatible_turn(data, provider=self._provider)
@@ -714,6 +740,118 @@ def _normalize_gemini_tool_response(output: str) -> dict[str, Any]:
     if isinstance(parsed, list):
         return {"items": parsed}
     return {"result": output}
+
+
+def _build_gemini_http_error(exc: httpx.HTTPStatusError) -> str:
+    response = exc.response
+    status = response.status_code if response is not None else "unknown"
+    detail = _extract_gemini_error_detail(response)
+    detail_lower = str(detail).lower()
+    hints: list[str] = []
+    if status == 400:
+        if "api key not valid" in detail_lower or "invalid api key" in detail_lower:
+            hints.append("API Key 无效或不属于当前项目，请在 AI Studio 重新生成并替换。")
+        elif "permission denied" in detail_lower or "not enabled" in detail_lower:
+            hints.append("当前项目可能未启用 Gemini API，请先在 GCP/AI Studio 打开 Gemini API。")
+        else:
+            hints.append("检查 API Key、Gemini API 开关、模型名与请求格式。")
+        hints.append("可先切到 mock 保持流程可用：/provider mock")
+    elif status in {401, 403}:
+        hints.append("检查 API Key 权限、项目配额/计费、IP 限制和区域策略。")
+        hints.append("若启用了代理，请确认代理允许访问 generativelanguage.googleapis.com。")
+    elif status == 429:
+        hints.append("请求过于频繁或配额不足，稍后重试。")
+    elif status in {500, 502, 503, 504}:
+        hints.append("Gemini 服务暂时不可用，建议稍后重试或临时切换到 mock。")
+    hint_text = f" hint: {' '.join(hints)}" if hints else ""
+    return f"Gemini API HTTP {status}: {detail}{hint_text}"
+
+
+def _build_http_status_error(*, provider: str, exc: httpx.HTTPStatusError) -> str:
+    response = exc.response
+    status = response.status_code if response is not None else "unknown"
+    detail = _extract_http_error_detail(response)
+    provider_label = str(provider or "provider").strip()
+    hints: list[str] = []
+    if status in {400, 422}:
+        hints.append("检查模型名、请求参数与 provider 配置是否匹配。")
+    elif status in {401, 403}:
+        hints.append("检查 API Key 权限、配额/计费与访问策略。")
+    elif status == 404:
+        hints.append("检查 base_url、路由路径与模型是否存在。")
+    elif status == 429:
+        hints.append("请求过于频繁或额度不足，请稍后重试。")
+    elif status in {500, 502, 503, 504}:
+        hints.append("上游服务暂不可用，请稍后重试或切换 provider。")
+    hint_text = f" hint: {' '.join(hints)}" if hints else ""
+    return f"{provider_label} API HTTP {status}: {detail}{hint_text}"
+
+
+def _extract_http_error_detail(response: httpx.Response | None) -> str:
+    if response is None:
+        return "unknown error"
+    try:
+        payload = response.json()
+    except Exception:
+        return _sanitize_secret_text(response.text.strip() or "unknown error")[:300]
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            for key in ("message", "detail", "error"):
+                text = str(error.get(key, "")).strip()
+                if text:
+                    return _sanitize_secret_text(text)[:300]
+        for key in ("message", "detail", "error"):
+            text = str(payload.get(key, "")).strip()
+            if text:
+                return _sanitize_secret_text(text)[:300]
+    return _sanitize_secret_text(response.text.strip() or "unknown error")[:300]
+
+
+def _build_provider_network_error(*, provider: str, exc: Exception) -> str:
+    detail = _sanitize_secret_text(str(exc).strip() or exc.__class__.__name__)
+    provider_label = str(provider or "provider").strip()
+    detail_lower = detail.lower()
+    hints: list[str] = []
+    if "socksio" in detail_lower and "proxy" in detail_lower:
+        hints.append("检测到 SOCKS 代理但缺少依赖，执行 `python3 -m pip install \"httpx[socks]\"`。")
+    elif any(token in detail_lower for token in ("name or service not known", "dns", "temporary failure", "timed out", "timeout")):
+        hints.append("检查网络连通性、DNS 与代理配置。")
+    hint_text = f" hint: {' '.join(hints)}" if hints else ""
+    return f"{provider_label} network error: {detail}{hint_text}"
+
+
+def _extract_gemini_error_detail(response: httpx.Response | None) -> str:
+    if response is None:
+        return "unknown error"
+    try:
+        payload = response.json()
+    except Exception:
+        raw = response.text.strip() or "unknown error"
+        return _sanitize_secret_text(raw)[:300]
+    if isinstance(payload, dict):
+        error = payload.get("error", {})
+        if isinstance(error, dict):
+            message = str(error.get("message", "")).strip()
+            if message:
+                return _sanitize_secret_text(message)
+        message = str(payload.get("message", "")).strip()
+        if message:
+            return _sanitize_secret_text(message)
+    return _sanitize_secret_text(response.text.strip() or "unknown error")[:300]
+
+
+def _sanitize_secret_text(text: str) -> str:
+    value = str(text or "")
+    value = re.sub(r"AIza[0-9A-Za-z_-]{10,}", "AIza***REDACTED***", value)
+    value = re.sub(r"([?&]key=)[^&\s]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"(\bkey=)[^\s,;]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"([?&]token=)[^&\s]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"(\btoken=)[^\s,;]+", r"\1***REDACTED***", value, flags=re.IGNORECASE)
+    value = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._-]{10,}", "Bearer ***REDACTED***", value)
+    value = re.sub(r"(?i)\b(x-api-key|api-key|apikey)\b\s*[:=]\s*([^\s,;]+)", r"\1=***REDACTED***", value)
+    value = re.sub(r"(://)([^/@:\s]+):([^/@\s]+)@", r"\1***:***@", value)
+    return value
 
 
 def _new_response_id(prefix: str) -> str:

@@ -3,7 +3,7 @@
 LazySRE 是一个纯 AI 驱动的 SRE/运维 CLI 工具。  
 目标是让你用自然语言驱动排障、诊断、修复与回滚，而不是手工拼接一堆命令。
 
-## 给其他用户的 1 分钟上手
+## 1 分钟上手
 
 ```bash
 # 1) 安装（跨平台：Windows/macOS/Linux）
@@ -31,7 +31,20 @@ TUI 内常用命令：
 - `/scan`：自动探测本机环境（Docker/Swarm/K8s/Prometheus）
 - `/brief`：生成现场总览
 - `/next`：执行系统推荐的下一步
+- `/retry`：重试上一条输入
+- `/history`：查看并重放最近输入（默认展示最近 12 条，支持 `/history 关键字` 筛选）
 - `/providers`：查看模型配置状态
+- `/doctor`：运行运行环境体检（支持 `/doctor strict`、`/doctor install`）
+- `/secret-scan`：快速检查当前工作区是否存在疑似密钥泄漏（输出脱敏）
+- `chat` 模式支持终端方向键历史输入（readline），并默认跳过敏感内容入历史
+- 口语快捷：直接输入 `继续` / `重试` / `历史` / `帮助` / `扫描` / `简报` 也会自动映射到对应命令
+- 口语快捷：`体检`、`安装检查`、`密钥检查`、`泄漏检查` 也可直接触发 `/doctor` 或 `/secret-scan`
+- 无斜杠命令：`do 1` / `go 2` / `history 第二条` / `provider gemini` / `ui expert` / `help full` 也可直接识别
+- 错拼容错：`provders`、`pannel next`、`quikstart` 等常见拼写错误会自动纠正
+- 数字快捷：直接输入 `1/2/3...`，若存在对应动作会执行 `/do n`；否则 `1-4` 走 `/go n`
+- 直接输入序号也支持容错：`①/#1/no.2/第1步` 会按快捷动作解析
+- 序号容错：`/do`、`/go`、`/history` 支持 `第1步/第一步/③/#1/no.2` 等写法
+- 首屏输入框留空时直接按 Enter：自动执行当前建议下一步（新手一键启动）
 
 ## 怎么确认拿到最新 Node 版本
 
@@ -51,17 +64,34 @@ lazysre --version
 检查并清理异常代理变量 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 后重试。
 - 启动后 provider 不可用：
 先用 `--provider mock` 体验完整流程，再执行 `lazysre login --provider <openai|anthropic|gemini|deepseek|qwen|kimi>` 配置真实 key。
+- 真实 provider 临时不可用：
+`lazysre/lsre` 会自动降级到 `mock` 保证流程可继续；如需禁用自动降级，可设置 `LAZYSRE_DISABLE_MOCK_FALLBACK=1`。
 - 终端不支持全屏：
 可用 `lazysre tui --demo` 查看文本预览，或直接 `lsre chat`。
+- 担心误提交密钥：
+运行 `lazysre install-doctor` 或 `lazysre doctor`，会附带 `workspace_secret_scan` 预检（输出脱敏）。
 
 ## 封版状态（v0.1.2）
 
 - 默认 `lazysre`/`lsre` 进入全屏 TUI，可直接自然语言交互
-- TUI 支持 `Tab` 补全、`↑/↓` 历史、`Shift+N/T/U` 快捷闭环（`/next`、`/trace`、`/undo`）
+- TUI 支持 `Tab` 补全、`↑/↓` 历史（输入前缀时自动筛选匹配项）、`Shift+N/T/U/R` 快捷闭环（`/next`、`/trace`、`/undo`、`/retry`）
+- TUI 输入编辑增强：支持 `Ctrl-A/E`（行首/行尾）、`Ctrl-U/K`（删左/删右）、`Ctrl-W`（删前一个词）
+- 方向键兼容增强：当终端把 `↑/↓/←/→` 当普通字符输入时，也会自动映射为历史/光标操作
+- 兼容更多终端方向键序列（含 `ESC[1;5A` 等修饰键形式），减少“方向键无响应”情况
+- TUI 输入历史持久化：重启后 `↑/↓` 仍可回看最近输入（自动脱敏）
+- TUI `simple` 模式会自动把长输出压缩为结果卡片（状态/结论/命令/下一步），降低新手阅读成本
+- `/help` 在 TUI 中输出精简“Quick Help”，`/help full` 可回到完整说明（F1/? 仍可看完整帮助）
+- TUI 会记住上次的 `panel/ui` 模式，重启后自动恢复到你上一次的操作视图
+- slash 命令容错增强：未知命令会直接提示最可能的正确命令（不再误触发模型调用）
 - 执行阶段加入运行中进度动画，避免“无响应”感知
 - Provider 就绪判断与当前 active provider 对齐，`mock` 明确标记为可用
+- 真实 provider 失败时自动降级到 `mock`，并保留脱敏错误原因（TUI/chat 会话都会自动切到 mock，避免重复降级打断）
+- chat 模式支持跨会话历史预热，`/history` 与 `/retry` 重启后仍可用
 - 输入/输出链路补充敏感信息脱敏（key/token/password）
-- 当前封版基线测试：`239 passed`
+- Provider 错误提示增强：Gemini/OpenAI/Anthropic/兼容网关异常会输出脱敏且可执行的修复建议
+- install-doctor 增加代理环境预检（自动识别 SOCKS 代理并提示 `httpx[socks]`）
+- install-doctor / doctor 增加工作区密钥泄漏预检（workspace_secret_scan，输出脱敏文件:行号）
+- 当前封版基线测试：`330 passed`
 
 ## 安装方式（开箱即用）
 
@@ -81,7 +111,7 @@ lazysre
 # 首次启动会自动生成只读 LazySRE Brief，并给出下一步命令
 lazysre tui
 lazysre tui --demo
-# TUI 内支持 Tab 自动补全、Up/Down 历史、Ctrl-L 清屏、F2/1-4 面板切换、/refresh 刷新总览、/providers 查看模型配置，并显示左侧面板标签条、面板上下文提示、Action Bar、最近活动时间线、阶段化 Trace Summary、执行时间线、建议动作、命令轨迹和底部状态栏
+# TUI 内支持 Tab 自动补全、Up/Down 历史、Shift+N/T/U/R 快捷动作、空输入 Enter 自动下一步、/history 历史重放、Ctrl-L 清屏、F2/1-4 面板切换、/refresh 刷新总览、/providers 查看模型配置，并显示左侧面板标签条、面板上下文提示、Action Bar、最近活动时间线、阶段化 Trace Summary、执行时间线、建议动作、命令轨迹和底部状态栏
 # 兼容短命令
 lsre
 # 或 python 模块方式
@@ -178,22 +208,6 @@ lazysre login --provider compatible \
 lazysre --provider compatible
 ```
 
-## npm 发布（维护者）
-
-```bash
-# 1) 首次先跑发布前检查（Node/npm、pack、npm auth、NPM_TOKEN 等）
-./scripts/check_npm_release.sh
-
-# 2) 配置仓库 Secret: NPM_TOKEN
-# 3) 本地执行发版脚本（会先做 preflight，然后更新 package.json、打 tag、推送）
-./scripts/release_npm.sh 0.1.2
-```
-
-发布机制：
-- GitHub Actions 监听 tag `npm-v*`
-- 自动校验 tag 与 `package.json` 版本一致
-- 自动执行 `npm publish --access public`
-
 ## 项目介绍
 
 项目主命令是 `lsre`，围绕“观察 -> 推理 -> 执行 -> 回滚”闭环设计：
@@ -229,7 +243,7 @@ lsre "检查 k8s pod 状态"
 lsre tui
 lsre remediate "修复当前巡检发现的问题"
 # chat 快捷命令
-# /help /activity /focus /do [n] /trace /timeline /panel [overview|activity|timeline|providers|next|1-4] /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /providers /provider <name> /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /remediate /tui /doctor [/doctor fix] [/doctor strict]
+# /help /activity /focus /do [n] /trace /timeline /panel [overview|activity|timeline|providers|next|1-4] /go [1-4] /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /providers /provider <name> /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /remediate /tui /doctor [/doctor fix] [/doctor strict]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
