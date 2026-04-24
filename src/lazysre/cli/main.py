@@ -5906,6 +5906,8 @@ def _scenario_command(name: str) -> str:
             "printf '## database\\n'; found=0; "
             "for bin in mysql psql redis-cli mongosh mongo; do command -v $bin >/dev/null 2>&1 && { echo bin:$bin; found=1; }; done; "
             "for svc in mysql mysqld mariadb postgresql redis redis-server mongod; do systemctl is-active $svc 2>/dev/null | sed \"s#^#$svc:#\" || true; done; "
+            "docker_out=$(command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}} {{.Image}} {{.Status}}' 2>/dev/null | grep -Ei 'mysql|postgres|redis|mongo|mariadb' | head -n 12 || true); "
+            "[ -n \"$docker_out\" ] && { echo \"$docker_out\" | sed 's#^#docker:#'; found=1; }; "
             "[ \"$found\" = 1 ] || echo LAZYSRE_NOT_INSTALLED"
         ),
         "gpu": (
@@ -5916,13 +5918,18 @@ def _scenario_command(name: str) -> str:
         "ai": (
             "printf '## ai\\n'; found=0; "
             "for bin in ollama vllm ray tritonserver xinference; do command -v $bin >/dev/null 2>&1 && { echo bin:$bin; found=1; }; done; "
-            "ps -eo pid,comm,args 2>/dev/null | grep -Ei 'ollama|vllm|triton|xinference|text-generation|llama|ray' | grep -v grep | head -n 12 || true; "
+            "proc_out=$(ps -eo pid,comm,args 2>/dev/null | grep -Ei 'ollama|vllm|triton|xinference|text-generation|llama|ray' | grep -v grep | head -n 12 || true); "
+            "[ -n \"$proc_out\" ] && { echo \"$proc_out\" | sed 's#^#process:#'; found=1; }; "
+            "docker_out=$(command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}} {{.Image}} {{.Status}}' 2>/dev/null | grep -Ei 'ollama|vllm|triton|xinference|llama|ray|text-generation' | head -n 12 || true); "
+            "[ -n \"$docker_out\" ] && { echo \"$docker_out\" | sed 's#^#docker:#'; found=1; }; "
             "[ \"$found\" = 1 ] || echo LAZYSRE_NOT_INSTALLED"
         ),
         "cicd": (
             "printf '## cicd\\n'; found=0; "
             "for bin in gitlab-runner jenkins java docker; do command -v $bin >/dev/null 2>&1 && { echo bin:$bin; found=1; }; done; "
             "for svc in gitlab-runner jenkins actions.runner; do systemctl is-active $svc 2>/dev/null | sed \"s#^#$svc:#\" || true; done; "
+            "docker_out=$(command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}} {{.Image}} {{.Status}}' 2>/dev/null | grep -Ei 'gitlab-runner|jenkins|actions-runner|runner' | head -n 12 || true); "
+            "[ -n \"$docker_out\" ] && { echo \"$docker_out\" | sed 's#^#docker:#'; found=1; }; "
             "[ \"$found\" = 1 ] || echo LAZYSRE_NOT_INSTALLED"
         ),
     }
@@ -6059,16 +6066,51 @@ def _classify_remote_scenario_report(*, name: str, stdout: str, stderr: str, sev
             "signals": [],
         }
     if name in {"database", "ai", "cicd"}:
-        detected = any(line.startswith("bin:") for line in _non_empty_lines(text)) or bool(
-            [line for line in _non_empty_lines(text) if re.search(r"\b(active|running)\b", line, flags=re.IGNORECASE)]
-        )
+        lines = _non_empty_lines(text)
+        bin_lines = [line for line in lines if line.startswith("bin:")]
+        runtime_lines = [
+            line
+            for line in lines
+            if line.startswith("process:")
+            or line.startswith("docker:")
+            or re.search(r":(active|running)\b", line, flags=re.IGNORECASE)
+        ]
+        bad_lines = [
+            line
+            for line in lines
+            if re.search(r"\b(failed|exited|restarting|unhealthy|dead)\b", line, flags=re.IGNORECASE)
+        ]
         label = {"database": "数据库", "ai": "AI/LLM 服务", "cicd": "CI/CD Runner"}.get(name, name)
+        if bad_lines:
+            return {
+                "severity": "warn",
+                "status": "service_unhealthy",
+                "headline": f"{label} 存在失败、退出或不健康信号。",
+                "summary": _preview_lines(lines, limit=5),
+                "signals": bad_lines[:4],
+            }
+        if runtime_lines:
+            return {
+                "severity": "pass",
+                "status": "running",
+                "headline": f"{label} 已检测到运行中实例。",
+                "summary": _preview_lines(lines, limit=5),
+                "signals": (runtime_lines + bin_lines)[:4],
+            }
+        if bin_lines:
+            return {
+                "severity": "info",
+                "status": "installed_not_running",
+                "headline": f"{label} 仅检测到客户端或二进制，未发现运行中服务。",
+                "summary": _preview_lines(lines, limit=5),
+                "signals": bin_lines[:4],
+            }
         return {
-            "severity": "pass" if detected else "info",
-            "status": "detected" if detected else "not_detected",
-            "headline": f"{label} {'已检测到' if detected else '未检测到明显运行信号'}。",
-            "summary": _preview_lines(_non_empty_lines(text), limit=5) or "not detected",
-            "signals": [line for line in _non_empty_lines(text) if line.startswith("bin:")][:4],
+            "severity": "info",
+            "status": "not_detected",
+            "headline": f"{label} 未检测到明显运行信号。",
+            "summary": _preview_lines(lines, limit=5) or "not detected",
+            "signals": [],
         }
     return {
         "severity": severity,

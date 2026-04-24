@@ -4680,6 +4680,34 @@ def test_remote_report_markdown_includes_scenario_findings() -> None:
     assert "Next: `lazysre remote root@192.168.10.101 --scenario linux --json`" in markdown
 
 
+def test_remote_scenario_classifier_detects_runtime_and_unhealthy_services() -> None:
+    db_running = cli_main._classify_remote_scenario_report(
+        name="database",
+        stdout="## database\nbin:mysql\ndocker:mysql mysql:8 Up 2 hours",
+        stderr="",
+        severity="pass",
+    )
+    ai_unhealthy = cli_main._classify_remote_scenario_report(
+        name="ai",
+        stdout="## ai\ndocker:vllm vllm:latest Restarting (1) 10 seconds ago",
+        stderr="",
+        severity="pass",
+    )
+    cicd_installed = cli_main._classify_remote_scenario_report(
+        name="cicd",
+        stdout="## cicd\nbin:gitlab-runner",
+        stderr="",
+        severity="pass",
+    )
+
+    assert db_running["severity"] == "pass"
+    assert db_running["status"] == "running"
+    assert ai_unhealthy["severity"] == "warn"
+    assert ai_unhealthy["status"] == "service_unhealthy"
+    assert cicd_installed["severity"] == "info"
+    assert cicd_installed["status"] == "installed_not_running"
+
+
 def test_extract_remote_scenarios_from_text_and_all_alias() -> None:
     assert cli_main._extract_remote_scenarios_from_text("远程检查 nginx gpu root@1.1.1.1") == ["nginx", "gpu"]
     assert cli_main._normalize_remote_scenarios(["all"]) == ["linux", "nginx", "database", "gpu", "ai", "cicd"]
