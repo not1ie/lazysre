@@ -4711,6 +4711,23 @@ def test_remote_scenario_classifier_detects_runtime_and_unhealthy_services() -> 
 def test_extract_remote_scenarios_from_text_and_all_alias() -> None:
     assert cli_main._extract_remote_scenarios_from_text("远程检查 nginx gpu root@1.1.1.1") == ["nginx", "gpu"]
     assert cli_main._normalize_remote_scenarios(["all"]) == ["linux", "nginx", "database", "gpu", "ai", "cicd"]
+    assert cli_main._infer_remote_scenarios_from_text("全量巡检远程服务器") == [
+        "linux",
+        "nginx",
+        "database",
+        "gpu",
+        "ai",
+        "cicd",
+    ]
+    assert cli_main._infer_remote_scenarios_from_text("检查远程服务器健康", default_all=True) == [
+        "linux",
+        "nginx",
+        "database",
+        "gpu",
+        "ai",
+        "cicd",
+    ]
+    assert cli_main._infer_remote_scenarios_from_text("检查 nginx 和 gpu", default_all=True) == ["nginx", "gpu"]
 
 
 def test_remote_scenario_intent_uses_saved_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4721,6 +4738,43 @@ def test_remote_scenario_intent_uses_saved_target(tmp_path: Path, monkeypatch: p
         target_file.write_text(json.dumps({"ssh_target": "root@192.168.10.101"}, ensure_ascii=False), encoding="utf-8")
         assert _looks_like_remote_diagnose_request("检查 nginx 配置")
         assert _looks_like_remote_diagnose_request("看看 gpu 和 ai 服务")
+    finally:
+        settings.target_profile_file = old_profile
+
+
+def test_tui_natural_remote_diagnose_defaults_to_all_scenarios(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_file = tmp_path / "target.json"
+    old_profile = settings.target_profile_file
+    calls: list[dict[str, object]] = []
+
+    def fake_collect(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {
+            "target": kwargs.get("target", ""),
+            "ok": True,
+            "summary": {"pass": 1, "warn": 0, "error": 0},
+            "briefing": {},
+            "checks": [],
+            "unhealthy_services": [],
+            "bad_nodes": [],
+            "root_causes": [],
+            "scenario_reports": [],
+            "recommendations": [],
+        }
+
+    try:
+        settings.target_profile_file = str(target_file)
+        target_file.write_text(json.dumps({"ssh_target": "root@192.168.10.101"}, ensure_ascii=False), encoding="utf-8")
+        monkeypatch.setattr(cli_main, "_collect_remote_docker_report", fake_collect)
+
+        _handle_tui_input("检查远程服务器健康", {"execute": False})
+
+        assert calls
+        assert calls[0]["target"] == "root@192.168.10.101"
+        assert calls[0]["scenarios"] == ["linux", "nginx", "database", "gpu", "ai", "cicd"]
     finally:
         settings.target_profile_file = old_profile
 

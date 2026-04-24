@@ -5825,6 +5825,9 @@ def _remote_report_check(report: dict[str, object], name: str) -> dict[str, obje
     return {}
 
 
+_REMOTE_ALL_SCENARIOS = ["linux", "nginx", "database", "gpu", "ai", "cicd"]
+
+
 _REMOTE_SCENARIO_ALIASES = {
     "linux": "linux",
     "host": "linux",
@@ -5867,7 +5870,7 @@ def _normalize_remote_scenarios(values: list[str]) -> list[str]:
                 continue
             normalized = _REMOTE_SCENARIO_ALIASES.get(item, item)
             if normalized == "all":
-                selected.extend(["linux", "nginx", "database", "gpu", "ai", "cicd"])
+                selected.extend(_REMOTE_ALL_SCENARIOS)
             elif normalized in {"linux", "nginx", "database", "gpu", "ai", "cicd"}:
                 selected.append(normalized)
     return _dedupe_strings(selected)
@@ -5883,6 +5886,35 @@ def _extract_remote_scenarios_from_text(text: str) -> list[str]:
         if key and key in lowered:
             values.append(key)
     return _normalize_remote_scenarios(values)
+
+
+def _infer_remote_scenarios_from_text(text: str, *, default_all: bool = False) -> list[str]:
+    explicit = _extract_remote_scenarios_from_text(text)
+    if explicit:
+        return explicit
+    lowered = str(text or "").lower()
+    if any(k in lowered for k in ("全量", "全部", "所有", "完整", "全面", "all", "full", "everything")):
+        return list(_REMOTE_ALL_SCENARIOS)
+    broad_words = (
+        "服务器",
+        "远程",
+        "主机",
+        "环境",
+        "巡检",
+        "体检",
+        "健康",
+        "问题",
+        "异常",
+        "检查",
+        "诊断",
+        "排查",
+        "scan",
+        "diagnose",
+        "check",
+    )
+    if default_all and any(k in lowered for k in broad_words):
+        return list(_REMOTE_ALL_SCENARIOS)
+    return []
 
 
 def _scenario_command(name: str) -> str:
@@ -7270,7 +7302,7 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
         report = _collect_remote_docker_report(
             target=target,
             service_filter=service,
-            scenarios=scenarios or _extract_remote_scenarios_from_text(tail_text),
+            scenarios=scenarios or _infer_remote_scenarios_from_text(tail_text),
             include_logs=include_logs,
             tail=tail,
             timeout_sec=8,
@@ -14117,7 +14149,7 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
                 _collect_remote_docker_report(
                     target=target,
                     service_filter=_extract_swarm_service_name(service_text),
-                    scenarios=_extract_remote_scenarios_from_text(tail),
+                    scenarios=_infer_remote_scenarios_from_text(tail),
                     include_logs="--logs" in lowered or "日志" in normalized,
                     tail=120,
                     timeout_sec=8,
@@ -14161,6 +14193,23 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
                     auto_approve_low_risk=True,
                     model=str(options.get("model", settings.model_name)),
                     provider=str(options.get("provider", "auto")),
+                )
+            )
+        )
+    if _looks_like_remote_diagnose_request(normalized):
+        target = _resolve_ssh_target_arg(_extract_ssh_target_from_text(normalized))
+        if not target:
+            return "请提供 SSH target，例如：检查远程服务器 root@192.168.10.101；或先 /connect <user>@<host>"
+        service_text = normalized.replace(target, " ")
+        return _capture_plain_output(
+            lambda: _render_remote_docker_report(
+                _collect_remote_docker_report(
+                    target=target,
+                    service_filter=_extract_swarm_service_name(service_text),
+                    scenarios=_infer_remote_scenarios_from_text(normalized, default_all=True),
+                    include_logs="--logs" in lowered or "日志" in normalized,
+                    tail=120,
+                    timeout_sec=8,
                 )
             )
         )
@@ -15004,7 +15053,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             report = _collect_remote_docker_report(
                 target=target,
                 service_filter=_extract_swarm_service_name(service_text),
-                scenarios=_extract_remote_scenarios_from_text(tail),
+                scenarios=_infer_remote_scenarios_from_text(tail),
                 include_logs="--logs" in tail.lower() or "日志" in tail,
                 tail=120,
                 timeout_sec=8,
@@ -15674,7 +15723,7 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
         report = _collect_remote_docker_report(
             target=target,
             service_filter=_extract_swarm_service_name(service_text),
-            scenarios=_extract_remote_scenarios_from_text(text),
+            scenarios=_infer_remote_scenarios_from_text(text, default_all=True),
             include_logs=any(k in lowered for k in ("日志", "logs")),
             tail=120,
             timeout_sec=8,

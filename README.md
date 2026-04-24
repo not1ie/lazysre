@@ -51,6 +51,7 @@ lazysre --provider mock
 进入后直接输入自然语言即可，例如：
 - `检查当前环境有什么异常`
 - `列出 Docker Swarm 不健康的 service`
+- `检查远程服务器健康`（已保存 SSH 目标时，会自动只读巡检 Linux/Nginx/数据库/GPU/AI/CI/CD）
 - `为什么最近请求变慢了`
 
 TUI 内常用命令：
@@ -172,6 +173,8 @@ lazysre remote root@192.168.10.101 --logs
 # 远程场景 Pack：Linux/Nginx/数据库/GPU/AI/CI/CD，只读采集证据，并给出分级结论和下一步
 lazysre remote root@192.168.10.101 --scenario linux --scenario nginx
 lazysre remote root@192.168.10.101 --scenario all --json
+# 保存默认远程目标后，也可以直接自然语言触发全场景只读巡检
+lazysre "检查远程服务器健康"
 # 首次连接体检：SSH 连通后自动保存默认远程目标
 lazysre connect root@192.168.10.101
 # 输出包含 AI Briefing：连通性、Docker/Swarm 状态、关键证据和下一步命令
