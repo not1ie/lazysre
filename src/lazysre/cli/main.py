@@ -9443,7 +9443,7 @@ def _apply_saved_tui_runtime_state(options: dict[str, object]) -> None:
     ui_mode = str(state.get("ui_mode", "")).strip()
     if panel:
         options["tui_panel"] = panel
-    if ui_mode:
+    if ui_mode and os.environ.get("LAZYSRE_TUI_RESTORE_UI", "").strip().lower() in {"1", "true", "yes"}:
         options["tui_ui_mode"] = ui_mode
 
 
@@ -10718,7 +10718,67 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     }
 
 
+def _render_tui_simple_demo_text(snapshot: dict[str, object]) -> str:
+    shortcuts = snapshot.get("shortcuts", [])
+    if not isinstance(shortcuts, list):
+        shortcuts = []
+    configured_providers = snapshot.get("configured_providers", [])
+    if not isinstance(configured_providers, list):
+        configured_providers = []
+    usable_targets = snapshot.get("usable_targets", [])
+    if not isinstance(usable_targets, list):
+        usable_targets = []
+    coach = _build_tui_start_coach(snapshot)
+    state_card = _build_tui_state_card(snapshot)
+    boot_actions = _build_tui_boot_actions(snapshot)
+    prompts = _build_tui_starter_prompts(snapshot)[:3]
+    swarm_posture = snapshot.get("swarm_posture", {})
+    if not isinstance(swarm_posture, dict):
+        swarm_posture = {}
+    incident_session = snapshot.get("incident_session", {})
+    if not isinstance(incident_session, dict):
+        incident_session = {}
+    environment_drift = snapshot.get("environment_drift", {})
+    if not isinstance(environment_drift, dict):
+        environment_drift = {}
+    ssh_target = str(snapshot.get("ssh_target", "") or "").strip()
+    focus_title = str(snapshot.get("focus_title", "Focus")).strip() or "Focus"
+    focus_body = str(snapshot.get("focus_body", "")).strip()
+    next_line = str(state_card.get("next", coach.get("primary", "/next"))).strip() or "/next"
+    shortcut_line = " · ".join(str(item) for item in shortcuts[:12] if str(item).strip())
+    lines = [
+        "╭─ LazySRE Console ───────────────────────────────────────────────╮",
+        "│ ◉ LazySRE                                                       │",
+        "│ AI Operations Console                                           │",
+        "│ 本机是控制台，远程服务器是目标；默认只读，变更需确认。          │",
+        "├─ Overview ──────────────────────────────────────────────────────┤",
+        f"│ {coach.get('phase_label', '-')} · {coach.get('headline', '-')}",
+        f"│ Mode      {snapshot.get('mode', '-')}",
+        f"│ Provider  {snapshot.get('active_provider', snapshot.get('provider', '-'))}",
+        f"│ Target {ssh_target or '未连接'}",
+        f"│ Next  {next_line}",
+        "├─ Next Actions ──────────────────────────────────────────────────┤",
+        *[f"│ {item}" for item in boot_actions[:4]],
+        "├─ Signals ───────────────────────────────────────────────────────┤",
+        f"│ {focus_title}: {focus_body or state_card.get('focus', '-')}",
+        *([f"│ Swarm Posture: {swarm_posture.get('headline', '')}"] if str(swarm_posture.get("headline", "")).strip() else []),
+        *[f"│ - {item}" for item in list(swarm_posture.get("signals", []))[:3]],
+        *([f"│ Incident Session: {incident_session.get('headline', '')}"] if bool(incident_session.get("exists")) and str(incident_session.get("headline", "")).strip() else []),
+        *([f"│ {incident_session.get('stage_flow', '')}"] if bool(incident_session.get("exists")) and str(incident_session.get("stage_flow", "")).strip() else []),
+        *([f"│ Environment Drift: {environment_drift.get('headline', '')}"] if str(environment_drift.get("status", "")).strip() in {"changed", "stale"} else []),
+        "├─ Ask ───────────────────────────────────────────────────────────┤",
+        *[f"│ {item}" for item in prompts],
+        "├─ Shortcuts ─────────────────────────────────────────────────────┤",
+        f"│ {shortcut_line}",
+        f"│ Tools {', '.join(str(x) for x in usable_targets) or '-'} · Providers {', '.join(str(x) for x in configured_providers) or '-'}",
+        "╰─────────────────────────────────────────────────────────────────╯",
+    ]
+    return "\n".join(lines)
+
+
 def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
+    if _normalize_tui_ui_mode(str(snapshot.get("ui_mode", "simple"))) == "simple":
+        return _render_tui_simple_demo_text(snapshot)
     shortcuts = snapshot.get("shortcuts", [])
     if not isinstance(shortcuts, list):
         shortcuts = []
@@ -11319,14 +11379,17 @@ def _draw_tui(
     stdscr.bkgd(" ", curses.A_NORMAL)
     stdscr.erase()
     ui_mode = _normalize_tui_ui_mode(str(snapshot.get("ui_mode", "simple")))
-    sidebar_w = min(max(30, width // 3), 44) if ui_mode == "simple" else min(max(28, width // 3), 46)
+    sidebar_w = min(max(24, width // 4), 34) if ui_mode == "simple" else min(max(28, width // 3), 46)
     logo = _build_tui_logo_lines(compact=True)[0]
     active_provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
     mode = str(snapshot.get("mode", "-")).strip() or "-"
-    title = (
-        f" {logo}    {status}    {mode} · {active_provider}    "
-        f"F1 Help   F2 Panels   F3 View   Tab Complete   Esc Quit "
-    )
+    if ui_mode == "simple":
+        title = f" {logo}  {status}  {mode}  {active_provider}    Enter Next   F1 Help   Esc Quit "
+    else:
+        title = (
+            f" {logo}    {status}    {mode} · {active_provider}    "
+            f"F1 Help   F2 Panels   F3 View   Tab Complete   Esc Quit "
+        )
     _tui_addnstr(stdscr, 0, 0, title.ljust(width), width - 1)
     for y in range(1, height - 2):
         if sidebar_w < width:
@@ -11411,46 +11474,42 @@ def _draw_tui_low_fidelity(
 def _build_tui_compact_sidebar_lines(snapshot: dict[str, object], *, width: int) -> list[str]:
     state_card = _build_tui_state_card(snapshot)
     coach = _build_tui_start_coach(snapshot)
-    boot_actions = _build_tui_boot_actions(snapshot)
     provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
     control_plane = str(snapshot.get("local_control_plane", "local")).strip() or "local"
     ssh_target = str(snapshot.get("ssh_target", "") or "").strip()
     targets = snapshot.get("usable_targets", [])
     target_list = [str(item).strip() for item in targets if str(item).strip()] if isinstance(targets, list) else []
-    focus = _truncate_tui_status_text(str(state_card.get("focus", "-")), max_chars=96)
-    next_step = _truncate_tui_status_text(str(state_card.get("next", "/do 1")), max_chars=96)
+    focus = _truncate_tui_status_text(str(state_card.get("focus", "-")), max_chars=52)
+    next_step = _truncate_tui_status_text(str(coach.get("primary", state_card.get("next", "/next"))), max_chars=44)
+    target_label = ssh_target or "未连接"
+    target_hint = "远程目标" if ssh_target else "先 /connect"
     lines: list[str] = [
         "◉ LazySRE",
-        "AI Operations",
+        "AI SRE Console",
         "",
-        "Focus",
-        focus,
+        "Status",
+        f"{str(coach.get('phase_label', '就绪'))}",
+        f"{focus}",
+        "",
+        "Target",
+        f"{target_label}",
+        f"{target_hint}",
         "",
         "Next",
         next_step,
         "",
-        "Guide",
-        str(coach.get("headline", "-")),
-        *[str(item) for item in list(coach.get("steps", []))[:2]],
-        "",
-        "Quick Start",
-        "直接输入自然语言",
-        *[f"- {item}" for item in boot_actions[:3]],
-        "Shift+N/T/U/R 快速闭环",
-        "F3 切换 simple/expert",
-        "",
-        "Runtime",
-        f"Control   {control_plane}",
-        f"Target    {ssh_target or 'remote not set'}",
-        f"Provider  {provider}",
-        f"Targets   {', '.join(target_list[:3]) if target_list else '-'}",
+        "System",
+        f"Control {control_plane}",
+        f"Provider {provider}",
+        f"Mode {snapshot.get('mode', '-')}",
+        f"Tools {', '.join(target_list[:2]) if target_list else '-'}",
     ]
     rows: list[str] = []
     for item in lines:
         if not item:
             rows.append("")
             continue
-        if item in {"Focus", "Next", "Guide", "Quick Start", "Runtime"}:
+        if item in {"Status", "Target", "Next", "System"}:
             rows.append(item)
             continue
         rows.extend(textwrap.wrap(item, width=max(10, width)) or [item])
@@ -11461,31 +11520,35 @@ def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) 
     state_card = _build_tui_state_card(snapshot)
     coach = _build_tui_start_coach(snapshot)
     boot_actions = _build_tui_boot_actions(snapshot)
-    prompts = _build_tui_starter_prompts(snapshot)[:4]
+    prompts = _build_tui_starter_prompts(snapshot)[:3]
+    ssh_target = str(snapshot.get("ssh_target", "") or "").strip()
+    target_line = f"目标  {ssh_target}" if ssh_target else "目标  未连接远程服务器"
+    safety = "默认只读。执行生产变更需要 --execute 和确认。"
     sections = [
-        "Overview",
-        f"当前  {state_card.get('focus', '-')}",
-        f"下一步  {state_card.get('next', '/do 1')}",
-        f"阶段  {coach.get('phase_label', '快速开始')}",
+        "LazySRE",
+        "AI SRE Console",
+        "本机是控制台，服务器才是目标。",
+        safety,
         "",
-        "One Minute Start",
-        *[f"- {item}" for item in boot_actions[:3]],
+        "Now",
+        f"{coach.get('headline', '-')}",
+        target_line,
         "",
-        "Keys",
-        "Shift+N  /next",
-        "Shift+T  /trace",
-        "Shift+U  /undo",
-        "Shift+R  /retry",
+        "Next Actions",
+        *[f"{item}" for item in boot_actions[:3]],
         "",
-        "Ask",
-        *[f"- {item}" for item in prompts],
+        "Ask Anything",
+        *[f"· {item}" for item in prompts],
+        "",
+        "Shortcuts",
+        "Enter 下一步   ↑ 历史   Tab 补全   F1 帮助",
     ]
     rows: list[str] = []
     for item in sections:
         if not item:
             rows.append("")
             continue
-        if item in {"Overview", "One Minute Start", "Keys", "Ask"}:
+        if item in {"LazySRE", "Now", "Next Actions", "Ask Anything", "Shortcuts"}:
             rows.append(item)
             continue
         rows.extend(textwrap.wrap(item, width=max(10, width)) or [item])
@@ -11493,34 +11556,29 @@ def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) 
 
 
 def _build_tui_compact_action_bar(snapshot: dict[str, object]) -> str:
-    next_hint = str(_build_tui_state_card(snapshot).get("next", "")).strip() or "/do 1"
-    return (
-        "Actions  Enter=Next · Number=Action · ↑/↓ History · Tab Complete · "
-        "Shift+N/T/U/R · F3切UI · /history · /doctor · /preflight · /secret-scan · /ui expert · "
-        f"{next_hint}"
-    )
+    next_hint = str(_build_tui_start_coach(snapshot).get("primary", "")).strip() or "/next"
+    return f"Enter {next_hint}   1-4 actions   ↑/↓ history   Tab complete   /help   /ui expert"
 
 
 def _build_tui_compact_hint_line(snapshot: dict[str, object]) -> str:
     coach = _build_tui_start_coach(snapshot)
     coach_hint = str(coach.get("hint", "")).strip()
     if coach_hint:
-        if len(coach_hint) > 96:
-            return coach_hint[:93] + "..."
+        if len(coach_hint) > 82:
+            return coach_hint[:79] + "..."
         return coach_hint
     hint = _build_tui_status_hint_line(snapshot)
-    if len(hint) > 96:
-        return hint[:93] + "..."
+    if len(hint) > 82:
+        return hint[:79] + "..."
     return hint
 
 
 def _build_tui_compact_footer_line(*, snapshot: dict[str, object], status: str) -> str:
-    targets = snapshot.get("usable_targets", [])
-    target_count = len(targets) if isinstance(targets, list) else 0
     provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
     mode = str(snapshot.get("mode", "-")).strip() or "-"
-    ui_mode = _normalize_tui_ui_mode(str(snapshot.get("ui_mode", "simple")))
-    return f"{status} · {mode} · provider={provider} · targets={target_count} · ui={ui_mode} · /next"
+    ssh_target = str(snapshot.get("ssh_target", "") or "").strip()
+    target = ssh_target or "no remote target"
+    return f"{status} · {mode} · {provider} · {target}"
 
 
 def _build_tui_start_coach(snapshot: dict[str, object]) -> dict[str, object]:

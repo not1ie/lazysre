@@ -1001,28 +1001,16 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "◉ LazySRE" in rendered
     assert "AI Operations Console" in rendered
     assert "Provider  mock" in rendered
-    assert "/remediate <目标>" in rendered
-    assert "/swarm --logs" in rendered
-    assert "/refresh" in rendered
-    assert "/providers" in rendered
-    assert "/activity" in rendered
-    assert "/focus" in rendered
-    assert "/do 1" in rendered
+    assert "/connect <user>@<host>" in rendered
+    assert "/remote --logs" in rendered
+    assert "/scan" in rendered
     assert "/trace" in rendered
     assert "/timeline" in rendered
-    assert "/panel next" in rendered
-    assert "Focus" in rendered
-    assert "Focus" in rendered
-    assert "Quick Actions" in rendered
-    assert "Recent Activity" in rendered
-    assert "Command Trail" in rendered
-    assert "Trace Summary" in rendered
-    assert "Panel    overview" in rendered
-    assert "Hint" in rendered
-    assert "Actions" in rendered
-    assert "Up/Down 浏览历史" in rendered
-    assert "F1/? 帮助" in rendered
-    assert "Starter Prompts" in rendered
+    assert "Signals" in rendered
+    assert "Next Actions" in rendered
+    assert "Shortcuts" in rendered
+    assert "Ask" in rendered
+    assert "默认只读" in rendered
 
 
 def test_tui_demo_snapshot_renders_incident_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3086,17 +3074,17 @@ def test_build_tui_compact_sidebar_lines_contains_guided_blocks() -> None:
         width=40,
     )
     joined = "\n".join(lines)
-    assert "Focus" in joined
+    assert "Status" in joined
     assert "Next" in joined
-    assert "Quick Start" in joined
-    assert "Provider  gemini" in joined
+    assert "Target" in joined
+    assert "Provider gemini" in joined
 
 
 def test_build_tui_compact_action_bar_mentions_shift_shortcuts() -> None:
     line = _build_tui_compact_action_bar({"focus_title": "x", "focus_body": "y"})
-    assert "Shift+N/T/U/R" in line
-    assert "/doctor" in line
-    assert "/secret-scan" in line
+    assert "Enter" in line
+    assert "1-4 actions" in line
+    assert "/ui expert" in line
 
 
 def test_tui_welcome_message_contains_one_minute_setup_and_go4() -> None:
@@ -3435,9 +3423,21 @@ def test_tui_runtime_state_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert state["ui_mode"] == "expert"
 
 
-def test_apply_saved_tui_runtime_state_updates_options(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_apply_saved_tui_runtime_state_keeps_simple_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     state_file = tmp_path / "lsre-tui-state.json"
     monkeypatch.setattr(cli_main, "_tui_state_file", lambda: state_file)
+    _save_tui_runtime_state(panel="timeline", ui_mode="expert")
+
+    options: dict[str, object] = {"tui_panel": "overview", "tui_ui_mode": "simple"}
+    _apply_saved_tui_runtime_state(options)
+    assert options["tui_panel"] == "timeline"
+    assert options["tui_ui_mode"] == "simple"
+
+
+def test_apply_saved_tui_runtime_state_can_restore_expert(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    state_file = tmp_path / "lsre-tui-state.json"
+    monkeypatch.setattr(cli_main, "_tui_state_file", lambda: state_file)
+    monkeypatch.setenv("LAZYSRE_TUI_RESTORE_UI", "1")
     _save_tui_runtime_state(panel="timeline", ui_mode="expert")
 
     options: dict[str, object] = {"tui_panel": "overview", "tui_ui_mode": "simple"}
