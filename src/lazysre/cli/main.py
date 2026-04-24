@@ -742,6 +742,54 @@ def install_doctor(
     _render_doctor_report(report)
 
 
+@app.command("preflight")
+def preflight(
+    ctx: typer.Context,
+    profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds for doctor checks.")] = 6,
+    dry_run_probe: Annotated[bool, typer.Option("--dry-run-probe", help="Run doctor probes in dry-run mode.")] = True,
+    strict: Annotated[bool, typer.Option("--strict", help="Treat warnings as failure (CI-friendly).")] = False,
+    staged: Annotated[bool, typer.Option("--staged/--all-files", help="Secret scan scope: staged files only (default) or all files.")] = True,
+    max_findings: Annotated[int, typer.Option("--max-findings", help="Maximum suspicious token findings to keep.")] = 8,
+    as_json: Annotated[bool, typer.Option("--json", help="Print preflight report as JSON.")] = False,
+) -> None:
+    options = _merged_options(
+        ctx,
+        execute=None,
+        approve=None,
+        interactive_approval=None,
+        stream_output=None,
+        verbose_reasoning=None,
+        approval_mode=None,
+        audit_log=None,
+        lock_file=None,
+        session_file=None,
+        deny_tool=None,
+        deny_prefix=None,
+        tool_pack=None,
+        remote_gateway=None,
+        model=None,
+        provider=None,
+        max_steps=None,
+    )
+    report = _collect_preflight_report(
+        profile_file=Path(profile_file),
+        timeout_sec=timeout_sec,
+        dry_run_probe=dry_run_probe,
+        strict=strict,
+        staged=staged,
+        max_findings=max_findings,
+        audit_log=Path(str(options["audit_log"])),
+    )
+    if as_json or (not _console):
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        _render_doctor_report(report)
+    gate = report.get("gate", {})
+    if strict and isinstance(gate, dict) and (not bool(gate.get("healthy", True))):
+        raise typer.Exit(code=2)
+
+
 @app.command("secret-scan")
 def secret_scan(
     staged: Annotated[bool, typer.Option("--staged", help="Only scan files staged in git index.")] = False,
@@ -8515,6 +8563,50 @@ def _collect_install_doctor_report() -> dict[str, object]:
     }
 
 
+def _collect_preflight_report(
+    *,
+    profile_file: Path,
+    timeout_sec: int,
+    dry_run_probe: bool,
+    strict: bool,
+    staged: bool,
+    max_findings: int,
+    audit_log: Path,
+) -> dict[str, object]:
+    install_report = _collect_install_doctor_report()
+    target_store = TargetEnvStore(profile_file)
+    target = target_store.load()
+    doctor_report = _collect_doctor_report(
+        target=target,
+        timeout_sec=timeout_sec,
+        dry_run_probe=dry_run_probe,
+        audit_log=audit_log,
+    )
+    secret_report = _collect_secret_scan_report(
+        staged=staged,
+        max_findings=max_findings,
+    )
+    checks: list[dict[str, object]] = []
+    for report in (install_report, doctor_report, secret_report):
+        rows = report.get("checks", [])
+        if isinstance(rows, list):
+            checks.extend([item for item in rows if isinstance(item, dict)])
+    summary = _summarize_doctor_checks(checks)
+    summary["strict_mode"] = strict
+    summary["strict_healthy"] = _doctor_is_healthy(summary, strict=strict)
+    result = {
+        "checks": checks,
+        "summary": summary,
+        "sections": {
+            "install_doctor": install_report.get("summary", {}),
+            "doctor": doctor_report.get("summary", {}),
+            "secret_scan": secret_report.get("summary", {}),
+        },
+    }
+    result["gate"] = _build_doctor_gate(result, strict=strict)
+    return result
+
+
 def _safe_run_command(command: list[str], *, timeout_sec: int) -> dict[str, object]:
     try:
         completed = subprocess.run(
@@ -10340,6 +10432,9 @@ def _render_chat_short_help() -> None:
         "- /doctor install: 安装环境自检（python/node/npm/gh）",
         "- /doctor fix: 执行安全自动修复后再预检",
         "- /doctor strict: 严格模式（warn 也视为不健康）",
+        "- /preflight: 发布前一键体检（install-doctor + doctor + secret-scan）",
+        "- /preflight --strict: 严格门禁（warn/error 触发失败）",
+        "- /preflight --all-files: 扫描全仓库（默认仅扫描暂存区）",
         "- /template list: 查看一键修复模板库",
         "- /template show <name>: 查看模板详情",
         "- /template run <name> [--apply] [--var k=v]: 运行模板（支持审批门禁）",
@@ -11330,7 +11425,7 @@ def _build_tui_compact_action_bar(snapshot: dict[str, object]) -> str:
     next_hint = str(_build_tui_state_card(snapshot).get("next", "")).strip() or "/do 1"
     return (
         "actions> Enter(空)=下一步 · 数字=动作 · ↑/↓ 历史(前缀筛选) · Tab 补全 · "
-        "Shift+N/T/U/R · F3切UI · /history · /doctor · /secret-scan · /ui expert · "
+        "Shift+N/T/U/R · F3切UI · /history · /doctor · /preflight · /secret-scan · /ui expert · "
         f"{next_hint}"
     )
 
@@ -11537,6 +11632,8 @@ def _render_tui_quick_help_text(snapshot: dict[str, object]) -> str:
             "- /trace /timeline: 看执行链路",
             "- /providers: 查看模型就绪状态",
             "- /doctor: 运行环境体检（支持 /doctor strict /doctor install）",
+            "- /preflight: 发布前一键体检（install-doctor + doctor + secret-scan）",
+            "- /preflight --strict: 严格门禁",
             "- /secret-scan: 检查当前工作区是否存在疑似密钥泄漏",
             "- /secret-scan --staged: 仅扫描当前 git 暂存区文件",
             "",
@@ -11958,6 +12055,7 @@ def _build_tui_help_overlay_lines(snapshot: dict[str, object], *, width: int) ->
         "- /drift",
         "- /doctor",
         "- /doctor install",
+        "- /preflight",
         "- /secret-scan",
         "- /providers",
         "- /scan",
@@ -12592,7 +12690,7 @@ def _build_tui_action_bar(snapshot: dict[str, object]) -> str:
         "overview": "/do 1 | /focus | /drift | /doctor",
         "activity": "/do 1 | /activity | /swarm --logs",
         "timeline": "/trace | /timeline | /panel next",
-        "providers": "/providers | /provider <name> | /secret-scan",
+        "providers": "/providers | /provider <name> | /preflight",
     }
     return f"{base} · {panel_actions.get(panel, panel_actions['overview'])}"
 
@@ -12919,6 +13017,9 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
             "/doctor",
             "/doctor strict",
             "/doctor install",
+            "/preflight",
+            "/preflight --strict",
+            "/preflight --all-files",
             "/secret-scan",
             "/secret-scan --staged",
             "/quickstart",
@@ -12935,6 +13036,35 @@ def _tui_completion_candidates(prefix: str, snapshot: dict[str, object]) -> list
     if not seed:
         return candidates
     return [item for item in candidates if item.lower().startswith(seed)]
+
+
+def _parse_preflight_inline_options(tail: str) -> dict[str, object]:
+    raw = str(tail or "").strip()
+    lowered = raw.lower()
+    strict_mode = (" strict" in f" {lowered}") or ("--strict" in lowered) or ("严格" in raw)
+    staged = True
+    if "--all-files" in lowered:
+        staged = False
+    if "--staged" in lowered:
+        staged = True
+    dry_run_probe = True
+    if ("--execute-probe" in lowered) or ("--no-dry-run-probe" in lowered):
+        dry_run_probe = False
+    timeout_sec = 6
+    timeout_match = re.search(r"--timeout-sec(?:=|\s+)(\d+)", lowered, flags=re.IGNORECASE)
+    if timeout_match:
+        timeout_sec = max(1, min(60, _safe_int(timeout_match.group(1))))
+    max_findings = 8
+    findings_match = re.search(r"--max-findings(?:=|\s+)(\d+)", lowered, flags=re.IGNORECASE)
+    if findings_match:
+        max_findings = max(1, min(30, _safe_int(findings_match.group(1))))
+    return {
+        "strict": strict_mode,
+        "staged": staged,
+        "dry_run_probe": dry_run_probe,
+        "timeout_sec": timeout_sec,
+        "max_findings": max_findings,
+    }
 
 
 def _capture_plain_output(callback) -> str:
@@ -13282,6 +13412,23 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
             _render_doctor_report(report)
 
         return _capture_plain_output(_render_doctor)
+    if lowered.startswith("/preflight"):
+        tail = normalized[len("/preflight") :].strip()
+        preflight_options = _parse_preflight_inline_options(tail)
+
+        def _render_preflight() -> None:
+            report = _collect_preflight_report(
+                profile_file=Path(settings.target_profile_file),
+                timeout_sec=int(preflight_options["timeout_sec"]),
+                dry_run_probe=bool(preflight_options["dry_run_probe"]),
+                strict=bool(preflight_options["strict"]),
+                staged=bool(preflight_options["staged"]),
+                max_findings=int(preflight_options["max_findings"]),
+                audit_log=Path(str(options.get("audit_log", ".data/lsre-audit.jsonl"))),
+            )
+            _render_doctor_report(report)
+
+        return _capture_plain_output(_render_preflight)
     if lowered in {"/providers", "/provider", "/provider show"}:
         return _capture_plain_output(lambda: _render_provider_runtime_report(_build_provider_runtime_report(options)))
     if lowered.startswith("/provider "):
@@ -13520,6 +13667,9 @@ def _rewrite_simple_quick_phrase_to_command(text: str) -> str:
         "doctor": "/doctor",
         "安装检查": "/doctor install",
         "安装体检": "/doctor install",
+        "发布前检查": "/preflight",
+        "上线前检查": "/preflight",
+        "preflight": "/preflight",
         "密钥检查": "/secret-scan",
         "泄漏检查": "/secret-scan",
         "暂存区密钥检查": "/secret-scan --staged",
@@ -13594,6 +13744,13 @@ def _rewrite_simple_quick_phrase_to_command(text: str) -> str:
         "安装检查",
         "安装体检",
     )
+    preflight_prefixes = (
+        "发布前检查",
+        "上线前检查",
+        "上线检查",
+        "发版前检查",
+        "preflight",
+    )
     secret_scan_prefixes = (
         "密钥检查",
         "泄漏检查",
@@ -13624,6 +13781,8 @@ def _rewrite_simple_quick_phrase_to_command(text: str) -> str:
         return "/timeline"
     if any(compact.startswith(prefix) for prefix in provider_prefixes):
         return "/providers"
+    if any(compact.startswith(prefix) for prefix in preflight_prefixes):
+        return "/preflight"
     if any(compact.startswith(prefix) for prefix in secret_scan_prefixes):
         return "/secret-scan"
     if any(compact.startswith(prefix) for prefix in secret_scan_staged_prefixes):
@@ -13659,6 +13818,7 @@ _KNOWN_SLASH_COMMANDS: tuple[str, ...] = (
     "setup",
     "status",
     "doctor",
+    "preflight",
     "runbook",
     "report",
     "incident",
@@ -13755,6 +13915,9 @@ def _normalize_slash_command_text(text: str) -> str:
         "secretscan": "secret-scan",
         "secretcheck": "secret-scan",
         "secret": "secret-scan",
+        "preflght": "preflight",
+        "preflite": "preflight",
+        "pre-flight": "preflight",
     }
     known = list(_KNOWN_SLASH_COMMANDS)
     corrected = aliases.get(command, "")
@@ -13819,6 +13982,9 @@ def _normalize_bare_command_text(text: str) -> str:
         "secretscan": "secret-scan",
         "secretcheck": "secret-scan",
         "secret": "secret-scan",
+        "preflght": "preflight",
+        "preflite": "preflight",
+        "pre-flight": "preflight",
     }
     command = aliases.get(head, head)
     if command not in _KNOWN_SLASH_COMMANDS:
@@ -14361,6 +14527,23 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 summary_obj["strict_mode"] = strict_mode
                 summary_obj["strict_healthy"] = _doctor_is_healthy(summary_obj, strict=strict_mode)
             report["gate"] = _build_doctor_gate(report, strict=strict_mode)
+            if _console:
+                _render_doctor_report(report)
+            else:
+                typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+            continue
+        if text.lower().startswith("/preflight"):
+            tail = text[len("/preflight") :].strip()
+            preflight_options = _parse_preflight_inline_options(tail)
+            report = _collect_preflight_report(
+                profile_file=Path(settings.target_profile_file),
+                timeout_sec=int(preflight_options["timeout_sec"]),
+                dry_run_probe=bool(preflight_options["dry_run_probe"]),
+                strict=bool(preflight_options["strict"]),
+                staged=bool(preflight_options["staged"]),
+                max_findings=int(preflight_options["max_findings"]),
+                audit_log=Path(str(options["audit_log"])),
+            )
             if _console:
                 _render_doctor_report(report)
             else:
@@ -15030,6 +15213,23 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
             _render_status_snapshot(snapshot)
         else:
             typer.echo(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        return True
+    if _looks_like_preflight_request(text):
+        strict_mode = ("strict" in lowered) or ("严格" in lowered)
+        staged = ("全仓" not in lowered) and ("all files" not in lowered)
+        report = _collect_preflight_report(
+            profile_file=Path(settings.target_profile_file),
+            timeout_sec=6,
+            dry_run_probe=True,
+            strict=strict_mode,
+            staged=staged,
+            max_findings=8,
+            audit_log=Path(str(options["audit_log"])),
+        )
+        if _console:
+            _render_doctor_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return True
     if _looks_like_install_doctor_request(text):
         report = _collect_install_doctor_report()
@@ -17736,6 +17936,21 @@ def _looks_like_install_doctor_request(text: str) -> bool:
     return any(k in lowered for k in keywords)
 
 
+def _looks_like_preflight_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    keywords = (
+        "preflight",
+        "发布前检查",
+        "上线前检查",
+        "上线检查",
+        "发版前检查",
+        "release check",
+    )
+    return any(k in lowered for k in keywords)
+
+
 def _looks_like_doctor_request(text: str) -> bool:
     if _looks_like_install_doctor_request(text):
         return False
@@ -18266,6 +18481,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "remote",
         "doctor",
         "install-doctor",
+        "preflight",
         "secret-scan",
         "setup",
         "report",
@@ -18338,6 +18554,7 @@ def _should_launch_default_tui(tokens: list[str]) -> bool:
         "remote",
         "doctor",
         "install-doctor",
+        "preflight",
         "secret-scan",
         "setup",
         "report",
@@ -18409,6 +18626,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "remote",
         "doctor",
         "install-doctor",
+        "preflight",
         "secret-scan",
         "setup",
         "report",

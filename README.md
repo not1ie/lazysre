@@ -35,6 +35,9 @@ TUI 内常用命令：
 - `/history`：查看并重放最近输入（默认展示最近 12 条，支持 `/history 关键字` 筛选）
 - `/providers`：查看模型配置状态
 - `/doctor`：运行运行环境体检（支持 `/doctor strict`、`/doctor install`）
+- `/preflight`：发布前一键体检（`install-doctor + doctor + secret-scan`）
+- `/preflight --strict`：严格门禁（`warn/error` 都拦截）
+- `/preflight --all-files`：扫描全仓库（默认仅扫描暂存区）
 - `/secret-scan`：快速检查当前工作区是否存在疑似密钥泄漏（输出脱敏）
 - `/secret-scan --staged`：仅检查当前 Git 暂存区文件（发布前推荐）
 - `chat` 模式支持终端方向键历史输入（readline），并默认跳过敏感内容入历史
@@ -93,7 +96,7 @@ lazysre --version
 - Provider 错误提示增强：Gemini/OpenAI/Anthropic/兼容网关异常会输出脱敏且可执行的修复建议
 - install-doctor 增加代理环境预检（自动识别 SOCKS 代理并提示 `httpx[socks]`）
 - install-doctor / doctor 增加工作区密钥泄漏预检（workspace_secret_scan，输出脱敏文件:行号）
-- 当前封版基线测试：`332 passed`
+- 当前封版基线测试：`333 passed`
 
 ## 安装方式（开箱即用）
 
@@ -120,6 +123,10 @@ lsre
 python -m lazysre
 # 安装环境自检
 lazysre install-doctor
+# 发布前一键门禁（默认只扫暂存区）
+lazysre preflight
+# 严格门禁 + 全仓扫描
+lazysre preflight --strict --all-files
 # 代码密钥泄漏预检（全仓库 / 仅暂存区）
 lazysre secret-scan
 lazysre secret-scan --staged
@@ -248,7 +255,7 @@ lsre "检查 k8s pod 状态"
 lsre tui
 lsre remediate "修复当前巡检发现的问题"
 # chat 快捷命令
-# /help /activity /focus /do [n] /trace /timeline /panel [overview|activity|timeline|providers|next|1-4] /go [1-4] /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /providers /provider <name> /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /remediate /tui /doctor [/doctor fix] [/doctor strict]
+# /help /activity /focus /do [n] /trace /timeline /panel [overview|activity|timeline|providers|next|1-4] /go [1-4] /mode /mode execute|dry-run /context /reset /undo /quickstart /init /login /providers /provider <name> /setup /status /status probe /brief /scan /swarm /connect /remote /watch /actions /autopilot /remediate /tui /doctor [/doctor fix] [/doctor strict] /preflight [--strict] [--all-files]
 # /template [list|show|run|name] [args]
 # /runbook [list|show|render|run|add|remove|export|import|name] [args] /report [args] /fix <问题> /apply /approve [1,3-4] /memory [query]
 # 示例: /template run k8s-crashloopbackoff --apply --var namespace=prod --var pod=payment-6c8b7
@@ -327,6 +334,10 @@ lsre doctor --auto-fix --write-backup
 lsre doctor --strict
 # 安装/发布环境自检（python/node/npm/gh）
 lsre install-doctor
+# 发布前一键门禁（install-doctor + doctor + secret-scan）
+lsre preflight
+lsre preflight --strict
+lsre preflight --strict --all-files
 # 本地登录（保存模型 Key 到 ~/.lazysre/secrets.json）
 lsre login --provider openai
 lsre login --provider deepseek

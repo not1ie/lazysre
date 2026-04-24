@@ -82,6 +82,7 @@ from lazysre.cli.main import (
     _looks_like_help_request,
     _looks_like_init_request,
     _looks_like_install_doctor_request,
+    _looks_like_preflight_request,
     _looks_like_low_risk_apply_request,
     _looks_like_quickstart_request,
     _looks_like_reset_request,
@@ -375,6 +376,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv23 = ["lsre", "secret-scan", "--staged", "--json"]
     _rewrite_argv_for_default_run(argv23)
     assert argv23 == ["lsre", "secret-scan", "--staged", "--json"]
+    argv24 = ["lsre", "preflight", "--strict", "--json"]
+    _rewrite_argv_for_default_run(argv24)
+    assert argv24 == ["lsre", "preflight", "--strict", "--json"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -598,6 +602,8 @@ def test_detect_fix_and_apply_intent() -> None:
     assert _extract_swarm_service_name("为什么 lazysre_lazysre 服务副本不足") == "lazysre_lazysre"
     assert _looks_like_doctor_request("做一次环境体检")
     assert _looks_like_install_doctor_request("做一下安装检查")
+    assert _looks_like_preflight_request("上线前检查一下")
+    assert _looks_like_preflight_request("run preflight check")
     assert _looks_like_report_request("导出复盘报告")
     assert _looks_like_template_library_request("有哪些修复模板")
     assert _looks_like_quickstart_request("帮我修复环境")
@@ -649,6 +655,8 @@ def test_normalize_chat_input_text() -> None:
     assert _normalize_chat_input_text("secretcheck") == "/secret-scan"
     assert _normalize_chat_input_text("secret scan") == "/secret-scan"
     assert _normalize_chat_input_text("/secret scan") == "/secret-scan"
+    assert _normalize_chat_input_text("preflight") == "/preflight"
+    assert _normalize_chat_input_text("/preflght --strict") == "/preflight --strict"
     assert _normalize_chat_input_text("help me check this") == "help me check this"
 
 
@@ -683,6 +691,8 @@ def test_rewrite_simple_quick_phrase_to_command() -> None:
     assert _rewrite_simple_quick_phrase_to_command("provider状态") == "/providers"
     assert _rewrite_simple_quick_phrase_to_command("体检一下") == "/doctor"
     assert _rewrite_simple_quick_phrase_to_command("安装检查") == "/doctor install"
+    assert _rewrite_simple_quick_phrase_to_command("发布前检查") == "/preflight"
+    assert _rewrite_simple_quick_phrase_to_command("上线前检查一下") == "/preflight"
     assert _rewrite_simple_quick_phrase_to_command("密钥检查") == "/secret-scan"
     assert _rewrite_simple_quick_phrase_to_command("暂存区泄漏检查") == "/secret-scan --staged"
     assert _rewrite_simple_quick_phrase_to_command("/history") == ""
@@ -908,6 +918,7 @@ def test_should_launch_default_tui_with_only_options() -> None:
     assert _should_launch_default_tui(["remote"]) is False
     assert _should_launch_default_tui(["doctor"]) is False
     assert _should_launch_default_tui(["install-doctor"]) is False
+    assert _should_launch_default_tui(["preflight"]) is False
     assert _should_launch_default_tui(["secret-scan"]) is False
     assert _should_launch_default_tui(["setup"]) is False
     assert _should_launch_default_tui(["template"]) is False
@@ -945,6 +956,7 @@ def test_should_launch_assistant_is_no_longer_default_surface() -> None:
     assert _should_launch_assistant(["remote"]) is False
     assert _should_launch_assistant(["doctor"]) is False
     assert _should_launch_assistant(["install-doctor"]) is False
+    assert _should_launch_assistant(["preflight"]) is False
     assert _should_launch_assistant(["secret-scan"]) is False
     assert _should_launch_assistant(["setup"]) is False
     assert _should_launch_assistant(["template"]) is False
@@ -1875,7 +1887,7 @@ def test_collect_proxy_runtime_checks_socksio_not_required_for_http_proxy(
 def test_collect_workspace_secret_checks_detects_google_key(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     project.mkdir()
-    sample_key = "AIza" + "SyA07WTYW4rP5R30fInBHARD3kxABq8D2wI"
+    sample_key = "A" + "I" + "z" + "a" + "UNITTESTTOKENVALUE1234567890ABCDEF"
     (project / "app.py").write_text(f'KEY = "{sample_key}"\n', encoding="utf-8")
 
     checks = cli_main._collect_workspace_secret_checks(root=project)
@@ -1895,7 +1907,7 @@ def test_collect_workspace_secret_checks_detects_google_key(tmp_path: Path) -> N
 def test_collect_workspace_secret_checks_ignores_demo_markers(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     project.mkdir()
-    sample_key = "AIza" + "SyA07WTYW4rP5R30fInBHARD3kxABq8D2wI" + "-demo"
+    sample_key = ("A" + "I" + "z" + "a" + "UNITTESTTOKENVALUE1234567890ABCDEF") + "-demo"
     (project / "tests.py").write_text(f'KEY = "{sample_key}"\n', encoding="utf-8")
 
     checks = cli_main._collect_workspace_secret_checks(root=project)
@@ -3606,6 +3618,42 @@ def test_handle_tui_input_secret_scan_parses_staged_and_max_findings(monkeypatch
     assert captured["max_findings"] == 3
 
 
+def test_handle_tui_input_preflight_parses_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_preflight(
+        *,
+        profile_file: Path,
+        timeout_sec: int,
+        dry_run_probe: bool,
+        strict: bool,
+        staged: bool,
+        max_findings: int,
+        audit_log: Path,
+    ) -> dict[str, object]:
+        captured["profile_file"] = str(profile_file)
+        captured["timeout_sec"] = timeout_sec
+        captured["dry_run_probe"] = dry_run_probe
+        captured["strict"] = strict
+        captured["staged"] = staged
+        captured["max_findings"] = max_findings
+        captured["audit_log"] = str(audit_log)
+        return {
+            "checks": [{"name": "runtime.preflight", "ok": True, "severity": "pass", "detail": "ok", "hint": ""}],
+            "summary": {"pass": 1, "warn": 0, "error": 0, "healthy": True},
+            "gate": {"healthy": True},
+        }
+
+    monkeypatch.setattr(cli_main, "_collect_preflight_report", _fake_preflight)
+    output = _handle_tui_input("/preflight --strict --all-files --max-findings 5 --timeout-sec 9", {"execute": False})
+    assert "runtime.preflight" in output
+    assert captured["strict"] is True
+    assert captured["staged"] is False
+    assert captured["max_findings"] == 5
+    assert captured["timeout_sec"] == 9
+    assert captured["dry_run_probe"] is True
+
+
 def test_resolve_tui_numeric_shortcut_prefers_do_when_action_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli_main,
@@ -3960,7 +4008,7 @@ def test_build_tui_action_bar_changes_by_panel() -> None:
     assert "/do 1" in activity_bar
     assert "/trace" in timeline_bar
     assert "/providers" in provider_bar
-    assert "/secret-scan" in provider_bar
+    assert "/preflight" in provider_bar
     assert "overview" in timeline_bar
 
 
@@ -4160,6 +4208,10 @@ def test_tui_completion_candidates_include_shortcuts_and_recommended() -> None:
 
     assert "/refresh" in candidates
     assert "/scan" not in candidates
+    assert "/preflight" not in candidates
+
+    preflight_candidates = _tui_completion_candidates("/pre", snapshot)
+    assert "/preflight" in preflight_candidates
 
 
 def test_handle_tui_input_drift_renders_drift_report(monkeypatch: pytest.MonkeyPatch) -> None:
