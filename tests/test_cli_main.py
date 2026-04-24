@@ -996,11 +996,11 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     )
     rendered = _render_tui_demo_text(snapshot)
 
-    assert "LazySRE Fullscreen TUI" in rendered
-    assert "Brand" in rendered
+    assert "LazySRE Console" in rendered
+    assert "Overview" in rendered
     assert "◉ LazySRE" in rendered
-    assert "AI-native Ops CLI" in rendered
-    assert "provider=mock" in rendered
+    assert "AI Operations Console" in rendered
+    assert "Provider  mock" in rendered
     assert "/remediate <目标>" in rendered
     assert "/swarm --logs" in rendered
     assert "/refresh" in rendered
@@ -1012,14 +1012,14 @@ def test_tui_demo_snapshot_contains_operational_shortcuts() -> None:
     assert "/timeline" in rendered
     assert "/panel next" in rendered
     assert "Focus" in rendered
-    assert "State Card" in rendered
+    assert "Focus" in rendered
     assert "Quick Actions" in rendered
     assert "Recent Activity" in rendered
     assert "Command Trail" in rendered
     assert "Trace Summary" in rendered
-    assert "panel=overview" in rendered
-    assert "hint=" in rendered
-    assert "action_bar=" in rendered
+    assert "Panel    overview" in rendered
+    assert "Hint" in rendered
+    assert "Actions" in rendered
     assert "Up/Down 浏览历史" in rendered
     assert "F1/? 帮助" in rendered
     assert "Starter Prompts" in rendered
@@ -2702,12 +2702,12 @@ def test_build_tui_footer_line_includes_last_user_command() -> None:
         ],
     )
 
-    assert "status=running" in footer
-    assert "provider=auto->mock" in footer
-    assert "targets=2" in footer
-    assert "activity=2" in footer
-    assert "timeline=1" in footer
-    assert "last=/activity" in footer
+    assert "Status running" in footer
+    assert "Provider auto->mock" in footer
+    assert "Targets 2" in footer
+    assert "Activity 2" in footer
+    assert "Timeline 1" in footer
+    assert "Last /activity" in footer
 
 
 def test_build_tui_footer_line_truncates_and_sanitizes_last_user() -> None:
@@ -2726,7 +2726,7 @@ def test_build_tui_footer_line_truncates_and_sanitizes_last_user() -> None:
     )
     assert "google-api-key-demo-value" not in footer
     assert "key=***REDACTED***" in footer
-    assert "last=检查 key=***REDACTED***" in footer
+    assert "Last 检查 key=***REDACTED***" in footer
     assert "…" in footer
 
 
@@ -3050,10 +3050,10 @@ def test_build_tui_compact_sidebar_lines_contains_guided_blocks() -> None:
         width=40,
     )
     joined = "\n".join(lines)
-    assert "Now" in joined
+    assert "Focus" in joined
     assert "Next" in joined
-    assert "Start" in joined
-    assert "provider: gemini" in joined
+    assert "Quick Start" in joined
+    assert "Provider  gemini" in joined
 
 
 def test_build_tui_compact_action_bar_mentions_shift_shortcuts() -> None:
@@ -3074,7 +3074,7 @@ def test_tui_welcome_message_contains_one_minute_setup_and_go4() -> None:
             "latest_quick_action": {},
         }
     )
-    assert "One Minute Setup" in text
+    assert "One Minute Start" in text
     assert "/go 1|2|3|4" in text
     assert "/quickstart" in text
 
@@ -3132,10 +3132,10 @@ def test_handle_tui_input_go_show_mentions_four_actions() -> None:
 
 def test_render_tui_success_card_has_three_sections() -> None:
     out = _render_tui_success_card("操作已完成\n- pod_count=12\n- warn=0", request="检查 k8s")
-    assert "Result: Success" in out
-    assert "Conclusion:" in out
-    assert "Evidence:" in out
-    assert "Next:" in out
+    assert "Done" in out
+    assert "Conclusion" in out
+    assert "Evidence" in out
+    assert "Next" in out
 
 
 def test_pick_tui_next_command_prefers_trace_after_failure() -> None:
@@ -3217,10 +3217,10 @@ def test_sanitize_tui_secret_tokens_masks_proxy_userinfo() -> None:
 
 def test_format_tui_output_for_display_renders_error_card() -> None:
     out = _format_tui_output_for_display("error: Client error '400 Bad Request' for url 'https://x?key=abc'")
-    assert "Result: Failed" in out
-    assert "Reason:" in out
-    assert "Do Now:" in out
-    assert "Fallback:" in out
+    assert "Needs Attention" in out
+    assert "Reason" in out
+    assert "Do Now" in out
+    assert "Fallback" in out
 
 
 def test_format_tui_output_for_display_renders_degraded_card_for_auto_fallback() -> None:
@@ -3269,13 +3269,13 @@ def test_render_tui_simple_result_card_summarizes_markdown_style_output() -> Non
         ]
     )
     out = _render_tui_simple_result_card(raw, request="检查 swarm")
-    assert "Result: Success" in out
-    assert "Status: Diagnosing" in out
-    assert "Summary:" in out
-    assert "Risk:" in out
-    assert "Commands:" in out
+    assert "Done" in out
+    assert "Status  Diagnosing" in out
+    assert "Summary" in out
+    assert "Risk" in out
+    assert "Commands" in out
     assert "docker service update --force lazysre_lazysre" in out
-    assert "Next:" in out
+    assert "Next" in out
 
 
 def test_render_tui_completion_card_uses_simple_summary_mode() -> None:
@@ -3291,18 +3291,18 @@ def test_render_tui_completion_card_uses_simple_summary_mode() -> None:
     )
     out = _render_tui_completion_card(raw, request="检查 k8s", duration_ms=12, ui_mode="simple")
     assert "Result" in out
-    assert "Status:" in out
-    assert "Summary:" in out
-    assert "Commands:" in out
+    assert "Status" in out
+    assert "Summary" in out
+    assert "Commands" in out
     assert "## Reasoning" not in out
 
 
 def test_render_tui_completion_card_expert_keeps_detailed_mode() -> None:
     raw = "操作已完成\n- pod_count=12\n- warn=0"
     out = _render_tui_completion_card(raw, request="检查 k8s", duration_ms=9, ui_mode="expert")
-    assert "Result: Success" in out
-    assert "Evidence:" in out
-    assert "Next:" in out
+    assert "Done" in out
+    assert "Evidence" in out
+    assert "Next" in out
 
 
 def test_handle_tui_input_ui_switches_mode() -> None:
@@ -3351,8 +3351,8 @@ def test_handle_tui_input_help_full_returns_demo(monkeypatch: pytest.MonkeyPatch
         lambda options: {"mode": "dry-run", "provider": "mock", "active_provider": "mock", "status": "ready"},
     )
     out = _handle_tui_input("/help full", {"execute": False})
-    assert "LazySRE Fullscreen TUI" in out
-    assert "Brand" in out
+    assert "LazySRE Console" in out
+    assert "Overview" in out
 
 
 def test_tui_runtime_state_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -4009,7 +4009,7 @@ def test_build_tui_action_bar_changes_by_panel() -> None:
     assert "/trace" in timeline_bar
     assert "/providers" in provider_bar
     assert "/preflight" in provider_bar
-    assert "overview" in timeline_bar
+    assert "Overview" in timeline_bar
 
 
 def test_build_tui_action_bar_prioritizes_trace_after_failed_quick_action() -> None:
@@ -4048,7 +4048,7 @@ def test_build_tui_sidebar_lines_honors_selected_panel() -> None:
 
     assert "Panels:" in joined
     assert "◉ LazySRE" in joined
-    assert "AI-native Ops CLI" in joined
+    assert "AI Operations Console" in joined
     assert "[3:timeline(1)]" in joined
     assert "hint:" in joined
     assert "panel: timeline" in joined
@@ -4139,7 +4139,7 @@ def test_tui_demo_state_card_prioritizes_debug_after_failure() -> None:
             "shortcuts": ["/do 1", "/trace"],
         }
     )
-    assert "next=/trace -> /timeline -> /do 1" in rendered
+    assert "Next  /trace -> /timeline -> /do 1" in rendered
 
 
 def test_build_tui_sidebar_lines_shows_empty_state_for_provider_panel() -> None:

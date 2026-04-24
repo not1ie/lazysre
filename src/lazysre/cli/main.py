@@ -10744,62 +10744,63 @@ def _render_tui_demo_text(snapshot: dict[str, object]) -> str:
     boot_actions = _build_tui_boot_actions(snapshot)
     logo_lines = _build_tui_logo_lines()
     lines = [
-        "╭─ ◉ LazySRE Fullscreen TUI ───────────────────────────────────────╮",
-        "├─ Brand ──────────────────────────────────────────────────────────┤",
+        "╭─ ◉ LazySRE Console ──────────────────────────────────────────────╮",
+        "├─ Overview ───────────────────────────────────────────────────────┤",
         *[f"│ {line}" for line in logo_lines],
-        f"│ version={snapshot.get('version', '-')} mode={snapshot.get('mode', '-')} provider={snapshot.get('provider', '-')} model={snapshot.get('model', '-')}",
-        f"│ panel={snapshot.get('sidebar_panel', 'overview')} hint={panel_hint or '-'}",
-        f"│ action_bar={action_bar}",
-        f"│ quick_state={_build_latest_quick_action_badge(snapshot)}",
-        "├─ State Card ────────────────────────────────────────────────────┤",
-        f"│ focus={state_card.get('focus', '-')}",
-        f"│ quick={state_card.get('quick', '-')}",
-        f"│ next={state_card.get('next', '-')}",
-        "├─ Start Coach ───────────────────────────────────────────────────┤",
-        f"│ phase={coach.get('phase_label', '-')}",
-        f"│ headline={coach.get('headline', '-')}",
-        f"│ primary={coach.get('primary', '/next')}",
-        *[f"│ action: {item}" for item in boot_actions[:4]],
+        f"│ Version  {snapshot.get('version', '-')}    Mode  {snapshot.get('mode', '-')}    Provider  {snapshot.get('provider', '-')}",
+        f"│ Model    {snapshot.get('model', '-')}",
+        f"│ Panel    {snapshot.get('sidebar_panel', 'overview')}",
+        f"│ Hint     {panel_hint or '-'}",
+        f"│ {action_bar}",
+        f"│ Recent   {_build_latest_quick_action_badge(snapshot)}",
+        "├─ Focus ──────────────────────────────────────────────────────────┤",
+        f"│ {state_card.get('focus', '-')}",
+        f"│ Next  {state_card.get('next', '-')}",
+        f"│ Quick {state_card.get('quick', '-')}",
+        "├─ Start ──────────────────────────────────────────────────────────┤",
+        f"│ {coach.get('phase_label', '-')} · {coach.get('headline', '-')}",
+        f"│ Primary  {coach.get('primary', '/next')}",
+        *[f"│ {item}" for item in boot_actions[:4]],
         "├─ Environment ───────────────────────────────────────────────────┤",
-        f"│ profile={snapshot.get('environment_profile', '-') or '-'}",
-        f"│ summary={snapshot.get('environment_summary', '-') or '-'}",
-        *[f"│ signal: {item}" for item in environment_signals[:3]],
+        f"│ Profile  {snapshot.get('environment_profile', '-') or '-'}",
+        f"│ Summary  {snapshot.get('environment_summary', '-') or '-'}",
+        *[f"│ Signal   {_format_tui_signal(item)}" for item in environment_signals[:3]],
         "├─ Brief ─────────────────────────────────────────────────────────┤",
-        f"│ status={snapshot.get('status', '-')}",
-        f"│ headline={snapshot.get('headline', '-')}",
-        "├─ Focus ─────────────────────────────────────────────────────────┤",
+        f"│ Status   {snapshot.get('status', '-')}",
+        f"│ {snapshot.get('headline', '-')}",
+        "├─ Diagnosis ─────────────────────────────────────────────────────┤",
         f"│ {snapshot.get('focus_title', 'Focus')}: {snapshot.get('focus_body', '-')}",
         *(
             ["├─ Swarm Posture ───────────────────────────────────────────────┤"]
             + [f"│ {str(swarm_posture.get('headline', '')).strip()}"]
-            + [f"│ {str(item)}" for item in list(swarm_posture.get("signals", []))[:3]]
+            + [f"│ {_format_tui_signal(str(item))}" for item in list(swarm_posture.get("signals", []))[:3]]
             if str(swarm_posture.get("headline", "")).strip()
             else []
         ),
         *(
             ["├─ Incident Session ────────────────────────────────────────────┤"]
-            + [f"│ status={incident_session.get('status', '-')}", f"│ {incident_session.get('headline', '-')}"]
+            + [f"│ Status   {incident_session.get('status', '-')}", f"│ {incident_session.get('headline', '-')}"]
             + ([f"│ {incident_session.get('stage_flow', '')}"] if str(incident_session.get("stage_flow", "")).strip() else [])
-            + ([f"│ next={incident_session.get('next_step', '')}"] if str(incident_session.get("next_step", "")).strip() else [])
+            + ([f"│ Next     {incident_session.get('next_step', '')}"] if str(incident_session.get("next_step", "")).strip() else [])
             if bool(incident_session.get("exists"))
             else []
         ),
         *(
             ["├─ Environment Drift ───────────────────────────────────────────┤"]
-            + [f"│ status={environment_drift.get('status', '-')}", f"│ {environment_drift.get('headline', '-')}"]
-            + [f"│ {str(item)}" for item in list(environment_drift.get("signals", []))[:3]]
+            + [f"│ Status   {environment_drift.get('status', '-')}", f"│ {environment_drift.get('headline', '-')}"]
+            + [f"│ {_format_tui_signal(str(item))}" for item in list(environment_drift.get("signals", []))[:3]]
             if str(environment_drift.get("status", "")).strip() in {"changed", "stale"}
             else []
         ),
         "├─ Target ────────────────────────────────────────────────────────┤",
-        f"│ active_provider={snapshot.get('active_provider', '-')}",
-        f"│ usable_targets={', '.join(str(x) for x in usable_targets) or '(none)'}",
-        f"│ providers={', '.join(str(x) for x in configured_providers) or '(unset)'}",
-        f"│ namespace={snapshot.get('namespace', '-')}",
-        f"│ ssh_target={snapshot.get('ssh_target', '-') or '(not set)'}",
-        f"│ prometheus={snapshot.get('prometheus_url', '-') or '(not set)'}",
-        f"│ session_turns={snapshot.get('session_turns', 0)}",
-        f"│ last_user={snapshot.get('last_user', '-') or '-'}",
+        f"│ Active Provider  {snapshot.get('active_provider', '-')}",
+        f"│ Targets          {', '.join(str(x) for x in usable_targets) or '(none)'}",
+        f"│ Providers        {', '.join(str(x) for x in configured_providers) or '(unset)'}",
+        f"│ Namespace        {snapshot.get('namespace', '-')}",
+        f"│ SSH              {snapshot.get('ssh_target', '-') or '(not set)'}",
+        f"│ Prometheus       {snapshot.get('prometheus_url', '-') or '(not set)'}",
+        f"│ Turns            {snapshot.get('session_turns', 0)}",
+        f"│ Last Input       {snapshot.get('last_user', '-') or '-'}",
         "├─ Recent Activity ───────────────────────────────────────────────┤",
         *[f"│ {item}" for item in recent_activity[:4]],
         *([ "├─ Focus Actions ────────────────────────────────────────────────┤"] + [f"│ {item}" for item in focus_actions[:2]] if focus_actions else []),
@@ -11292,7 +11293,8 @@ def _draw_tui(
     active_provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
     mode = str(snapshot.get("mode", "-")).strip() or "-"
     title = (
-        f" {logo} | {status} | {mode}/{active_provider} | ui={ui_mode} | F1 help | F2 panel | F3 ui | Tab complete | Esc quit "
+        f" {logo}    {status}    {mode} · {active_provider}    "
+        f"F1 Help   F2 Panels   F3 View   Tab Complete   Esc Quit "
     )
     _tui_addnstr(stdscr, 0, 0, title.ljust(width), width - 1)
     for y in range(1, height - 2):
@@ -11356,9 +11358,9 @@ def _draw_tui_low_fidelity(
     coach = _build_tui_start_coach(snapshot)
     provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
     rows = [
-        f"◉ LazySRE [{status}] {snapshot.get('mode', '-')}/{provider} (low-fidelity)",
-        f"阶段: {coach.get('phase_label', '-')}",
-        f"下一步: {coach.get('primary', '/next')}",
+        f"◉ LazySRE  {status}  {snapshot.get('mode', '-')} · {provider}",
+        f"Focus  {coach.get('phase_label', '-')}",
+        f"Next   {coach.get('primary', '/next')}",
         "输入自然语言，或 /next /start /ui expert /help",
         "-" * max(1, width - 1),
     ]
@@ -11382,35 +11384,38 @@ def _build_tui_compact_sidebar_lines(snapshot: dict[str, object], *, width: int)
     provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
     targets = snapshot.get("usable_targets", [])
     target_list = [str(item).strip() for item in targets if str(item).strip()] if isinstance(targets, list) else []
+    focus = _truncate_tui_status_text(str(state_card.get("focus", "-")), max_chars=96)
+    next_step = _truncate_tui_status_text(str(state_card.get("next", "/do 1")), max_chars=96)
     lines: list[str] = [
-        *_build_tui_logo_lines(),
+        "◉ LazySRE",
+        "AI Operations",
         "",
-        "Now",
-        f"- {state_card.get('focus', '-')}",
+        "Focus",
+        focus,
         "",
         "Next",
-        f"- {state_card.get('next', '/do 1')}",
+        next_step,
         "",
         "Guide",
-        f"- {coach.get('headline', '-')}",
-        *[f"- {item}" for item in list(coach.get("steps", []))[:2]],
+        str(coach.get("headline", "-")),
+        *[str(item) for item in list(coach.get("steps", []))[:2]],
         "",
-        "Start",
-        "- 直接输入自然语言",
+        "Quick Start",
+        "直接输入自然语言",
         *[f"- {item}" for item in boot_actions[:3]],
-        "- Shift+N/T/U/R 快速闭环",
-        "- F3 切换 simple/expert",
+        "Shift+N/T/U/R 快速闭环",
+        "F3 切换 simple/expert",
         "",
         "Runtime",
-        f"- provider: {provider}",
-        f"- targets: {', '.join(target_list[:3]) if target_list else '-'}",
+        f"Provider  {provider}",
+        f"Targets   {', '.join(target_list[:3]) if target_list else '-'}",
     ]
     rows: list[str] = []
     for item in lines:
         if not item:
             rows.append("")
             continue
-        if item in {"Now", "Next", "Guide", "Start", "Runtime"}:
+        if item in {"Focus", "Next", "Guide", "Quick Start", "Runtime"}:
             rows.append(item)
             continue
         rows.extend(textwrap.wrap(item, width=max(10, width)) or [item])
@@ -11423,21 +11428,21 @@ def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) 
     boot_actions = _build_tui_boot_actions(snapshot)
     prompts = _build_tui_starter_prompts(snapshot)[:4]
     sections = [
-        "Start",
-        f"- 当前: {state_card.get('focus', '-')}",
-        f"- 下一步: {state_card.get('next', '/do 1')}",
-        f"- 阶段: {coach.get('phase_label', '快速开始')}",
+        "Overview",
+        f"当前  {state_card.get('focus', '-')}",
+        f"下一步  {state_card.get('next', '/do 1')}",
+        f"阶段  {coach.get('phase_label', '快速开始')}",
         "",
-        "One Minute",
+        "One Minute Start",
         *[f"- {item}" for item in boot_actions[:3]],
         "",
-        "Quick Keys",
-        "- Shift+N = /next",
-        "- Shift+T = /trace",
-        "- Shift+U = /undo",
-        "- Shift+R = /retry",
+        "Keys",
+        "Shift+N  /next",
+        "Shift+T  /trace",
+        "Shift+U  /undo",
+        "Shift+R  /retry",
         "",
-        "Try",
+        "Ask",
         *[f"- {item}" for item in prompts],
     ]
     rows: list[str] = []
@@ -11445,7 +11450,7 @@ def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) 
         if not item:
             rows.append("")
             continue
-        if item in {"Start", "One Minute", "Quick Keys", "Try"}:
+        if item in {"Overview", "One Minute Start", "Keys", "Ask"}:
             rows.append(item)
             continue
         rows.extend(textwrap.wrap(item, width=max(10, width)) or [item])
@@ -11455,7 +11460,7 @@ def _build_tui_compact_welcome_rows(snapshot: dict[str, object], *, width: int) 
 def _build_tui_compact_action_bar(snapshot: dict[str, object]) -> str:
     next_hint = str(_build_tui_state_card(snapshot).get("next", "")).strip() or "/do 1"
     return (
-        "actions> Enter(空)=下一步 · 数字=动作 · ↑/↓ 历史(前缀筛选) · Tab 补全 · "
+        "Actions  Enter=Next · Number=Action · ↑/↓ History · Tab Complete · "
         "Shift+N/T/U/R · F3切UI · /history · /doctor · /preflight · /secret-scan · /ui expert · "
         f"{next_hint}"
     )
@@ -11833,6 +11838,28 @@ def _maybe_apply_runtime_provider_fallback(options: dict[str, object], result: D
     )
 
 
+def _format_tui_signal(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return "-"
+    key_labels = {
+        "baseline": "Baseline",
+        "current": "Current",
+        "added": "Added",
+        "missing": "Missing",
+        "top root cause": "Root Cause",
+        "focus service": "Focus Service",
+        "ai providers": "AI Providers",
+    }
+    if "=" not in value:
+        return value
+    key, raw_detail = value.split("=", 1)
+    key = key.replace("_", " ").strip()
+    detail = raw_detail.strip()
+    label = key_labels.get(key.lower(), key.title())
+    return f"{label}  {detail or '-'}"
+
+
 def _render_tui_simple_result_card(text: str, *, request: str) -> str:
     content = str(text or "").strip()
     status = _extract_named_field(content, ["status", "状态"]) or "Completed"
@@ -11871,15 +11898,15 @@ def _render_tui_simple_result_card(text: str, *, request: str) -> str:
     summary_text = _truncate_tui_status_text(summary or "已完成。", max_chars=160)
     next_actions = _infer_tui_next_actions_from_text(content, request=request)[:2]
     rows = [
-        "Result: Success",
-        f"Status: {status[:64]}",
-        f"Summary: {summary_text}",
+        "Done",
+        f"Status  {status[:64]}",
+        f"Summary {summary_text}",
     ]
     if risk:
-        rows.append(f"Risk: {_truncate_tui_status_text(risk, max_chars=96)}")
+        rows.append(f"Risk    {_truncate_tui_status_text(risk, max_chars=96)}")
     if commands:
-        rows.extend(["Commands:", *[f"- {item}" for item in commands]])
-    rows.extend(["Next:", *[f"- {item}" for item in next_actions]])
+        rows.extend(["Commands", *[f"- {item}" for item in commands]])
+    rows.extend(["Next", *[f"- {item}" for item in next_actions]])
     return "\n".join(rows)
 
 
@@ -11898,12 +11925,12 @@ def _render_tui_error_card(text: str) -> str:
         fallback_actions = ["/provider mock", "/providers"]
     return "\n".join(
         [
-            "Result: Failed",
-            f"Reason: {detail[:220]}",
-            f"Impact: {impact}",
-            "Do Now:",
+            "Needs Attention",
+            f"Reason  {detail[:220]}",
+            f"Impact  {impact}",
+            "Do Now",
             *[f"- {item}" for item in now_actions],
-            "Fallback:",
+            "Fallback",
             *[f"- {item}" for item in fallback_actions],
         ]
     )
@@ -11918,11 +11945,11 @@ def _render_tui_success_card(text: str, *, request: str) -> str:
     next_actions = _infer_tui_next_actions_from_text(text, request=request)[:2]
     return "\n".join(
         [
-            "Result: Success",
-            f"Conclusion: {conclusion[:220]}",
-            "Evidence:",
+            "Done",
+            f"Conclusion  {conclusion[:220]}",
+            "Evidence",
             *(evidence or ["- (no structured evidence)"]),
-            "Next:",
+            "Next",
             *[f"- {item}" for item in next_actions],
         ]
     )
@@ -12635,22 +12662,22 @@ def _build_tui_footer_line(*, snapshot: dict[str, object], status: str, history:
             last_you = str(text).strip()
             break
     parts = [
-        f"status={status}",
-        f"panel={snapshot.get('sidebar_panel', 'overview')}",
-        f"mode={snapshot.get('mode', '-')}",
-        f"provider={snapshot.get('active_provider', snapshot.get('provider', '-'))}",
-        f"targets={target_count}",
-        f"activity={activity_count}",
-        f"timeline={timeline_count}",
+        f"Status {status}",
+        f"Panel {snapshot.get('sidebar_panel', 'overview')}",
+        f"Mode {snapshot.get('mode', '-')}",
+        f"Provider {snapshot.get('active_provider', snapshot.get('provider', '-'))}",
+        f"Targets {target_count}",
+        f"Activity {activity_count}",
+        f"Timeline {timeline_count}",
     ]
     if incident_status:
-        parts.append(f"incident={incident_status}")
+        parts.append(f"Incident {incident_status}")
     if drift_status in {"changed", "stale"}:
-        parts.append(f"drift={drift_status}")
+        parts.append(f"Drift {drift_status}")
     if last_you:
         safe_last = _sanitize_tui_secret_tokens(last_you)
-        parts.append(f"last={_truncate_tui_status_text(safe_last, max_chars=22)}")
-    return " | ".join(parts)
+        parts.append(f"Last {_truncate_tui_status_text(safe_last, max_chars=22)}")
+    return " · ".join(parts)
 
 
 def _truncate_tui_status_text(text: str, *, max_chars: int = 22) -> str:
@@ -12712,7 +12739,7 @@ def _build_tui_status_hint_line(snapshot: dict[str, object]) -> str:
 
 def _build_tui_action_bar(snapshot: dict[str, object]) -> str:
     panel = _normalize_tui_panel_name(str(snapshot.get("sidebar_panel", "overview")))
-    base = "actions> [1]overview [2]activity [3]timeline [4]providers"
+    base = "Actions  [1] Overview  [2] Activity  [3] Timeline  [4] Providers"
     latest = snapshot.get("latest_quick_action", {})
     latest_status = str(latest.get("status", "")).strip().lower() if isinstance(latest, dict) else ""
     if latest_status == "fail":
@@ -12840,9 +12867,9 @@ def _tui_welcome_message(snapshot: dict[str, object] | None = None) -> str:
         focus = str(state.get("focus", "-")).strip() or "-"
     lines = [
         logo,
-        f"目标: {coach_headline}",
-        f"焦点: {focus}",
-        "One Minute Setup:",
+        f"Focus  {focus}",
+        f"Next   {coach_headline}",
+        "One Minute Start",
         *[f"- {item}" for item in actions],
         f"输入一句话描述问题，或输入 {coach_primary} 自动执行当前建议动作。",
         "也可输入 /go 1|2|3|4 快速执行引导动作，按 F1 查看帮助。",
@@ -12855,7 +12882,7 @@ def _build_tui_logo_lines(*, compact: bool = False) -> list[str]:
         return ["◉ LazySRE"]
     return [
         "◉ LazySRE",
-        "AI-native Ops CLI",
+        "AI Operations Console",
     ]
 
 
