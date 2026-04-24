@@ -5514,7 +5514,9 @@ def _collect_remote_docker_report(
             task_reports=[],
             log_reports=[],
             root_causes=[],
-            recommendations=[f"ssh {safe_target} 'docker version'"],
+            recommendations=_dedupe_strings(
+                [f"ssh {safe_target} 'docker version'"] + _remote_scenario_report_recommendations(scenario_reports)
+            ),
             scenario_reports=scenario_reports,
         )
 
@@ -5574,7 +5576,9 @@ def _collect_remote_docker_report(
             task_reports=[],
             log_reports=[],
             root_causes=[],
-            recommendations=[f"lazysre remote {safe_target} --json"],
+            recommendations=_dedupe_strings(
+                [f"lazysre remote {safe_target} --json"] + _remote_scenario_report_recommendations(scenario_reports)
+            ),
             scenario_reports=scenario_reports,
         )
 
@@ -5677,6 +5681,7 @@ def _collect_remote_docker_report(
         include_logs=include_logs,
         service_filter=service_filter,
     )
+    recommendations = _dedupe_strings(recommendations + _remote_scenario_report_recommendations(scenario_reports))[:10]
     return _remote_report_payload(
         target=safe_target,
         include_logs=include_logs,
@@ -5938,19 +5943,163 @@ def _collect_remote_scenario_reports(*, target: str, scenarios: list[str], timeo
         severity = "pass" if ok else ("info" if not_installed else "warn")
         clean_lines = [line for line in _non_empty_lines(stdout) if "LAZYSRE_NOT_INSTALLED" not in line]
         summary = "not detected" if not_installed else (_preview_lines(clean_lines, limit=5) or stderr[:240] or "no output")
+        classified = _classify_remote_scenario_report(name=name, stdout=stdout, stderr=stderr, severity=severity)
+        final_severity = str(classified.get("severity", severity))
         reports.append(
             {
                 "name": name,
-                "ok": ok,
-                "severity": severity,
-                "summary": summary,
+                "ok": final_severity == "pass",
+                "severity": final_severity,
+                "status": classified.get("status", "not_detected" if not_installed else "observed"),
+                "headline": classified.get("headline", ""),
+                "summary": classified.get("summary", summary),
+                "signals": classified.get("signals", []),
+                "recommendations": _remote_scenario_recommendations(name=name, severity=final_severity, target=target),
                 "command": command,
                 "stdout": stdout[:4000],
                 "stderr": stderr[:1000],
-                "hint": _remote_scenario_hint(name, severity),
+                "hint": _remote_scenario_hint(name, final_severity),
             }
         )
     return reports
+
+
+def _classify_remote_scenario_report(*, name: str, stdout: str, stderr: str, severity: str) -> dict[str, object]:
+    text = f"{stdout}\n{stderr}".strip()
+    lowered = text.lower()
+    if severity == "info":
+        return {
+            "severity": "info",
+            "status": "not_detected",
+            "headline": f"{name} 场景未检测到有效组件。",
+            "summary": "not detected",
+            "signals": [],
+        }
+    if severity == "warn":
+        return {
+            "severity": "warn",
+            "status": "collect_failed",
+            "headline": f"{name} 场景采集失败或权限不足。",
+            "summary": _preview_lines(_non_empty_lines(text), limit=4) or "collect failed",
+            "signals": [],
+        }
+    if name == "linux":
+        disk_values = [int(item) for item in re.findall(r"\b([0-9]{1,3})%", text) if _safe_int(item) <= 100]
+        max_disk = max(disk_values) if disk_values else 0
+        failed_lines = [line for line in _non_empty_lines(text) if "failed" in line.lower()]
+        if max_disk >= 90:
+            return {
+                "severity": "warn",
+                "status": "disk_pressure",
+                "headline": f"Linux 主机磁盘使用率最高 {max_disk}%，需要优先确认容量。",
+                "summary": _preview_lines(_non_empty_lines(text), limit=5),
+                "signals": [f"max_disk={max_disk}%", *failed_lines[:2]],
+            }
+        if failed_lines:
+            return {
+                "severity": "warn",
+                "status": "systemd_failed",
+                "headline": "Linux 主机存在 failed systemd 单元。",
+                "summary": _preview_lines(_non_empty_lines(text), limit=5),
+                "signals": failed_lines[:4],
+            }
+        return {
+            "severity": "pass",
+            "status": "healthy",
+            "headline": "Linux 主机基础信号未发现明显异常。",
+            "summary": _preview_lines(_non_empty_lines(text), limit=5),
+            "signals": [f"max_disk={max_disk}%"] if max_disk else [],
+        }
+    if name == "nginx":
+        bad = any(token in lowered for token in ("syntax is not ok", "[emerg]", "test failed", "configuration file") if token in lowered) and "syntax is ok" not in lowered
+        if bad:
+            return {
+                "severity": "warn",
+                "status": "config_failed",
+                "headline": "Nginx 配置校验失败或 error.log 存在高风险错误。",
+                "summary": _preview_lines(_non_empty_lines(text), limit=5),
+                "signals": [line for line in _non_empty_lines(text) if any(k in line.lower() for k in ("emerg", "failed", "error"))][:4],
+            }
+        return {
+            "severity": "pass",
+            "status": "healthy",
+            "headline": "Nginx 已检测到，配置校验未发现阻断性异常。",
+            "summary": _preview_lines(_non_empty_lines(text), limit=5),
+            "signals": [],
+        }
+    if name == "gpu":
+        warn_signals: list[str] = []
+        for line in _non_empty_lines(text):
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 6:
+                continue
+            used = _safe_int(parts[-4])
+            total = _safe_int(parts[-3])
+            util = _safe_int(parts[-2])
+            temp = _safe_int(parts[-1])
+            if total > 0 and used * 100 / total >= 90:
+                warn_signals.append(f"gpu_memory={used}/{total}MB")
+            if util >= 95:
+                warn_signals.append(f"gpu_util={util}%")
+            if temp >= 80:
+                warn_signals.append(f"gpu_temp={temp}C")
+        if warn_signals:
+            return {
+                "severity": "warn",
+                "status": "gpu_pressure",
+                "headline": "GPU 资源接近瓶颈，建议进一步查看 AI 服务进程。",
+                "summary": _preview_lines(_non_empty_lines(text), limit=5),
+                "signals": warn_signals[:4],
+            }
+        return {
+            "severity": "pass",
+            "status": "healthy",
+            "headline": "GPU 已检测到，显存/利用率/温度未触发默认阈值。",
+            "summary": _preview_lines(_non_empty_lines(text), limit=5),
+            "signals": [],
+        }
+    if name in {"database", "ai", "cicd"}:
+        detected = any(line.startswith("bin:") for line in _non_empty_lines(text)) or bool(
+            [line for line in _non_empty_lines(text) if re.search(r"\b(active|running)\b", line, flags=re.IGNORECASE)]
+        )
+        label = {"database": "数据库", "ai": "AI/LLM 服务", "cicd": "CI/CD Runner"}.get(name, name)
+        return {
+            "severity": "pass" if detected else "info",
+            "status": "detected" if detected else "not_detected",
+            "headline": f"{label} {'已检测到' if detected else '未检测到明显运行信号'}。",
+            "summary": _preview_lines(_non_empty_lines(text), limit=5) or "not detected",
+            "signals": [line for line in _non_empty_lines(text) if line.startswith("bin:")][:4],
+        }
+    return {
+        "severity": severity,
+        "status": "observed",
+        "headline": f"{name} 场景采集完成。",
+        "summary": _preview_lines(_non_empty_lines(text), limit=5),
+        "signals": [],
+    }
+
+
+def _remote_scenario_recommendations(*, name: str, severity: str, target: str) -> list[str]:
+    if severity == "pass":
+        return []
+    mapping = {
+        "linux": [f"lazysre remote {target} --scenario linux --json"],
+        "nginx": [f"lazysre remote {target} --scenario nginx --json", f"lazysre fix \"远程 {target} 的 nginx 异常\""],
+        "database": [f"lazysre remote {target} --scenario db --json"],
+        "gpu": [f"lazysre remote {target} --scenario gpu --scenario ai --json"],
+        "ai": [f"lazysre remote {target} --scenario ai --scenario gpu --json"],
+        "cicd": [f"lazysre remote {target} --scenario cicd --json"],
+    }
+    return mapping.get(name, [f"lazysre remote {target} --scenario {name} --json"])
+
+
+def _remote_scenario_report_recommendations(reports: list[dict[str, object]]) -> list[str]:
+    items: list[str] = []
+    for raw in reports:
+        recs = raw.get("recommendations", []) if isinstance(raw, dict) else []
+        if isinstance(recs, list):
+            items.extend(str(item).strip() for item in recs if str(item).strip())
+    return _dedupe_strings(items)
 
 
 def _remote_scenario_hint(name: str, severity: str) -> str:
@@ -18152,6 +18301,8 @@ def _looks_like_remote_diagnose_request(text: str) -> bool:
         "check",
     )
     has_intent = any(k in lowered for k in keywords) and any(k in lowered for k in diagnose_words)
+    if (not has_intent) and _extract_remote_scenarios_from_text(text) and any(k in lowered for k in diagnose_words):
+        has_intent = True
     if not has_intent:
         return False
     return bool(_extract_ssh_target_from_text(text) or _resolve_ssh_target_arg(""))

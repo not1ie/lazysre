@@ -4641,14 +4641,30 @@ def test_remote_scenario_packs_collect_linux_nginx_gpu(monkeypatch: pytest.Monke
 
     scenario_reports = report["scenario_reports"]
     assert [item["name"] for item in scenario_reports] == ["linux", "nginx", "gpu"]
-    assert all(item["severity"] == "pass" for item in scenario_reports)
+    assert scenario_reports[0]["severity"] == "warn"
+    assert scenario_reports[0]["status"] == "disk_pressure"
+    assert scenario_reports[1]["severity"] == "pass"
+    assert scenario_reports[2]["severity"] == "pass"
     assert any("scenario=nginx" in item for item in report["briefing"]["evidence"])
+    assert "lazysre remote root@192.168.10.101 --scenario linux --json" in report["recommendations"]
     assert any("nvidia-smi" in item for item in calls)
 
 
 def test_extract_remote_scenarios_from_text_and_all_alias() -> None:
     assert cli_main._extract_remote_scenarios_from_text("远程检查 nginx gpu root@1.1.1.1") == ["nginx", "gpu"]
     assert cli_main._normalize_remote_scenarios(["all"]) == ["linux", "nginx", "database", "gpu", "ai", "cicd"]
+
+
+def test_remote_scenario_intent_uses_saved_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target_file = tmp_path / "target.json"
+    old_profile = settings.target_profile_file
+    try:
+        settings.target_profile_file = str(target_file)
+        target_file.write_text(json.dumps({"ssh_target": "root@192.168.10.101"}, ensure_ascii=False), encoding="utf-8")
+        assert _looks_like_remote_diagnose_request("检查 nginx 配置")
+        assert _looks_like_remote_diagnose_request("看看 gpu 和 ai 服务")
+    finally:
+        settings.target_profile_file = old_profile
 
 
 def test_build_remote_briefing_classifies_ssh_blocker() -> None:
