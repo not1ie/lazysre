@@ -603,6 +603,7 @@ def remediate(
 def remote(
     target: Annotated[str, typer.Argument(help="SSH target, e.g. root@192.168.10.101. Omit to use target.ssh_target.")] = "",
     service: Annotated[str, typer.Option("--service", help="Optional Docker Swarm service filter.")] = "",
+    scenario: Annotated[list[str], typer.Option("--scenario", help="Read-only scenario pack: linux|nginx|db|gpu|ai|cicd|all. Can repeat.")] = [],
     logs: Annotated[bool, typer.Option("--logs", help="Include remote Swarm service logs.")] = False,
     tail: Annotated[int, typer.Option("--tail", help="Remote log/task tail lines.")] = 80,
     timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Per SSH command timeout seconds.")] = 8,
@@ -613,6 +614,7 @@ def remote(
     report = _collect_remote_docker_report(
         target=resolved_target,
         service_filter=service,
+        scenarios=list(scenario),
         include_logs=logs,
         tail=tail,
         timeout_sec=timeout_sec,
@@ -5423,6 +5425,7 @@ def _collect_remote_docker_report(
     *,
     target: str,
     service_filter: str = "",
+    scenarios: list[str] | None = None,
     include_logs: bool = False,
     tail: int = 80,
     timeout_sec: int = 8,
@@ -5430,6 +5433,7 @@ def _collect_remote_docker_report(
     safe_target = _normalize_ssh_target(target)
     per_check_timeout = max(2, min(int(timeout_sec or 8), 20))
     tail = max(20, min(int(tail or 80), 500))
+    scenario_names = _normalize_remote_scenarios(scenarios or [])
     checks: list[dict[str, object]] = []
     if not safe_target:
         checks.append(_scan_check("ssh.target", False, "error", str(target), "SSH target 格式不合法，示例：root@192.168.10.101"))
@@ -5446,6 +5450,7 @@ def _collect_remote_docker_report(
             log_reports=[],
             root_causes=[],
             recommendations=["请使用形如 root@192.168.10.101 的 SSH target"],
+            scenario_reports=[],
         )
 
     ping = _safe_run_ssh_command(safe_target, "printf lazysre-ok", timeout_sec=per_check_timeout)
@@ -5472,7 +5477,14 @@ def _collect_remote_docker_report(
             log_reports=[],
             root_causes=[],
             recommendations=[f"先确认本机可执行：ssh {safe_target} 'docker version'"],
+            scenario_reports=[],
         )
+
+    scenario_reports = _collect_remote_scenario_reports(
+        target=safe_target,
+        scenarios=scenario_names,
+        timeout_sec=per_check_timeout,
+    )
 
     version_probe = _safe_run_ssh_command(
         safe_target,
@@ -5503,6 +5515,7 @@ def _collect_remote_docker_report(
             log_reports=[],
             root_causes=[],
             recommendations=[f"ssh {safe_target} 'docker version'"],
+            scenario_reports=scenario_reports,
         )
 
     swarm_probe = _safe_run_ssh_command(
@@ -5562,6 +5575,7 @@ def _collect_remote_docker_report(
             log_reports=[],
             root_causes=[],
             recommendations=[f"lazysre remote {safe_target} --json"],
+            scenario_reports=scenario_reports,
         )
 
     nodes_probe = _safe_run_ssh_command(
@@ -5676,6 +5690,7 @@ def _collect_remote_docker_report(
         log_reports=log_reports,
         root_causes=root_causes,
         recommendations=recommendations,
+        scenario_reports=scenario_reports,
     )
 
 
@@ -5758,8 +5773,10 @@ def _remote_report_payload(
     log_reports: list[dict[str, object]],
     root_causes: list[dict[str, object]],
     recommendations: list[str],
+    scenario_reports: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     summary = _summarize_doctor_checks(checks)
+    scenario_items = scenario_reports or []
     payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": "remote-ssh",
@@ -5776,6 +5793,7 @@ def _remote_report_payload(
         "tasks": task_reports,
         "logs": log_reports,
         "root_causes": root_causes,
+        "scenario_reports": scenario_items,
         "recommendations": recommendations,
     }
     payload["posture"] = _build_swarm_posture(
@@ -5802,6 +5820,153 @@ def _remote_report_check(report: dict[str, object], name: str) -> dict[str, obje
     return {}
 
 
+_REMOTE_SCENARIO_ALIASES = {
+    "linux": "linux",
+    "host": "linux",
+    "system": "linux",
+    "系统": "linux",
+    "主机": "linux",
+    "nginx": "nginx",
+    "db": "database",
+    "database": "database",
+    "mysql": "database",
+    "postgres": "database",
+    "postgresql": "database",
+    "redis": "database",
+    "数据库": "database",
+    "gpu": "gpu",
+    "nvidia": "gpu",
+    "cuda": "gpu",
+    "显卡": "gpu",
+    "ai": "ai",
+    "llm": "ai",
+    "ollama": "ai",
+    "vllm": "ai",
+    "模型": "ai",
+    "cicd": "cicd",
+    "ci": "cicd",
+    "cd": "cicd",
+    "jenkins": "cicd",
+    "gitlab": "cicd",
+    "runner": "cicd",
+    "all": "all",
+    "全部": "all",
+}
+
+
+def _normalize_remote_scenarios(values: list[str]) -> list[str]:
+    selected: list[str] = []
+    for raw in values:
+        for item in re.split(r"[,，/\s]+", str(raw or "").strip().lower()):
+            if not item:
+                continue
+            normalized = _REMOTE_SCENARIO_ALIASES.get(item, item)
+            if normalized == "all":
+                selected.extend(["linux", "nginx", "database", "gpu", "ai", "cicd"])
+            elif normalized in {"linux", "nginx", "database", "gpu", "ai", "cicd"}:
+                selected.append(normalized)
+    return _dedupe_strings(selected)
+
+
+def _extract_remote_scenarios_from_text(text: str) -> list[str]:
+    raw = str(text or "")
+    values: list[str] = []
+    for match in re.finditer(r"--scenario(?:=|\s+)([A-Za-z0-9_,，/-]+)", raw, flags=re.IGNORECASE):
+        values.append(match.group(1))
+    lowered = raw.lower()
+    for key in _REMOTE_SCENARIO_ALIASES:
+        if key and key in lowered:
+            values.append(key)
+    return _normalize_remote_scenarios(values)
+
+
+def _scenario_command(name: str) -> str:
+    commands = {
+        "linux": (
+            "printf '## linux\\n'; "
+            "uname -a 2>/dev/null || true; "
+            "uptime 2>/dev/null || true; "
+            "df -P -x tmpfs -x devtmpfs 2>/dev/null | tail -n +2 | sort -k5 -r | head -n 8 || true; "
+            "free -m 2>/dev/null || true; "
+            "systemctl --failed --no-legend --no-pager 2>/dev/null | head -n 10 || true"
+        ),
+        "nginx": (
+            "if command -v nginx >/dev/null 2>&1; then "
+            "printf '## nginx\\n'; nginx -v 2>&1; nginx -t 2>&1; "
+            "systemctl is-active nginx 2>/dev/null || true; "
+            "test -r /var/log/nginx/error.log && tail -n 40 /var/log/nginx/error.log || true; "
+            "else echo LAZYSRE_NOT_INSTALLED; fi"
+        ),
+        "database": (
+            "printf '## database\\n'; found=0; "
+            "for bin in mysql psql redis-cli mongosh mongo; do command -v $bin >/dev/null 2>&1 && { echo bin:$bin; found=1; }; done; "
+            "for svc in mysql mysqld mariadb postgresql redis redis-server mongod; do systemctl is-active $svc 2>/dev/null | sed \"s#^#$svc:#\" || true; done; "
+            "[ \"$found\" = 1 ] || echo LAZYSRE_NOT_INSTALLED"
+        ),
+        "gpu": (
+            "if command -v nvidia-smi >/dev/null 2>&1; then "
+            "printf '## gpu\\n'; nvidia-smi --query-gpu=name,driver_version,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>&1; "
+            "else echo LAZYSRE_NOT_INSTALLED; fi"
+        ),
+        "ai": (
+            "printf '## ai\\n'; found=0; "
+            "for bin in ollama vllm ray tritonserver xinference; do command -v $bin >/dev/null 2>&1 && { echo bin:$bin; found=1; }; done; "
+            "ps -eo pid,comm,args 2>/dev/null | grep -Ei 'ollama|vllm|triton|xinference|text-generation|llama|ray' | grep -v grep | head -n 12 || true; "
+            "[ \"$found\" = 1 ] || echo LAZYSRE_NOT_INSTALLED"
+        ),
+        "cicd": (
+            "printf '## cicd\\n'; found=0; "
+            "for bin in gitlab-runner jenkins java docker; do command -v $bin >/dev/null 2>&1 && { echo bin:$bin; found=1; }; done; "
+            "for svc in gitlab-runner jenkins actions.runner; do systemctl is-active $svc 2>/dev/null | sed \"s#^#$svc:#\" || true; done; "
+            "[ \"$found\" = 1 ] || echo LAZYSRE_NOT_INSTALLED"
+        ),
+    }
+    return commands.get(name, "")
+
+
+def _collect_remote_scenario_reports(*, target: str, scenarios: list[str], timeout_sec: int) -> list[dict[str, object]]:
+    reports: list[dict[str, object]] = []
+    for name in scenarios[:8]:
+        command = _scenario_command(name)
+        if not command:
+            continue
+        probe = _safe_run_ssh_command(target, command, timeout_sec=timeout_sec)
+        stdout = str(probe.get("stdout", "") or "")
+        stderr = str(probe.get("stderr", "") or "")
+        not_installed = "LAZYSRE_NOT_INSTALLED" in stdout
+        ok = bool(probe.get("ok")) and not not_installed
+        severity = "pass" if ok else ("info" if not_installed else "warn")
+        clean_lines = [line for line in _non_empty_lines(stdout) if "LAZYSRE_NOT_INSTALLED" not in line]
+        summary = "not detected" if not_installed else (_preview_lines(clean_lines, limit=5) or stderr[:240] or "no output")
+        reports.append(
+            {
+                "name": name,
+                "ok": ok,
+                "severity": severity,
+                "summary": summary,
+                "command": command,
+                "stdout": stdout[:4000],
+                "stderr": stderr[:1000],
+                "hint": _remote_scenario_hint(name, severity),
+            }
+        )
+    return reports
+
+
+def _remote_scenario_hint(name: str, severity: str) -> str:
+    if severity == "pass":
+        return "只读采集完成"
+    hints = {
+        "linux": "主机基础信息采集异常，检查 shell 权限或基础命令是否可用",
+        "nginx": "未检测到 nginx 或 nginx -t 失败；如有反代问题，建议先确认配置和 error.log",
+        "database": "未检测到常见数据库客户端/服务；如需深度诊断可安装对应客户端或提供 DSN",
+        "gpu": "未检测到 nvidia-smi；如是 GPU 节点，请检查驱动和 NVIDIA runtime",
+        "ai": "未检测到常见 AI/LLM 服务进程；如有 vLLM/Ollama，请确认服务进程和端口",
+        "cicd": "未检测到常见 CI/CD runner；如有 Jenkins/GitLab Runner，请检查 systemd 服务",
+    }
+    return hints.get(name, "场景采集未发现有效信号")
+
+
 def _build_remote_briefing(report: dict[str, object]) -> dict[str, object]:
     target = str(report.get("target", "") or "").strip() or "(unknown)"
     summary = report.get("summary", {})
@@ -5815,6 +5980,8 @@ def _build_remote_briefing(report: dict[str, object]) -> dict[str, object]:
     cause_items = root_causes if isinstance(root_causes, list) else []
     recommendations = report.get("recommendations", [])
     recommendation_items = recommendations if isinstance(recommendations, list) else []
+    scenario_reports = report.get("scenario_reports", [])
+    scenario_items = scenario_reports if isinstance(scenario_reports, list) else []
 
     ssh_check = _remote_report_check(report, "ssh.connect")
     docker_check = _remote_report_check(report, "remote.docker.version")
@@ -5872,6 +6039,12 @@ def _build_remote_briefing(report: dict[str, object]) -> dict[str, object]:
         service = str(first.get("service", "-"))
         advice = str(first.get("advice", "")).strip()
         evidence.append(f"root_cause={category} service={service}" + (f" advice={advice[:120]}" if advice else ""))
+    for raw in scenario_items[:4]:
+        item = raw if isinstance(raw, dict) else {}
+        name = str(item.get("name", "-"))
+        severity = str(item.get("severity", "-"))
+        summary_line = str(item.get("summary", "")).replace("\n", " | ")[:160]
+        evidence.append(f"scenario={name} severity={severity} {summary_line}".strip())
 
     next_step = str(recommendation_items[0]).strip() if recommendation_items else ""
     if not next_step:
@@ -5971,6 +6144,22 @@ def _render_remote_docker_report(report: dict[str, object]) -> None:
                     f"severity={item.get('severity', '-')}: {item.get('advice', '')}"
                 )
         _console.print(Panel("\n".join(lines), title="Remote Root Causes", border_style="red"))
+    scenario_reports = report.get("scenario_reports", [])
+    if isinstance(scenario_reports, list) and scenario_reports and Table:
+        scenario_table = Table(title="Scenario Packs")
+        scenario_table.add_column("Scenario", style="cyan")
+        scenario_table.add_column("Severity", style="white", no_wrap=True)
+        scenario_table.add_column("Summary", style="white")
+        scenario_table.add_column("Hint", style="yellow")
+        for raw in scenario_reports[:12]:
+            item = raw if isinstance(raw, dict) else {}
+            scenario_table.add_row(
+                str(item.get("name", "-")),
+                str(item.get("severity", "-")).upper(),
+                str(item.get("summary", "-"))[:180],
+                str(item.get("hint", ""))[:160],
+            )
+        _console.print(scenario_table)
     recommendations = report.get("recommendations", [])
     if isinstance(recommendations, list) and recommendations and Panel:
         _console.print(Panel("\n".join(f"- {item}" for item in recommendations), title="Recommendations", border_style="green"))
@@ -6009,6 +6198,16 @@ def _render_remote_docker_report_markdown(report: dict[str, object]) -> str:
         if not isinstance(raw, dict):
             continue
         lines.append(f"- `{raw.get('name', '-')}` severity=`{raw.get('severity', '-')}` detail={raw.get('detail', '-')}")
+    lines.append("")
+    scenario_reports = report.get("scenario_reports", [])
+    lines.extend(["## Scenario Packs", ""])
+    if isinstance(scenario_reports, list) and scenario_reports:
+        for item in scenario_reports:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"- `{item.get('name', '-')}` severity=`{item.get('severity', '-')}` summary={item.get('summary', '-')}")
+    else:
+        lines.append("- No scenario packs requested.")
     lines.append("")
     root_causes = report.get("root_causes", [])
     lines.extend(["## Root Causes", ""])
@@ -6814,12 +7013,14 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
         return True
 
     if subcommand == "remote":
-        target = _resolve_ssh_target_arg(_extract_ssh_target_from_text(" ".join(tokens[1:])))
+        tail_text = " ".join(tokens[1:])
+        target = _resolve_ssh_target_arg(_extract_ssh_target_from_text(tail_text))
         if not target:
             typer.echo("remote action 缺少 SSH target。请先执行：lsre target set --ssh-target root@host")
             return False
         service = ""
         include_logs = False
+        scenarios: list[str] = []
         tail = 120
         idx = 1
         while idx < len(tokens):
@@ -6838,6 +7039,16 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
                 service = token.split("=", 1)[1]
                 idx += 1
                 continue
+            if token == "--scenario":
+                idx += 1
+                if idx < len(tokens):
+                    scenarios.append(tokens[idx])
+                idx += 1
+                continue
+            if token.startswith("--scenario="):
+                scenarios.append(token.split("=", 1)[1])
+                idx += 1
+                continue
             if token == "--tail":
                 idx += 1
                 if idx < len(tokens):
@@ -6852,6 +7063,7 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
         report = _collect_remote_docker_report(
             target=target,
             service_filter=service,
+            scenarios=scenarios or _extract_remote_scenarios_from_text(tail_text),
             include_logs=include_logs,
             tail=tail,
             timeout_sec=8,
@@ -10465,6 +10677,7 @@ def _render_chat_short_help() -> None:
         "- /autopilot [目标]: 自动扫描 -> 巡检 -> 行动清单，可加 --fix 生成修复计划",
         "- /connect [user@host]: 远程连接体检；SSH 连通后自动保存为默认远程目标",
         "- /remote [user@host] [--logs]: 通过 SSH 只读诊断远程 Docker/Swarm；已保存 ssh_target 时可省略主机",
+        "- /remote [user@host] --scenario linux|nginx|db|gpu|ai|cicd|all: 只读采集场景证据",
         "- /remediate <目标>: 生产闭环修复（Observe -> Plan -> Apply -> Verify -> Rollback Advice）",
         "- /tui: 启动全屏 TUI（也可直接运行 lazysre tui）",
         "- /refresh: 刷新当前总览简报并更新 TUI/启动页摘要",
@@ -10695,6 +10908,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "shortcuts": [
             "/connect <user>@<host>",
             "/remote --logs",
+            "/remote --scenario all",
             "/brief",
             "/scan",
             "/drift",
@@ -13696,6 +13910,7 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
                 _collect_remote_docker_report(
                     target=target,
                     service_filter=_extract_swarm_service_name(service_text),
+                    scenarios=_extract_remote_scenarios_from_text(tail),
                     include_logs="--logs" in lowered or "日志" in normalized,
                     tail=120,
                     timeout_sec=8,
@@ -14582,6 +14797,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             report = _collect_remote_docker_report(
                 target=target,
                 service_filter=_extract_swarm_service_name(service_text),
+                scenarios=_extract_remote_scenarios_from_text(tail),
                 include_logs="--logs" in tail.lower() or "日志" in tail,
                 tail=120,
                 timeout_sec=8,
@@ -15251,6 +15467,7 @@ def _handle_natural_intent(text: str, options: dict[str, object], execute_mode: 
         report = _collect_remote_docker_report(
             target=target,
             service_filter=_extract_swarm_service_name(service_text),
+            scenarios=_extract_remote_scenarios_from_text(text),
             include_logs=any(k in lowered for k in ("日志", "logs")),
             tail=120,
             timeout_sec=8,

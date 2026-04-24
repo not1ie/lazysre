@@ -4613,6 +4613,44 @@ def test_collect_remote_docker_report_detects_swarm_issue(monkeypatch: pytest.Mo
     assert any("docker service logs" in item for item in calls)
 
 
+def test_remote_scenario_packs_collect_linux_nginx_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def fake_safe_run(command: list[str], *, timeout_sec: int) -> dict[str, object]:
+        remote_command = str(command[-1])
+        calls.append(remote_command)
+        if remote_command == "printf lazysre-ok":
+            return {"ok": True, "stdout": "lazysre-ok", "stderr": "", "exit_code": 0}
+        if "## linux" in remote_command:
+            return {"ok": True, "stdout": "## linux\nup 1 day\n/dev/sda1 90% /", "stderr": "", "exit_code": 0}
+        if "command -v nginx" in remote_command:
+            return {"ok": True, "stdout": "## nginx\nnginx version: nginx/1.24\nsyntax is ok", "stderr": "", "exit_code": 0}
+        if "nvidia-smi" in remote_command:
+            return {"ok": True, "stdout": "NVIDIA A10,535,1024,24576,5,42", "stderr": "", "exit_code": 0}
+        if "docker version" in remote_command:
+            return {"ok": False, "stdout": "", "stderr": "docker missing", "exit_code": 1}
+        return {"ok": True, "stdout": "", "stderr": "", "exit_code": 0}
+
+    monkeypatch.setattr(cli_main, "_safe_run_command", fake_safe_run)
+
+    report = _collect_remote_docker_report(
+        target="root@192.168.10.101",
+        scenarios=["linux", "nginx", "gpu"],
+        timeout_sec=3,
+    )
+
+    scenario_reports = report["scenario_reports"]
+    assert [item["name"] for item in scenario_reports] == ["linux", "nginx", "gpu"]
+    assert all(item["severity"] == "pass" for item in scenario_reports)
+    assert any("scenario=nginx" in item for item in report["briefing"]["evidence"])
+    assert any("nvidia-smi" in item for item in calls)
+
+
+def test_extract_remote_scenarios_from_text_and_all_alias() -> None:
+    assert cli_main._extract_remote_scenarios_from_text("远程检查 nginx gpu root@1.1.1.1") == ["nginx", "gpu"]
+    assert cli_main._normalize_remote_scenarios(["all"]) == ["linux", "nginx", "database", "gpu", "ai", "cicd"]
+
+
 def test_build_remote_briefing_classifies_ssh_blocker() -> None:
     report = {
         "target": "root@192.168.10.101",

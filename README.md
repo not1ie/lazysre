@@ -56,6 +56,7 @@ lazysre --provider mock
 TUI 内常用命令：
 - `/connect <user>@<host>`：只读 SSH 体检目标服务器，成功后保存默认远程目标
 - `/remote --logs`：只读诊断已保存的远程 Docker/Swarm 目标
+- `/remote --scenario all`：只读采集 Linux/Nginx/数据库/GPU/AI/CI/CD 场景证据
 - `/scan`：检查本机控制台依赖（Docker/kubectl/Prometheus 配置），不是生产扫描
 - `/brief`：生成本机控制台 + 远程目标总览
 - `/next`：执行系统推荐的下一步
@@ -168,6 +169,9 @@ lazysre scan
 lazysre swarm --logs
 # 远程服务器只读诊断（目标机无需安装 LazySRE，只需可 SSH）
 lazysre remote root@192.168.10.101 --logs
+# 远程场景 Pack：Linux/Nginx/数据库/GPU/AI/CI/CD，只读采集证据
+lazysre remote root@192.168.10.101 --scenario linux --scenario nginx
+lazysre remote root@192.168.10.101 --scenario all --json
 # 首次连接体检：SSH 连通后自动保存默认远程目标
 lazysre connect root@192.168.10.101
 # 输出包含 AI Briefing：连通性、Docker/Swarm 状态、关键证据和下一步命令
@@ -329,6 +333,9 @@ lsre connect
 lsre remote root@192.168.10.101
 lsre remote root@192.168.10.101 --logs
 lsre remote root@192.168.10.101 --service lazysre_lazysre --logs
+lsre remote root@192.168.10.101 --scenario linux --scenario nginx --scenario db
+lsre remote root@192.168.10.101 --scenario gpu --scenario ai
+lsre remote root@192.168.10.101 --scenario all
 lsre remote root@192.168.10.101 --report-md .data/remote-101.md
 # 已保存 ssh_target 后可省略主机
 lsre remote --logs
