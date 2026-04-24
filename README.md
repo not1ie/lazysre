@@ -3,6 +3,32 @@
 LazySRE 是一个纯 AI 驱动的 SRE/运维 CLI 工具。  
 目标是让你用自然语言驱动排障、诊断、修复与回滚，而不是手工拼接一堆命令。
 
+## 推荐使用方式：本机控制台，远程只读观察
+
+LazySRE 默认按“控制台 / 目标环境”分层：
+
+- 在 Mac/Windows/Linux 笔记本上运行 `lazysre`：只作为 AI 运维控制台。
+- 服务器、Docker Swarm、K8s、Prometheus 是目标环境：优先通过 SSH/API 只读采集证据。
+- 目标服务器不需要安装 LazySRE：只要能 SSH，LazySRE 就能从本机发起只读诊断。
+- 默认 `dry-run`：高风险动作只生成计划和影响评估，不直接修改生产。
+- 真正执行写操作必须显式加 `--execute`，并经过确认门禁。
+
+典型流程：
+
+```bash
+# 本机启动 TUI
+lazysre
+
+# TUI 中先连接目标服务器，只读 SSH 体检并保存默认目标
+/connect root@192.168.10.101
+
+# 后续直接远程观察，不需要再输入目标
+/remote --logs
+
+# 需要修复时先生成计划，不直接执行
+/remediate 修复 swarm 副本不足
+```
+
 ## 1 分钟上手
 
 ```bash
@@ -28,8 +54,10 @@ lazysre --provider mock
 - `为什么最近请求变慢了`
 
 TUI 内常用命令：
-- `/scan`：自动探测本机环境（Docker/Swarm/K8s/Prometheus）
-- `/brief`：生成现场总览
+- `/connect <user>@<host>`：只读 SSH 体检目标服务器，成功后保存默认远程目标
+- `/remote --logs`：只读诊断已保存的远程 Docker/Swarm 目标
+- `/scan`：检查本机控制台依赖（Docker/kubectl/Prometheus 配置），不是生产扫描
+- `/brief`：生成本机控制台 + 远程目标总览
 - `/next`：执行系统推荐的下一步
 - `/retry`：重试上一条输入
 - `/history`：查看并重放最近输入（默认展示最近 12 条，支持 `/history 关键字` 筛选）

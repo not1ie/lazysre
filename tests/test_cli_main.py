@@ -1608,6 +1608,42 @@ def test_remote_intent_and_action_use_saved_target(tmp_path: Path, monkeypatch: 
         settings.target_profile_file = old_profile
 
 
+def test_connect_action_saves_verified_remote_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target_file = tmp_path / "target.json"
+    old_profile = settings.target_profile_file
+    calls: list[dict[str, object]] = []
+
+    def fake_remote(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {
+            "target": kwargs.get("target", ""),
+            "ok": True,
+            "summary": {"pass": 2, "warn": 0, "error": 0},
+            "checks": [
+                {"name": "ssh.connect", "ok": True, "severity": "pass"},
+                {"name": "remote.docker.version", "ok": True, "severity": "pass"},
+            ],
+            "services": [],
+            "unhealthy_services": [],
+            "bad_nodes": [],
+            "root_causes": [],
+            "recommendations": [],
+        }
+
+    try:
+        settings.target_profile_file = str(target_file)
+        target_file.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(cli_main, "_collect_remote_docker_report", fake_remote)
+
+        assert _run_action_command("lazysre connect root@192.168.10.101 --logs", options={}, execute_mode=False) is True
+        assert calls[0]["target"] == "root@192.168.10.101"
+        assert calls[0]["include_logs"] is True
+        saved = json.loads(target_file.read_text(encoding="utf-8"))
+        assert saved["ssh_target"] == "root@192.168.10.101"
+    finally:
+        settings.target_profile_file = old_profile
+
+
 def test_resolve_runbook_vars_prefers_cli_over_target(tmp_path: Path, monkeypatch) -> None:
     target_file = tmp_path / "target.json"
     target_file.write_text(
@@ -3094,6 +3130,40 @@ def test_build_tui_start_coach_prioritizes_provider_setup() -> None:
     assert "/go 1" in str(coach["primary"])
 
 
+def test_build_tui_start_coach_prioritizes_remote_target_on_mac() -> None:
+    coach = _build_tui_start_coach(
+        {
+            "provider_ready": True,
+            "provider": "gemini",
+            "active_provider": "gemini",
+            "target_strategy": "remote-first",
+            "ssh_target": "",
+            "usable_targets": ["docker", "kubernetes"],
+            "status": "ready",
+            "latest_quick_action": {},
+        }
+    )
+    assert coach["phase"] == "connect_target"
+    assert "Mac 作为控制台" in str(coach["headline"])
+    assert _resolve_tui_boot_action_command({"target_strategy": "remote-first", "provider_ready": True}, 1) == "/connect"
+
+
+def test_build_tui_start_coach_uses_saved_remote_target_first() -> None:
+    snapshot = {
+        "provider_ready": True,
+        "provider": "gemini",
+        "active_provider": "gemini",
+        "target_strategy": "remote-first",
+        "ssh_target": "root@10.0.0.8",
+        "usable_targets": ["remote-ssh"],
+        "status": "cold-start",
+        "latest_quick_action": {},
+    }
+    coach = _build_tui_start_coach(snapshot)
+    assert coach["phase"] == "remote_observe"
+    assert _resolve_tui_boot_action_command(snapshot, 1) == "/remote --logs"
+
+
 def test_resolve_tui_boot_action_command_by_stage() -> None:
     snapshot_connect = {
         "provider_ready": False,
@@ -4439,7 +4509,7 @@ def test_build_tui_bootstrap_input_history_includes_recent_and_defaults() -> Non
 
 def test_cycle_tui_completion_keeps_original_prefix_across_tabs() -> None:
     snapshot = {
-        "shortcuts": ["/refresh", "/remote root@host --logs"],
+        "shortcuts": ["/refresh", "/remote <user>@<host> --logs"],
         "recommended_commands": [],
     }
 
@@ -4447,7 +4517,7 @@ def test_cycle_tui_completion_keeps_original_prefix_across_tabs() -> None:
     second, idx2, seed2 = _cycle_tui_completion(first, snapshot=snapshot, completion_index=idx, completion_seed=seed)
 
     assert first == "/refresh"
-    assert second == "/remote root@host --logs"
+    assert second == "/remote <user>@<host> --logs"
     assert seed2 == "/r"
 
 

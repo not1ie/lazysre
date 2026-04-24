@@ -6862,6 +6862,32 @@ def _run_action_command(command_text: str, *, options: dict[str, object], execut
             typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return True
 
+    if subcommand == "connect":
+        tail_text = " ".join(tokens[1:])
+        target = _extract_ssh_target_from_text(tail_text)
+        if not target:
+            typer.echo("connect action 缺少 SSH target。示例：lazysre connect root@192.168.10.101")
+            return False
+        include_logs = "--logs" in tail_text.lower() or "日志" in tail_text
+        report = _run_remote_connect_flow(
+            target=target,
+            save_target=True,
+            include_logs=include_logs,
+            tail=80,
+            timeout_sec=8,
+        )
+        if _console:
+            _render_remote_docker_report(report)
+        else:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        save_payload = report.get("target_save", {})
+        if isinstance(save_payload, dict):
+            if bool(save_payload.get("saved")):
+                typer.echo(f"默认远程目标已保存: {save_payload.get('target', '')}")
+            else:
+                typer.echo(f"未保存默认远程目标: {save_payload.get('reason', 'unknown')}")
+        return True
+
     if subcommand == "fix":
         instruction = " ".join(tokens[1:]).strip() or "修复巡检发现的问题"
         _run_fix(
@@ -10622,6 +10648,9 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
     return {
         "title": "LazySRE TUI",
         "version": __version__,
+        "local_control_plane": "mac" if sys.platform == "darwin" else "local",
+        "target_strategy": "remote-first" if sys.platform == "darwin" else "local-or-remote",
+        "safety_posture": "read-only-first",
         "ui_mode": _normalize_tui_ui_mode(str(options.get("tui_ui_mode", "simple"))),
         "mode": "execute" if bool(options.get("execute", False)) else "dry-run",
         "provider": str(options.get("provider", "auto")),
@@ -10664,6 +10693,8 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
         "recommended_commands": _dedupe_strings([item for item in recommended_commands if item])[:6],
         "active_provider": _resolve_runtime_provider_label(str(options.get("provider", "auto"))),
         "shortcuts": [
+            "/connect <user>@<host>",
+            "/remote --logs",
             "/brief",
             "/scan",
             "/drift",
@@ -10678,7 +10709,7 @@ def _build_tui_dashboard_snapshot(options: dict[str, object]) -> dict[str, objec
             "/refresh",
             "/providers",
             "/swarm --logs",
-            "/remote root@host --logs",
+            "/remote <user>@<host> --logs",
             "/autopilot",
             "/remediate <目标>",
             "/mode execute",
@@ -11382,6 +11413,8 @@ def _build_tui_compact_sidebar_lines(snapshot: dict[str, object], *, width: int)
     coach = _build_tui_start_coach(snapshot)
     boot_actions = _build_tui_boot_actions(snapshot)
     provider = str(snapshot.get("active_provider", snapshot.get("provider", "-"))).strip() or "-"
+    control_plane = str(snapshot.get("local_control_plane", "local")).strip() or "local"
+    ssh_target = str(snapshot.get("ssh_target", "") or "").strip()
     targets = snapshot.get("usable_targets", [])
     target_list = [str(item).strip() for item in targets if str(item).strip()] if isinstance(targets, list) else []
     focus = _truncate_tui_status_text(str(state_card.get("focus", "-")), max_chars=96)
@@ -11407,6 +11440,8 @@ def _build_tui_compact_sidebar_lines(snapshot: dict[str, object], *, width: int)
         "F3 切换 simple/expert",
         "",
         "Runtime",
+        f"Control   {control_plane}",
+        f"Target    {ssh_target or 'remote not set'}",
         f"Provider  {provider}",
         f"Targets   {', '.join(target_list[:3]) if target_list else '-'}",
     ]
@@ -11492,11 +11527,31 @@ def _build_tui_start_coach(snapshot: dict[str, object]) -> dict[str, object]:
     provider_ready = bool(snapshot.get("provider_ready"))
     targets = snapshot.get("usable_targets", [])
     target_count = len(targets) if isinstance(targets, list) else 0
+    ssh_target = str(snapshot.get("ssh_target", "") or "").strip()
+    remote_first = str(snapshot.get("target_strategy", "")).strip().lower() == "remote-first"
     status = str(snapshot.get("status", "")).strip().lower()
     latest = snapshot.get("latest_quick_action", {})
     latest_status = str(latest.get("status", "")).strip().lower() if isinstance(latest, dict) else ""
     state_card = _build_tui_state_card(snapshot)
 
+    if remote_first and (not ssh_target):
+        return {
+            "phase": "connect_target",
+            "phase_label": "连接目标",
+            "headline": "Mac 作为控制台，先连接服务器目标",
+            "primary": "/go 1",
+            "hint": "hint> 先执行 /connect <user>@<host> 做只读 SSH 体检并保存目标；本机扫描只作为控制台依赖检查。",
+            "steps": ["/go 1", "/go 2", "/go 3"],
+        }
+    if ssh_target and latest_status != "fail" and status in {"cold-start", "unknown"}:
+        return {
+            "phase": "remote_observe",
+            "phase_label": "观察服务器",
+            "headline": f"默认只读观察远程目标 {ssh_target}",
+            "primary": "/go 1",
+            "hint": "hint> 先运行 /remote --logs 读取服务器证据；修复默认只生成计划，不直接执行生产变更。",
+            "steps": ["/go 1", "/go 2", "/go 3"],
+        }
     if not provider_ready:
         return {
             "phase": "connect_llm",
@@ -11510,9 +11565,9 @@ def _build_tui_start_coach(snapshot: dict[str, object]) -> dict[str, object]:
         return {
             "phase": "scan_env",
             "phase_label": "自动探测环境",
-            "headline": "先做一次全局扫描",
+            "headline": "先做一次本机依赖扫描",
             "primary": "/go 1",
-            "hint": "hint> 先执行 /scan，LazySRE 会自动识别 Docker/Swarm/K8s/Prometheus。",
+            "hint": "hint> /scan 只确认本机控制台能力；生产环境建议通过 /connect <user>@<host> 接入。",
             "steps": ["/go 1", "/go 2"],
         }
     if latest_status == "fail":
@@ -11558,6 +11613,8 @@ def _pick_tui_next_command(snapshot: dict[str, object]) -> str:
     ]
     tokens = [
         "/do 1",
+        "/connect",
+        "/remote",
         "/scan",
         "/brief",
         "/trace",
@@ -11590,7 +11647,9 @@ def _resolve_tui_coach_primary_command(snapshot: dict[str, object], primary: str
         action_id = _safe_int(lowered[len("/go ") :].strip())
         if action_id > 0:
             return _resolve_tui_boot_action_command(snapshot, action_id)
-    if lowered in {"/provider mock", "/provider gemini", "/providers", "/quickstart", "/scan", "/brief", "/trace", "/timeline", "/doctor strict", "/do 1"}:
+    if lowered.startswith("/connect") or lowered.startswith("/remote"):
+        return value
+    if lowered in {"/provider mock", "/provider gemini", "/providers", "/quickstart", "/scan", "/brief", "/trace", "/timeline", "/doctor strict", "/do 1", "/preflight"}:
         return lowered
     return ""
 
@@ -11599,6 +11658,22 @@ def _build_tui_boot_actions(snapshot: dict[str, object]) -> list[str]:
     coach = _build_tui_start_coach(snapshot)
     phase = str(coach.get("phase", "")).strip()
     provider_ready = bool(snapshot.get("provider_ready"))
+    ssh_target = str(snapshot.get("ssh_target", "") or "").strip()
+    if phase == "connect_target":
+        return [
+            "1) /connect <user>@<host>（只读 SSH 体检并保存目标）",
+            "2) /remote <user>@<host> --logs（只读诊断服务器）",
+            "3) /scan（仅检查本机控制台依赖）",
+            "4) /preflight（发布前门禁）",
+        ]
+    if phase == "remote_observe":
+        remote_cmd = "/remote --logs" if ssh_target else "/remote <user>@<host> --logs"
+        return [
+            f"1) {remote_cmd}（只读读取服务器证据）",
+            "2) /brief（本机+远程总览）",
+            "3) /autopilot --remote @target --logs（生成建议，不执行变更）",
+            "4) /doctor strict（控制台依赖体检）",
+        ]
     if (not provider_ready) or phase == "connect_llm":
         return [
             "1) /quickstart（一键补齐基础环境）",
@@ -11620,6 +11695,17 @@ def _resolve_tui_boot_action_command(snapshot: dict[str, object], action_id: int
     coach = _build_tui_start_coach(snapshot)
     phase = str(coach.get("phase", "")).strip()
     provider_ready = bool(snapshot.get("provider_ready"))
+    ssh_target = str(snapshot.get("ssh_target", "") or "").strip()
+    if phase == "connect_target":
+        return {
+            1: "/connect",
+            2: "/remote --logs",
+            3: "/scan",
+            4: "/preflight",
+        }.get(action_id, "")
+    if phase == "remote_observe":
+        remote_cmd = "/remote --logs" if ssh_target else "/remote <user>@<host> --logs"
+        return {1: remote_cmd, 2: "/brief", 3: "/autopilot --remote @target --logs", 4: "/doctor strict"}.get(action_id, "")
     if (not provider_ready) or phase == "connect_llm":
         return {1: "/quickstart", 2: "/provider mock", 3: "/providers", 4: "/provider gemini"}.get(action_id, "")
     return {1: "/scan", 2: "/brief", 3: "/next", 4: "/doctor strict"}.get(action_id, "")
@@ -13545,7 +13631,7 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
         tail = normalized[len("/remote") :].strip()
         target = _resolve_ssh_target_arg(_extract_ssh_target_from_text(tail))
         if not target:
-            return "用法：/remote [root@host] [--logs] [--service name]；或先 /connect root@host"
+            return "用法：/remote [root@host] [--logs] [--service name]；或先 /connect <user>@<host>"
         service_text = tail.replace(target, " ")
         return _capture_plain_output(
             lambda: _render_remote_docker_report(
@@ -13560,10 +13646,13 @@ def _handle_tui_input(text: str, options: dict[str, object]) -> str:
         )
     if lowered.startswith("/connect"):
         tail = normalized[len("/connect") :].strip()
+        target = _extract_ssh_target_from_text(tail)
+        if not target:
+            return "用法：/connect <user>@<host>。示例：/connect root@192.168.10.101。该操作只做 SSH/Docker/Swarm 只读体检，成功后保存默认目标。"
         return _capture_plain_output(
             lambda: _render_remote_docker_report(
                 _run_remote_connect_flow(
-                    target=_extract_ssh_target_from_text(tail),
+                    target=target,
                     save_target=True,
                     include_logs="--logs" in lowered or "日志" in normalized,
                     tail=80,
@@ -14429,7 +14518,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             tail = text[len("/remote") :].strip()
             target = _resolve_ssh_target_arg(_extract_ssh_target_from_text(tail))
             if not target:
-                typer.echo("用法：/remote [root@192.168.10.101] [--logs] [--service name]；或先 /connect root@host")
+                typer.echo("用法：/remote [root@192.168.10.101] [--logs] [--service name]；或先 /connect <user>@<host>")
                 continue
             service_text = tail.replace(target, " ")
             report = _collect_remote_docker_report(
