@@ -4650,6 +4650,36 @@ def test_remote_scenario_packs_collect_linux_nginx_gpu(monkeypatch: pytest.Monke
     assert any("nvidia-smi" in item for item in calls)
 
 
+def test_remote_report_markdown_includes_scenario_findings() -> None:
+    markdown = cli_main._render_remote_docker_report_markdown(
+        {
+            "generated_at_utc": "2026-04-24T00:00:00Z",
+            "target": "root@192.168.10.101",
+            "ok": False,
+            "summary": {"pass": 1, "warn": 1, "error": 0},
+            "briefing": {},
+            "checks": [],
+            "scenario_reports": [
+                {
+                    "name": "linux",
+                    "severity": "warn",
+                    "status": "disk_pressure",
+                    "headline": "Linux 主机磁盘使用率最高 90%，需要优先确认容量。",
+                    "signals": ["max_disk=90%"],
+                    "recommendations": ["lazysre remote root@192.168.10.101 --scenario linux --json"],
+                }
+            ],
+            "root_causes": [],
+            "recommendations": [],
+        }
+    )
+
+    assert "status=`disk_pressure`" in markdown
+    assert "Linux 主机磁盘使用率最高 90%" in markdown
+    assert "Signals: max_disk=90%" in markdown
+    assert "Next: `lazysre remote root@192.168.10.101 --scenario linux --json`" in markdown
+
+
 def test_extract_remote_scenarios_from_text_and_all_alias() -> None:
     assert cli_main._extract_remote_scenarios_from_text("远程检查 nginx gpu root@1.1.1.1") == ["nginx", "gpu"]
     assert cli_main._normalize_remote_scenarios(["all"]) == ["linux", "nginx", "database", "gpu", "ai", "cicd"]

@@ -6298,15 +6298,22 @@ def _render_remote_docker_report(report: dict[str, object]) -> None:
         scenario_table = Table(title="Scenario Packs")
         scenario_table.add_column("Scenario", style="cyan")
         scenario_table.add_column("Severity", style="white", no_wrap=True)
-        scenario_table.add_column("Summary", style="white")
-        scenario_table.add_column("Hint", style="yellow")
+        scenario_table.add_column("Status", style="white", no_wrap=True)
+        scenario_table.add_column("Finding", style="white")
+        scenario_table.add_column("Next", style="yellow")
         for raw in scenario_reports[:12]:
             item = raw if isinstance(raw, dict) else {}
+            recs = item.get("recommendations", [])
+            next_step = ""
+            if isinstance(recs, list) and recs:
+                next_step = str(recs[0])
+            finding = str(item.get("headline") or item.get("summary") or "-")
             scenario_table.add_row(
                 str(item.get("name", "-")),
                 str(item.get("severity", "-")).upper(),
-                str(item.get("summary", "-"))[:180],
-                str(item.get("hint", ""))[:160],
+                str(item.get("status", "-")),
+                finding[:180],
+                next_step[:160] or str(item.get("hint", ""))[:160],
             )
         _console.print(scenario_table)
     recommendations = report.get("recommendations", [])
@@ -6354,7 +6361,16 @@ def _render_remote_docker_report_markdown(report: dict[str, object]) -> str:
         for item in scenario_reports:
             if not isinstance(item, dict):
                 continue
-            lines.append(f"- `{item.get('name', '-')}` severity=`{item.get('severity', '-')}` summary={item.get('summary', '-')}")
+            lines.append(
+                f"- `{item.get('name', '-')}` severity=`{item.get('severity', '-')}` "
+                f"status=`{item.get('status', '-')}` headline={item.get('headline') or item.get('summary', '-')}"
+            )
+            signals = item.get("signals", [])
+            if isinstance(signals, list) and signals:
+                lines.append(f"  Signals: {'; '.join(str(signal) for signal in signals[:4])}")
+            recs = item.get("recommendations", [])
+            if isinstance(recs, list) and recs:
+                lines.append(f"  Next: `{recs[0]}`")
     else:
         lines.append("- No scenario packs requested.")
     lines.append("")

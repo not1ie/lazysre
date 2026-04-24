@@ -169,7 +169,7 @@ lazysre scan
 lazysre swarm --logs
 # 远程服务器只读诊断（目标机无需安装 LazySRE，只需可 SSH）
 lazysre remote root@192.168.10.101 --logs
-# 远程场景 Pack：Linux/Nginx/数据库/GPU/AI/CI/CD，只读采集证据
+# 远程场景 Pack：Linux/Nginx/数据库/GPU/AI/CI/CD，只读采集证据，并给出分级结论和下一步
 lazysre remote root@192.168.10.101 --scenario linux --scenario nginx
 lazysre remote root@192.168.10.101 --scenario all --json
 # 首次连接体检：SSH 连通后自动保存默认远程目标
