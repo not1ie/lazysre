@@ -8595,6 +8595,12 @@ def _collect_preflight_report(
     summary["strict_mode"] = strict
     summary["strict_healthy"] = _doctor_is_healthy(summary, strict=strict)
     result = {
+        "kind": "preflight",
+        "scope": {
+            "secret_scan": "staged" if staged else "all_files",
+            "dry_run_probe": dry_run_probe,
+            "strict": strict,
+        },
         "checks": checks,
         "summary": summary,
         "sections": {
@@ -10152,10 +10158,35 @@ def _render_doctor_report(report: dict[str, object]) -> None:
         summary_text = (
             f"{summary_text} autofix_changed={autofix.get('changed', False)}"
         )
+    kind = str(report.get("kind", "doctor")).strip().lower()
+    title_prefix = "Preflight Gate" if kind == "preflight" else "Doctor Summary"
     if Panel:
-        _console.print(Panel(summary_text, title="Doctor Summary", border_style="cyan"))
+        _console.print(Panel(summary_text, title=title_prefix, border_style="cyan"))
+    sections = report.get("sections", {})
+    if isinstance(sections, dict) and sections and Panel:
+        lines: list[str] = []
+        for name, section in sections.items():
+            if not isinstance(section, dict):
+                continue
+            lines.append(
+                f"{name}: pass={section.get('pass', 0)} warn={section.get('warn', 0)} "
+                f"error={section.get('error', 0)} healthy={section.get('healthy', False)}"
+            )
+        if lines:
+            _console.print(Panel("\n".join(lines), title="Preflight Sections", border_style="blue"))
+    if isinstance(gate, dict) and int(gate.get("blocking_count", 0) or 0) > 0 and Panel:
+        blocking = gate.get("blocking_checks", [])
+        if isinstance(blocking, list):
+            lines = []
+            for raw in blocking[:8]:
+                item = raw if isinstance(raw, dict) else {}
+                hint = str(item.get("hint", "")).strip()
+                suffix = f" - {hint}" if hint else ""
+                lines.append(f"{item.get('severity', '-')}: {item.get('name', '-')}{suffix}")
+            if lines:
+                _console.print(Panel("\n".join(lines), title="Blocking Checks", border_style="red"))
     checks = report.get("checks", [])
-    table = Table(title="Doctor Checks")
+    table = Table(title="Preflight Checks" if kind == "preflight" else "Doctor Checks")
     table.add_column("Check", style="cyan")
     table.add_column("Severity", style="white", no_wrap=True)
     table.add_column("Detail", style="white")
