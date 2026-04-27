@@ -112,6 +112,59 @@ class PlatformTemplate(BaseModel):
     stages: list[str] = Field(default_factory=list)
 
 
+class SkillDefinition(BaseModel):
+    name: str = Field(min_length=2, max_length=128)
+    title: str = Field(min_length=1, max_length=180)
+    description: str = ""
+    category: str = "custom"
+    mode: str = "diagnose"
+    risk_level: str = "low"
+    required_permission: str = "read"
+    instruction: str = Field(min_length=1, max_length=4000)
+    variables: dict[str, str] = Field(default_factory=dict)
+    read_commands: list[str] = Field(default_factory=list)
+    apply_commands: list[str] = Field(default_factory=list)
+    verify_commands: list[str] = Field(default_factory=list)
+    rollback_commands: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    source: str = "builtin"
+
+
+class SkillCreateRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=128)
+    title: str = Field(min_length=1, max_length=180)
+    description: str = ""
+    category: str = "custom"
+    mode: str = "diagnose"
+    risk_level: str = "low"
+    required_permission: str = "read"
+    instruction: str = Field(min_length=1, max_length=4000)
+    variables: dict[str, str] = Field(default_factory=dict)
+    read_commands: list[str] = Field(default_factory=list)
+    apply_commands: list[str] = Field(default_factory=list)
+    verify_commands: list[str] = Field(default_factory=list)
+    rollback_commands: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+
+
+class SkillRunRequest(BaseModel):
+    variables: dict[str, str] = Field(default_factory=dict)
+    dry_run: bool = True
+    apply: bool = False
+    timeout_sec: int = 20
+
+
+class SkillRunResult(BaseModel):
+    skill: SkillDefinition
+    variables: dict[str, str] = Field(default_factory=dict)
+    dry_run: bool = True
+    apply: bool = False
+    commands: dict[str, list[str]] = Field(default_factory=dict)
+    status: str
+    outputs: list[dict[str, Any]] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+
+
 class AutoDesignRequest(BaseModel):
     objective: str = Field(min_length=3, max_length=2000)
     name: str | None = None

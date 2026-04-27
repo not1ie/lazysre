@@ -379,6 +379,9 @@ def test_rewrite_argv_preserves_report_and_runbook_subcommands() -> None:
     argv24 = ["lsre", "preflight", "--strict", "--json"]
     _rewrite_argv_for_default_run(argv24)
     assert argv24 == ["lsre", "preflight", "--strict", "--json"]
+    argv25 = ["lsre", "skill", "list"]
+    _rewrite_argv_for_default_run(argv25)
+    assert argv25 == ["lsre", "skill", "list"]
 
 
 def test_secret_store_supports_multiple_provider_keys(tmp_path: Path) -> None:
@@ -925,6 +928,7 @@ def test_should_launch_default_tui_with_only_options() -> None:
     assert _should_launch_default_tui(["report"]) is False
     assert _should_launch_default_tui(["incident"]) is False
     assert _should_launch_default_tui(["runbook"]) is False
+    assert _should_launch_default_tui(["skill"]) is False
     assert _should_launch_default_tui(["approve"]) is False
     assert _should_launch_default_tui(["memory"]) is False
     assert _should_launch_default_tui(["version"]) is False
@@ -963,6 +967,7 @@ def test_should_launch_assistant_is_no_longer_default_surface() -> None:
     assert _should_launch_assistant(["report"]) is False
     assert _should_launch_assistant(["incident"]) is False
     assert _should_launch_assistant(["runbook"]) is False
+    assert _should_launch_assistant(["skill"]) is False
     assert _should_launch_assistant(["approve"]) is False
     assert _should_launch_assistant(["memory"]) is False
     assert _should_launch_assistant(["version"]) is False

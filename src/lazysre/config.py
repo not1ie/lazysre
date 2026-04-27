@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     target_profile_file: str = ".data/lsre-target.json"
     target_profiles_file: str = ".data/lsre-target-profiles.json"
     runbook_store_file: str = ".data/lsre-runbooks.json"
+    skill_store_file: str = ".data/lsre-skills.json"
     target_prometheus_url: str = "http://92.168.69.176:9090"
     target_k8s_api_url: str = "https://192.168.10.1:6443"
     target_k8s_context: str = ""

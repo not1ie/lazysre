@@ -11,6 +11,14 @@ from typing import Any
 import httpx
 
 from lazysre.config import settings
+from lazysre.cli.skills import (
+    SkillStore,
+    SkillTemplate,
+    all_skills,
+    find_skill,
+    run_skill,
+    skill_from_dict,
+)
 from lazysre.platform.engine import WorkflowEngine
 from lazysre.platform.models import (
     AgentCreateRequest,
@@ -34,6 +42,10 @@ from lazysre.platform.models import (
     RunEvent,
     RunReport,
     RunStatus,
+    SkillCreateRequest,
+    SkillDefinition,
+    SkillRunRequest,
+    SkillRunResult,
     ToolCreateRequest,
     ToolHealthItem,
     ToolProbeRequest,
@@ -53,6 +65,7 @@ class PlatformService:
         path = store_path or str(Path(settings.data_dir) / settings.platform_store_file)
         self._artifact_dir = Path(path).resolve().parent / "artifacts"
         self._store = FilePlatformStore(path)
+        self._skill_store = SkillStore.default()
         self._state = self._store.load()
         self._lock = asyncio.Lock()
         self._running: dict[str, asyncio.Task[None]] = {}
@@ -120,6 +133,61 @@ class PlatformService:
 
     async def list_templates(self) -> list[PlatformTemplate]:
         return list(self._templates.values())
+
+    async def list_skills(self) -> list[SkillDefinition]:
+        return [_skill_definition(item) for item in all_skills(store=self._skill_store)]
+
+    async def get_skill(self, name: str) -> SkillDefinition | None:
+        item = find_skill(name, store=self._skill_store)
+        return _skill_definition(item) if item else None
+
+    async def create_skill(self, req: SkillCreateRequest) -> SkillDefinition:
+        item = skill_from_dict(
+            req.name,
+            {
+                "title": req.title,
+                "description": req.description,
+                "category": req.category,
+                "mode": req.mode,
+                "risk_level": req.risk_level,
+                "required_permission": req.required_permission,
+                "instruction": req.instruction,
+                "variables": req.variables,
+                "read_commands": req.read_commands,
+                "apply_commands": req.apply_commands,
+                "verify_commands": req.verify_commands,
+                "rollback_commands": req.rollback_commands,
+                "tags": req.tags,
+            },
+            source="custom",
+        )
+        if not item:
+            raise ValueError("invalid skill payload")
+        self._skill_store.upsert(item)
+        return _skill_definition(item)
+
+    async def run_skill(self, name: str, req: SkillRunRequest) -> SkillRunResult:
+        item = find_skill(name, store=self._skill_store)
+        if not item:
+            raise ValueError("skill not found")
+        result = run_skill(
+            item,
+            overrides=req.variables,
+            dry_run=req.dry_run,
+            apply=req.apply,
+            timeout_sec=req.timeout_sec,
+        )
+        payload = result.to_dict()
+        return SkillRunResult(
+            skill=_skill_definition(result.skill),
+            variables=payload["variables"],
+            dry_run=payload["dry_run"],
+            apply=payload["apply"],
+            commands=payload["commands"],
+            status=payload["status"],
+            outputs=payload["outputs"],
+            next_actions=payload["next_actions"],
+        )
 
     async def bootstrap_environment(
         self, req: EnvironmentBootstrapRequest
@@ -1379,3 +1447,23 @@ def _default_templates() -> list[PlatformTemplate]:
             stages=["assess", "execute", "critique", "communicate"],
         ),
     ]
+
+
+def _skill_definition(item: SkillTemplate) -> SkillDefinition:
+    return SkillDefinition(
+        name=item.name,
+        title=item.title,
+        description=item.description,
+        category=item.category,
+        mode=item.mode,
+        risk_level=item.risk_level,
+        required_permission=item.required_permission,
+        instruction=item.instruction,
+        variables=dict(item.variables),
+        read_commands=list(item.read_commands),
+        apply_commands=list(item.apply_commands),
+        verify_commands=list(item.verify_commands),
+        rollback_commands=list(item.rollback_commands),
+        tags=list(item.tags),
+        source=item.source,
+    )

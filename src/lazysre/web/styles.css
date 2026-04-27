@@ -233,6 +233,115 @@ button.danger {
   margin-bottom: 10px;
 }
 
+.skill-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: 12px;
+  align-items: start;
+  border: 1px solid rgba(29, 143, 148, 0.22);
+  border-radius: 16px;
+  padding: 13px;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.92), rgba(242, 251, 250, 0.8));
+  margin-bottom: 10px;
+}
+
+.skill-hero h3 {
+  font-size: 19px;
+  margin: 4px 0 6px;
+}
+
+.skill-hero p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+#skill-vars-json,
+#skill-default-vars,
+#skill-read-commands {
+  min-height: 74px;
+}
+
+.skill-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  max-height: 300px;
+  overflow: auto;
+  margin-bottom: 10px;
+}
+
+.skill-card {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.82);
+  cursor: pointer;
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.skill-card:hover {
+  transform: translateY(-2px);
+}
+
+.skill-card.active {
+  border-color: rgba(29, 143, 148, 0.65);
+  box-shadow: 0 10px 24px rgba(29, 143, 148, 0.12);
+}
+
+.skill-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: "Space Mono", monospace;
+  font-size: 11px;
+  color: var(--accent-2);
+  text-transform: uppercase;
+}
+
+.skill-card h3 {
+  margin: 8px 0 6px;
+  font-size: 15px;
+}
+
+.skill-card p {
+  margin: 0 0 8px;
+  min-height: 42px;
+  color: #34494f;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.skill-card .meta {
+  color: var(--muted);
+  font-family: "Space Mono", monospace;
+  font-size: 11px;
+}
+
+.skill-result-log {
+  min-height: 120px;
+  max-height: 210px;
+  background: #f7fbf8;
+  border-color: rgba(27, 136, 119, 0.24);
+}
+
+.skill-builder {
+  border: 1px dashed rgba(29, 143, 148, 0.28);
+  border-radius: 14px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.skill-builder summary {
+  cursor: pointer;
+  font-weight: 800;
+  color: var(--accent-2);
+}
+
+.skill-builder form {
+  margin-top: 10px;
+}
+
 .tool-list {
   display: grid;
   gap: 8px;
@@ -438,6 +547,11 @@ button.danger {
   }
 
   .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .skill-hero,
+  .skill-list {
     grid-template-columns: 1fr;
   }
 }

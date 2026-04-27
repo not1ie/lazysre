@@ -58,6 +58,7 @@ TUI 内常用命令：
 - `/connect <user>@<host>`：只读 SSH 体检目标服务器，成功后保存默认远程目标
 - `/remote --logs`：只读诊断已保存的远程 Docker/Swarm 目标
 - `/remote --scenario all`：只读采集 Linux/Nginx/数据库/GPU/AI/CI/CD 场景证据
+- Web Skill Center：打开 Web 控制台即可点选内置 Skill 模板或创建自定义 Skill，新手不需要记 CLI 参数
 - `/scan`：检查本机控制台依赖（Docker/kubectl/Prometheus 配置），不是生产扫描
 - `/brief`：生成本机控制台 + 远程目标总览
 - `/next`：执行系统推荐的下一步
@@ -127,7 +128,9 @@ lazysre --version
 - Provider 错误提示增强：Gemini/OpenAI/Anthropic/兼容网关异常会输出脱敏且可执行的修复建议
 - install-doctor 增加代理环境预检（自动识别 SOCKS 代理并提示 `httpx[socks]`）
 - install-doctor / doctor 增加工作区密钥泄漏预检（workspace_secret_scan，输出脱敏文件:行号）
-- 当前封版基线测试：`333 passed`
+- Web Skill Center MVP：内置远程服务器、K8s、Swarm、Nginx、数据库、GPU/AI、CI/CD Skill 模板，支持 Web 创建自定义 Skill 和 dry-run 预览
+- CLI Skill Center：`lsre skill list/show/run/add/remove`，与 Web 共用同一套 Skill 模板和自定义存储
+- 当前封版基线测试：`347 passed`
 
 ## 安装方式（开箱即用）
 
@@ -400,6 +403,16 @@ lsre template show swarm-replicas-unhealthy
 lsre template show swarm-image-pull-failed
 lsre template run k8s-crashloopbackoff --var namespace=prod --var pod=payment-6c8b7 --apply --execute
 lsre template run swarm-replicas-unhealthy --var service=lazysre_lazysre --apply --execute
+
+# Skill Center（Web/CLI 共用，默认 dry-run，不直接改生产）
+lsre skill list
+lsre skill show remote-health
+lsre skill run remote-health --var ssh_target=root@192.168.10.101
+lsre skill add team-nginx-check \
+  --title "团队 Nginx 巡检" \
+  --instruction "检查团队服务器 Nginx" \
+  --var ssh_target=root@192.168.10.101 \
+  --read-command 'lazysre remote {ssh_target} --scenario nginx --logs'
 
 # Runbook 工作流
 lsre runbook list

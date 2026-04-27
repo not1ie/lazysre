@@ -57,6 +57,16 @@ from lazysre.cli.runbook import (
     parse_runbook_vars,
     render_runbook_instruction,
 )
+from lazysre.cli.skills import (
+    SkillStore,
+    SkillTemplate,
+    all_skills,
+    find_skill,
+    parse_skill_vars,
+    render_skill_commands,
+    run_skill as execute_skill_template,
+    skill_from_dict,
+)
 from lazysre.cli.remediation_templates import (
     get_template as get_remediation_template,
     list_templates as list_remediation_templates,
@@ -113,6 +123,7 @@ memory_app = typer.Typer(help="Long-term incident memory management.")
 incident_app = typer.Typer(help="Incident lifecycle management.")
 runbook_app = typer.Typer(help="Workflow runbook templates.")
 template_app = typer.Typer(help="One-click remediation templates.")
+skill_app = typer.Typer(help="Web/CLI managed SRE skills.")
 
 
 @app.callback(invoke_without_command=True)
@@ -1157,6 +1168,145 @@ def template_run(
         model=str(options["model"]),
         provider=str(options["provider"]),
     )
+
+
+@skill_app.command("list")
+def skill_list(
+    skill_file: Annotated[str, typer.Option("--skill-file", help="Skill store JSON path.")] = settings.skill_store_file,
+    custom_only: Annotated[bool, typer.Option("--custom-only", help="Show custom skills only.")] = False,
+) -> None:
+    store = SkillStore(Path(skill_file))
+    items = store.list_custom() if custom_only else all_skills(store=store)
+    if not (_console and Table):
+        for item in items:
+            typer.echo(f"{item.name} [{item.mode}] risk={item.risk_level} ({item.source}) {item.title}")
+        return
+    table = Table(title="LazySRE Skill Center")
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Category", style="magenta", no_wrap=True)
+    table.add_column("Risk", style="yellow", no_wrap=True)
+    table.add_column("Source", style="green", no_wrap=True)
+    table.add_column("Title", style="white")
+    table.add_column("Tags", style="dim")
+    for item in items:
+        table.add_row(
+            item.name,
+            item.category,
+            item.risk_level,
+            item.source,
+            item.title,
+            ", ".join(item.tags[:5]),
+        )
+    _console.print(table)
+
+
+@skill_app.command("show")
+def skill_show(
+    name: Annotated[str, typer.Argument(help="Skill name.")],
+    skill_file: Annotated[str, typer.Option("--skill-file", help="Skill store JSON path.")] = settings.skill_store_file,
+) -> None:
+    item = find_skill(name, store=SkillStore(Path(skill_file)))
+    if not item:
+        raise typer.BadParameter(f"skill not found: {name}")
+    commands, variables = render_skill_commands(item, overrides={})
+    payload = item.to_dict()
+    payload["variables"] = variables
+    payload["commands"] = commands
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@skill_app.command("run")
+def skill_run(
+    name: Annotated[str, typer.Argument(help="Skill name.")],
+    var: Annotated[list[str], typer.Option("--var", "-v", help="Skill variables key=value, can be repeated.")] = [],
+    apply: Annotated[bool, typer.Option("--apply", help="Include apply and verify commands.")] = False,
+    execute: Annotated[bool, typer.Option("--execute", help="Execute commands. Default is dry-run.")] = False,
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Command timeout seconds.")] = 20,
+    skill_file: Annotated[str, typer.Option("--skill-file", help="Skill store JSON path.")] = settings.skill_store_file,
+) -> None:
+    item = find_skill(name, store=SkillStore(Path(skill_file)))
+    if not item:
+        raise typer.BadParameter(f"skill not found: {name}")
+    try:
+        values = parse_skill_vars(list(var))
+    except ValueError as exc:
+        raise typer.BadParameter(_safe_exception_text(exc)) from exc
+    result = execute_skill_template(
+        item,
+        overrides=values,
+        dry_run=not execute,
+        apply=apply,
+        timeout_sec=max(1, min(timeout_sec, 300)),
+    )
+    _render_skill_run_result(result.to_dict())
+
+
+@skill_app.command("add")
+def skill_add(
+    name: Annotated[str, typer.Argument(help="Skill name.")],
+    title: Annotated[str, typer.Option("--title", help="Skill title.")],
+    instruction: Annotated[str, typer.Option("--instruction", help="Natural language goal/instruction.")],
+    read_command: Annotated[list[str], typer.Option("--read-command", help="Read-only command, repeatable.")] = [],
+    apply_command: Annotated[list[str], typer.Option("--apply-command", help="Apply command, repeatable.")] = [],
+    verify_command: Annotated[list[str], typer.Option("--verify-command", help="Verify command, repeatable.")] = [],
+    rollback_command: Annotated[list[str], typer.Option("--rollback-command", help="Rollback command, repeatable.")] = [],
+    category: Annotated[str, typer.Option("--category", help="Skill category.")] = "custom",
+    mode: Annotated[str, typer.Option("--mode", help="diagnose|fix|workflow")] = "diagnose",
+    risk_level: Annotated[str, typer.Option("--risk-level", help="low|medium|high|critical")] = "low",
+    required_permission: Annotated[str, typer.Option("--required-permission", help="read|write|admin")] = "read",
+    description: Annotated[str, typer.Option("--description", help="Short description.")] = "",
+    var: Annotated[list[str], typer.Option("--var", "-v", help="Default variable key=value, repeatable.")] = [],
+    tag: Annotated[list[str], typer.Option("--tag", help="Tag, repeatable.")] = [],
+    skill_file: Annotated[str, typer.Option("--skill-file", help="Skill store JSON path.")] = settings.skill_store_file,
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing custom skill.")] = False,
+) -> None:
+    store = SkillStore(Path(skill_file))
+    if find_skill(name, store=store) and not force:
+        raise typer.BadParameter(f"skill already exists: {name}. use --force to overwrite.")
+    try:
+        variables = parse_skill_vars(list(var))
+    except ValueError as exc:
+        raise typer.BadParameter(_safe_exception_text(exc)) from exc
+    item = skill_from_dict(
+        name,
+        {
+            "title": title,
+            "description": description,
+            "category": category,
+            "mode": mode,
+            "risk_level": risk_level,
+            "required_permission": required_permission,
+            "instruction": instruction,
+            "variables": variables,
+            "read_commands": list(read_command),
+            "apply_commands": list(apply_command),
+            "verify_commands": list(verify_command),
+            "rollback_commands": list(rollback_command),
+            "tags": list(tag),
+        },
+        source="custom",
+    )
+    if not item:
+        raise typer.BadParameter("invalid skill payload")
+    store.upsert(item)
+    typer.echo(f"Saved skill: {item.name} ({item.mode}, risk={item.risk_level})")
+
+
+@skill_app.command("remove")
+def skill_remove(
+    name: Annotated[str, typer.Argument(help="Custom skill name.")],
+    skill_file: Annotated[str, typer.Option("--skill-file", help="Skill store JSON path.")] = settings.skill_store_file,
+    yes: Annotated[bool, typer.Option("--yes", help="Skip confirmation prompt.")] = False,
+) -> None:
+    store = SkillStore(Path(skill_file))
+    custom = store.get_custom(name)
+    if not custom:
+        raise typer.BadParameter(f"custom skill not found: {name}")
+    if not yes and not typer.confirm(f"确认删除自定义 skill {name} 吗？", default=False):
+        typer.echo("Canceled.")
+        return
+    store.remove(name)
+    typer.echo(f"Removed skill: {name}")
 
 
 @app.command("approve")
@@ -3466,6 +3616,7 @@ app.add_typer(memory_app, name="memory")
 app.add_typer(incident_app, name="incident")
 app.add_typer(runbook_app, name="runbook")
 app.add_typer(template_app, name="template")
+app.add_typer(skill_app, name="skill")
 
 
 def _render_timeline(events) -> None:
@@ -13768,6 +13919,50 @@ def _safe_exception_text(exc: Exception) -> str:
     return _sanitize_tui_secret_tokens(str(exc).strip() or exc.__class__.__name__)
 
 
+def _render_skill_run_result(result: dict[str, object]) -> None:
+    skill = result.get("skill", {})
+    skill_name = str(skill.get("name", "-") if isinstance(skill, dict) else "-")
+    status = str(result.get("status", "-"))
+    dry_run = bool(result.get("dry_run", True))
+    commands = result.get("commands", {})
+    if _console and Panel:
+        lines = [
+            f"skill={skill_name}",
+            f"status={status}",
+            f"mode={'dry-run' if dry_run else 'execute'}",
+        ]
+        _console.print(Panel("\n".join(lines), title="Skill Run", border_style="cyan"))
+    else:
+        typer.echo(f"Skill Run: {skill_name} status={status} mode={'dry-run' if dry_run else 'execute'}")
+    if isinstance(commands, dict):
+        for group in ("read", "apply", "verify", "rollback"):
+            rows = commands.get(group, [])
+            if not isinstance(rows, list) or not rows:
+                continue
+            typer.echo(f"\n[{group}]")
+            for command in rows:
+                typer.echo(f"- {command}")
+    outputs = result.get("outputs", [])
+    if isinstance(outputs, list) and outputs:
+        typer.echo("\n[outputs]")
+        for item in outputs:
+            if not isinstance(item, dict):
+                continue
+            typer.echo(f"$ {item.get('command', '')}")
+            typer.echo(f"exit={item.get('exit_code', '-')}")
+            stdout = str(item.get("stdout", "") or "").strip()
+            stderr = str(item.get("stderr", "") or "").strip()
+            if stdout:
+                typer.echo(stdout[:1600])
+            if stderr:
+                typer.echo(stderr[:1200])
+    next_actions = result.get("next_actions", [])
+    if isinstance(next_actions, list) and next_actions:
+        typer.echo("\n[next]")
+        for item in next_actions:
+            typer.echo(f"- {item}")
+
+
 def _should_auto_fallback_to_mock(*, provider_mode: str, error: Exception) -> bool:
     if str(os.getenv("LAZYSRE_DISABLE_MOCK_FALLBACK", "")).strip() == "1":
         return False
@@ -19168,6 +19363,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "incident",
         "template",
         "runbook",
+        "skill",
         "pack",
         "target",
         "history",
@@ -19241,6 +19437,7 @@ def _should_launch_default_tui(tokens: list[str]) -> bool:
         "incident",
         "template",
         "runbook",
+        "skill",
         "pack",
         "target",
         "history",
@@ -19313,6 +19510,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "incident",
         "template",
         "runbook",
+        "skill",
         "pack",
         "target",
         "history",

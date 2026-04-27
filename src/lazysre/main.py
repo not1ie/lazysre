@@ -25,6 +25,10 @@ from lazysre.platform.models import (
     RunComparison,
     RunApprovalRequest,
     RunCreateRequest,
+    SkillCreateRequest,
+    SkillDefinition,
+    SkillRunRequest,
+    SkillRunResult,
     ToolCreateRequest,
     ToolHealthItem,
     ToolProbeRequest,
@@ -152,6 +156,37 @@ async def probe_tool(tool_id: str, req: ToolProbeRequest) -> ToolProbeResult:
 @app.get("/v1/platform/templates", response_model=list[PlatformTemplate])
 async def list_templates() -> list[PlatformTemplate]:
     return await platform_service.list_templates()
+
+
+@app.get("/v1/platform/skills", response_model=list[SkillDefinition])
+async def list_skills() -> list[SkillDefinition]:
+    return await platform_service.list_skills()
+
+
+@app.get("/v1/platform/skills/{skill_name}", response_model=SkillDefinition)
+async def get_skill(skill_name: str) -> SkillDefinition:
+    item = await platform_service.get_skill(skill_name)
+    if not item:
+        raise HTTPException(status_code=404, detail="skill not found")
+    return item
+
+
+@app.post("/v1/platform/skills", response_model=SkillDefinition)
+async def create_skill(req: SkillCreateRequest) -> SkillDefinition:
+    try:
+        return await platform_service.create_skill(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/platform/skills/{skill_name}/run", response_model=SkillRunResult)
+async def run_skill(skill_name: str, req: SkillRunRequest) -> SkillRunResult:
+    try:
+        return await platform_service.run_skill(skill_name, req)
+    except ValueError as exc:
+        msg = str(exc)
+        code = 404 if "not found" in msg else 400
+        raise HTTPException(status_code=code, detail=msg) from exc
 
 
 @app.get("/v1/platform/overview", response_model=PlatformOverview)

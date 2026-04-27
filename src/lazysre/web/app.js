@@ -1,5 +1,6 @@
 const state = {
   templates: [],
+  skills: [],
   tools: [],
   toolHealth: {},
   agents: [],
@@ -7,6 +8,7 @@ const state = {
   runs: [],
   artifacts: [],
   selectedArtifact: null,
+  selectedSkillName: null,
   selectedWorkflowId: null,
   selectedRunId: null,
   eventSource: null,
@@ -20,6 +22,17 @@ const els = {
   missionObjective: $("mission-objective"),
   missionMode: $("mission-mode"),
   templateSelect: $("template-select"),
+  refreshSkills: $("refresh-skills"),
+  runSkillBtn: $("run-skill-btn"),
+  skillList: $("skill-list"),
+  skillVarsJson: $("skill-vars-json"),
+  skillResultLog: $("skill-result-log"),
+  skillForm: $("skill-form"),
+  skillName: $("skill-name"),
+  skillTitle: $("skill-title"),
+  skillDescription: $("skill-description"),
+  skillDefaultVars: $("skill-default-vars"),
+  skillReadCommands: $("skill-read-commands"),
   workflowName: $("workflow-name"),
   envForm: $("env-form"),
   envMonitoringIp: $("env-monitoring-ip"),
@@ -133,6 +146,11 @@ function setArtifactPreview(text) {
   els.artifactPreview.scrollTop = 0;
 }
 
+function setSkillResult(text) {
+  els.skillResultLog.textContent = text;
+  els.skillResultLog.scrollTop = 0;
+}
+
 function setRunCompare(text) {
   els.runCompareLog.textContent = text;
   els.runCompareLog.scrollTop = 0;
@@ -154,6 +172,40 @@ function renderTemplateOptions() {
     els.templateSelect.appendChild(opt);
   }
   els.templateSelect.disabled = els.missionMode.value !== "template";
+}
+
+function renderSkills() {
+  els.skillList.innerHTML = "";
+  for (const skill of state.skills) {
+    const active = skill.name === state.selectedSkillName;
+    const row = document.createElement("article");
+    row.className = `skill-card ${active ? "active" : ""}`;
+    row.innerHTML = `
+      <div class="skill-top">
+        <span>${escapeHtml(skill.category)}</span>
+        <b>${escapeHtml(skill.risk_level)}</b>
+      </div>
+      <h3>${escapeHtml(skill.title)}</h3>
+      <p>${escapeHtml(skill.description || skill.instruction)}</p>
+      <div class="meta">${escapeHtml(skill.name)} · ${escapeHtml(skill.source)} · ${(skill.tags || []).slice(0, 4).map(escapeHtml).join(", ")}</div>
+    `;
+    row.onclick = () => {
+      state.selectedSkillName = skill.name;
+      els.skillVarsJson.value = JSON.stringify(skill.variables || {}, null, 2);
+      renderSkills();
+      setSummary(`已选择 Skill: ${skill.title}`);
+    };
+    els.skillList.appendChild(row);
+  }
+  if (!state.skills.length) {
+    els.skillList.innerHTML = `<div class="row-item"><div class="meta">暂无 Skill 模板</div></div>`;
+    return;
+  }
+  if (!state.selectedSkillName || !state.skills.find((x) => x.name === state.selectedSkillName)) {
+    state.selectedSkillName = state.skills[0].name;
+    els.skillVarsJson.value = JSON.stringify(state.skills[0].variables || {}, null, 2);
+    renderSkills();
+  }
 }
 
 function renderTools() {
@@ -362,6 +414,11 @@ async function loadTemplates() {
   renderTemplateOptions();
 }
 
+async function loadSkills() {
+  state.skills = await api("/v1/platform/skills");
+  renderSkills();
+}
+
 async function loadTools() {
   state.tools = await api("/v1/platform/tools");
   renderTools();
@@ -549,6 +606,91 @@ async function generateBriefing() {
   setBriefing(formatBriefing(briefing));
   await loadArtifacts();
   setSummary(`故障简报已生成: severity=${briefing.severity}`);
+}
+
+function formatSkillRunResult(result) {
+  const lines = [];
+  lines.push(`skill=${result.skill?.name || "-"} status=${result.status} mode=${result.dry_run ? "dry-run" : "execute"}`);
+  lines.push("");
+  for (const group of ["read", "apply", "verify", "rollback"]) {
+    const rows = result.commands?.[group] || [];
+    if (!rows.length) continue;
+    lines.push(`[${group}]`);
+    for (const command of rows) lines.push(`- ${command}`);
+    lines.push("");
+  }
+  if ((result.outputs || []).length) {
+    lines.push("[outputs]");
+    for (const item of result.outputs || []) {
+      lines.push(`$ ${item.command}`);
+      lines.push(`exit=${item.exit_code}`);
+      if (item.stdout) lines.push(String(item.stdout).slice(0, 1200));
+      if (item.stderr) lines.push(String(item.stderr).slice(0, 800));
+    }
+    lines.push("");
+  }
+  if ((result.next_actions || []).length) {
+    lines.push("[next]");
+    for (const item of result.next_actions || []) lines.push(`- ${item}`);
+  }
+  return lines.join("\n");
+}
+
+async function runSelectedSkill() {
+  if (!state.selectedSkillName) {
+    alert("请先选择 Skill");
+    return;
+  }
+  let variables = {};
+  try {
+    variables = JSON.parse(els.skillVarsJson.value || "{}");
+  } catch {
+    alert("Skill 变量 JSON 格式错误");
+    return;
+  }
+  const result = await api(`/v1/platform/skills/${encodeURIComponent(state.selectedSkillName)}/run`, {
+    method: "POST",
+    body: JSON.stringify({ variables, dry_run: true, apply: false, timeout_sec: 20 }),
+  });
+  setSkillResult(formatSkillRunResult(result));
+  setSummary(`Skill dry-run 已生成: ${state.selectedSkillName}`);
+}
+
+async function saveCustomSkill() {
+  let variables = {};
+  try {
+    variables = JSON.parse(els.skillDefaultVars.value || "{}");
+  } catch {
+    alert("自定义 Skill 变量 JSON 格式错误");
+    return;
+  }
+  const readCommands = (els.skillReadCommands.value || "")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (!els.skillName.value.trim() || !els.skillTitle.value.trim() || !readCommands.length) {
+    alert("Skill 名称、标题和至少一条只读命令必填");
+    return;
+  }
+  const skill = await api("/v1/platform/skills", {
+    method: "POST",
+    body: JSON.stringify({
+      name: els.skillName.value.trim(),
+      title: els.skillTitle.value.trim(),
+      description: els.skillDescription.value.trim(),
+      category: "custom",
+      mode: "diagnose",
+      risk_level: "low",
+      required_permission: "read",
+      instruction: els.skillTitle.value.trim(),
+      variables,
+      read_commands: readCommands,
+      tags: ["custom", "web"],
+    }),
+  });
+  state.selectedSkillName = skill.name;
+  await loadSkills();
+  setSummary(`自定义 Skill 已保存: ${skill.name}`);
 }
 
 async function exportRunReport() {
@@ -790,6 +932,7 @@ async function refreshAll() {
   await Promise.all([
     loadOverview(),
     loadTemplates(),
+    loadSkills(),
     loadTools(),
     loadToolHealth(),
     loadAgents(),
@@ -816,6 +959,32 @@ els.missionForm.addEventListener("submit", async (e) => {
     await createWorkflowFromMission();
   } catch (err) {
     alert(`创建 workflow 失败: ${err.message}`);
+  }
+});
+
+els.refreshSkills.addEventListener("click", async () => {
+  try {
+    await loadSkills();
+    setSummary("Skill 列表已刷新");
+  } catch (err) {
+    alert(`刷新 Skill 失败: ${err.message}`);
+  }
+});
+
+els.runSkillBtn.addEventListener("click", async () => {
+  try {
+    await runSelectedSkill();
+  } catch (err) {
+    alert(`运行 Skill 失败: ${err.message}`);
+  }
+});
+
+els.skillForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await saveCustomSkill();
+  } catch (err) {
+    alert(`保存 Skill 失败: ${err.message}`);
   }
 });
 

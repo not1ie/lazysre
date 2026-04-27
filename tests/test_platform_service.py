@@ -9,6 +9,8 @@ from lazysre.platform.models import (
     RunApprovalRequest,
     RunCreateRequest,
     RunStatus,
+    SkillCreateRequest,
+    SkillRunRequest,
     ToolCreateRequest,
     ToolProbeRequest,
     WorkflowCreateRequest,
@@ -93,6 +95,39 @@ async def test_template_catalog_and_autodesign(tmp_path: Path) -> None:
     assert wf.name == "Release Mission"
     assert len(wf.nodes) >= 3
     assert wf.start_node in {n.id for n in wf.nodes}
+
+
+async def test_skill_catalog_create_and_dry_run(tmp_path: Path) -> None:
+    service = PlatformService(store_path=str(tmp_path / "platform.json"))
+    service._skill_store.path = tmp_path / "skills.json"
+
+    skills = await service.list_skills()
+    assert any(item.name == "remote-health" for item in skills)
+
+    custom = await service.create_skill(
+        SkillCreateRequest(
+            name="team-nginx",
+            title="Team Nginx",
+            description="团队 Nginx 巡检",
+            category="middleware",
+            mode="diagnose",
+            risk_level="low",
+            required_permission="read",
+            instruction="检查 Nginx",
+            variables={"ssh_target": "root@host"},
+            read_commands=["lazysre remote {ssh_target} --scenario nginx"],
+            tags=["nginx"],
+        )
+    )
+    assert custom.source == "custom"
+
+    result = await service.run_skill(
+        "team-nginx",
+        SkillRunRequest(variables={"ssh_target": "root@192.168.10.101"}, dry_run=True),
+    )
+
+    assert result.status == "planned"
+    assert result.commands["read"] == ["lazysre remote root@192.168.10.101 --scenario nginx"]
 
 
 async def test_platform_overview_metrics(tmp_path: Path) -> None:

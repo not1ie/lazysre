@@ -152,6 +152,53 @@
 
         <section class="canvas card">
           <div class="card-head">
+            <h2>Skill Center</h2>
+            <div class="inline-actions">
+              <button id="refresh-skills" class="ghost">刷新 Skills</button>
+              <button id="run-skill-btn">运行 Skill</button>
+            </div>
+          </div>
+          <div class="skill-hero">
+            <div>
+              <p class="label">LOW BARRIER OPS</p>
+              <h3>选择模板即可巡检，不需要记命令</h3>
+              <p>内置 Linux / K8s / Swarm / Nginx / DB / GPU / AI / CI/CD 技能。默认 dry-run，只读优先。</p>
+            </div>
+            <label>
+              Skill 变量 JSON
+              <textarea id="skill-vars-json">{"ssh_target":"root@192.168.10.101"}</textarea>
+            </label>
+          </div>
+          <div id="skill-list" class="skill-list"></div>
+          <pre id="skill-result-log" class="event-log skill-result-log"></pre>
+          <details class="skill-builder">
+            <summary>创建自定义 Skill</summary>
+            <form id="skill-form" class="stack">
+              <label>
+                Skill 名称
+                <input id="skill-name" value="team-nginx-check" />
+              </label>
+              <label>
+                标题
+                <input id="skill-title" value="团队 Nginx 巡检" />
+              </label>
+              <label>
+                说明
+                <input id="skill-description" value="检查团队服务器上的 Nginx 配置和错误日志" />
+              </label>
+              <label>
+                变量 JSON
+                <textarea id="skill-default-vars">{"ssh_target":"root@192.168.10.101"}</textarea>
+              </label>
+              <label>
+                只读命令（每行一个）
+                <textarea id="skill-read-commands">lazysre remote {ssh_target} --scenario nginx --logs</textarea>
+              </label>
+              <button type="submit">保存自定义 Skill</button>
+            </form>
+          </details>
+          <hr />
+          <div class="card-head">
             <h2>Workflow Canvas</h2>
             <div class="inline-actions">
               <button id="refresh-workflows" class="ghost">刷新 Workflows</button>
