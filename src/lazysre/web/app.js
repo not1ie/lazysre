@@ -137,6 +137,7 @@ createApp({
     },
   },
   async mounted() {
+    document.documentElement.classList.add("vue-ready");
     await this.refreshAll();
   },
   methods: {

@@ -3,24 +3,34 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>LazySRE Skill Console</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;650;800&family=Space+Mono:wght@400;700&display=swap"
-      rel="stylesheet"
-    />
+    <title>LazySRE Ops Console</title>
     <link rel="stylesheet" href="/web/styles.css" />
   </head>
   <body>
+    <main id="boot-fallback" class="fallback-shell">
+      <section class="fallback-card">
+        <div class="app-icon">LS</div>
+        <p class="eyebrow">LAZYSRE OPS CONSOLE</p>
+        <h1>正在启动 Web 控制台</h1>
+        <p>
+          如果页面停留在这里，通常是浏览器无法加载 Vue CDN。后端和 CLI 仍可用，可以先用下面命令验证。
+        </p>
+        <div class="fallback-actions">
+          <code>lazysre web</code>
+          <code>PYTHONPATH=src .venv/bin/lazysre web --port 8000</code>
+          <code>lazysre skill list</code>
+          <code>lazysre skill run remote-health --var ssh_target=root@host</code>
+        </div>
+      </section>
+    </main>
     <div id="app" v-cloak>
       <div class="shell">
-        <aside class="sidebar glass">
+        <aside class="sidebar panel-surface">
           <div class="brand-mark">
-            <div class="orb">LS</div>
+            <div class="app-icon">LS</div>
             <div>
               <p>LazySRE</p>
-              <strong>Skill Console</strong>
+              <strong>Ops Console</strong>
             </div>
           </div>
           <nav class="nav-list" aria-label="Main Navigation">
@@ -30,20 +40,20 @@
             <button :class="{ active: activeView === 'runs' }" @click="activeView = 'runs'">Runs</button>
           </nav>
           <div class="target-card">
-            <span>默认变量</span>
+            <span>当前上下文</span>
             <code>{{ selectedSkillName || '未选择 Skill' }}</code>
-            <small>默认 dry-run，只生成计划，不直接修改生产。</small>
+            <small>默认只读 dry-run。写操作必须二次确认。</small>
           </div>
-          <button class="secondary wide" @click="refreshAll">刷新全部</button>
+          <button class="secondary wide" @click="refreshAll">同步状态</button>
         </aside>
 
         <main class="workspace">
-          <header class="hero glass">
+          <header class="hero panel-surface">
             <div>
               <p class="eyebrow">AI-NATIVE OPS PLATFORM</p>
-              <h1>把运维能力做成可点击、可复用、可审计的 Skill。</h1>
+              <h1>把生产运维封装成安全、可复用的 Skills。</h1>
               <p class="hero-copy">
-                CLI 继续作为执行引擎，Web 负责降低门槛：选择模板、填变量、预览命令，再决定是否执行。
+                选择模板，填少量变量，先预览命令和影响范围，再决定是否执行。适合从本机管理远端服务器、Docker、Swarm、Kubernetes 和监控系统。
               </p>
             </div>
             <div class="kpis">
@@ -55,11 +65,11 @@
           </header>
 
           <section v-if="activeView === 'skills'" class="view-grid skills-view">
-            <section class="panel glass main-panel">
+            <section class="panel panel-surface main-panel">
               <div class="section-head">
                 <div>
                   <p class="eyebrow">SKILL CENTER</p>
-                  <h2>内置技能模板</h2>
+                  <h2>选择一个运维场景</h2>
                 </div>
                 <div class="segmented">
                   <button :class="{ active: skillFilter === 'all' }" @click="skillFilter = 'all'">全部</button>
@@ -89,11 +99,11 @@
               </div>
             </section>
 
-            <aside class="panel glass side-panel">
+            <aside class="panel panel-surface side-panel">
               <div class="section-head compact">
                 <div>
                   <p class="eyebrow">RUN PREVIEW</p>
-                  <h2>{{ selectedSkill?.title || '选择一个 Skill' }}</h2>
+                  <h2>{{ selectedSkill?.title || '预览执行计划' }}</h2>
                 </div>
               </div>
               <label>
@@ -101,17 +111,17 @@
                 <textarea v-model="skillVarsJson" spellcheck="false"></textarea>
               </label>
               <div class="button-row">
-                <button @click="runSelectedSkill">Dry-run</button>
+                <button @click="runSelectedSkill">生成计划</button>
                 <button class="secondary" @click="copySkillCommand">复制 CLI</button>
               </div>
               <pre class="result-log">{{ skillResult || '选择 Skill 后点击 Dry-run，LazySRE 会生成只读命令计划。' }}</pre>
             </aside>
 
-            <section class="panel glass builder-panel">
+            <section class="panel panel-surface builder-panel">
               <div class="section-head compact">
                 <div>
                   <p class="eyebrow">CUSTOM SKILL</p>
-                  <h2>创建自定义 Skill</h2>
+                  <h2>沉淀团队经验</h2>
                 </div>
               </div>
               <div class="form-grid">
@@ -130,7 +140,7 @@
           </section>
 
           <section v-if="activeView === 'mission'" class="view-grid two-col">
-            <section class="panel glass">
+            <section class="panel panel-surface">
               <div class="section-head compact"><div><p class="eyebrow">MISSION STUDIO</p><h2>生成 Workflow</h2></div></div>
               <label>目标<textarea v-model="mission.objective"></textarea></label>
               <div class="form-grid">
@@ -140,7 +150,7 @@
               </div>
               <button @click="createWorkflow">生成 Workflow</button>
             </section>
-            <section class="panel glass">
+            <section class="panel panel-surface">
               <div class="section-head compact"><div><p class="eyebrow">WORKFLOWS</p><h2>工作流画布</h2></div></div>
               <div class="list compact-list">
                 <button v-for="wf in workflows" :key="wf.id" :class="{ active: selectedWorkflowId === wf.id }" @click="selectWorkflow(wf)">
@@ -156,7 +166,7 @@
           </section>
 
           <section v-if="activeView === 'tools'" class="view-grid two-col">
-            <section class="panel glass">
+            <section class="panel panel-surface">
               <div class="section-head compact"><div><p class="eyebrow">TOOL HUB</p><h2>注册观测工具</h2></div></div>
               <div class="form-grid">
                 <label>名称<input v-model="toolForm.name" /></label>
@@ -167,7 +177,7 @@
               </div>
               <button @click="createTool">注册 Tool</button>
             </section>
-            <section class="panel glass">
+            <section class="panel panel-surface">
               <div class="section-head compact"><div><p class="eyebrow">HEALTH</p><h2>工具状态</h2></div><button class="secondary" @click="loadToolHealth">探测</button></div>
               <div class="list">
                 <article v-for="tool in tools" :key="tool.id" class="row-card">
@@ -178,7 +188,7 @@
           </section>
 
           <section v-if="activeView === 'runs'" class="view-grid two-col">
-            <section class="panel glass">
+            <section class="panel panel-surface">
               <div class="section-head compact"><div><p class="eyebrow">RUNS</p><h2>执行记录</h2></div><button class="secondary" @click="refreshRuns">刷新</button></div>
               <div class="button-row"><button @click="startRun">启动选中 Workflow</button><button class="secondary" @click="generateBriefing">生成简报</button></div>
               <div class="list">
@@ -187,13 +197,13 @@
                 </button>
               </div>
             </section>
-            <section class="panel glass">
+            <section class="panel panel-surface">
               <div class="section-head compact"><div><p class="eyebrow">OUTPUT</p><h2>运行输出</h2></div></div>
               <pre class="result-log tall">{{ runOutput || briefing || '选择 Run 查看输出。' }}</pre>
             </section>
           </section>
 
-          <footer class="status-bar glass">
+          <footer class="status-bar panel-surface">
             <span>{{ statusText }}</span>
             <code>{{ selectedSkillName || 'no-skill-selected' }}</code>
           </footer>

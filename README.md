@@ -83,6 +83,19 @@ TUI 内常用命令：
 - 首屏输入框留空时直接按 Enter：自动执行当前建议下一步（新手一键启动）
 - 默认 UI 使用简洁视图：只展示控制台状态、远程目标、下一步动作和少量关键信号；需要完整诊断细节时再输入 `/ui expert`
 
+Web 控制台（适合不熟 CLI 的用户）：
+
+```bash
+# npm/pipx 安装后的用户
+lazysre web
+# 浏览器打开 http://127.0.0.1:8000/
+
+# 本地源码开发时，必须让 Python 优先加载 src/，否则可能看到已安装旧版本
+PYTHONPATH=src .venv/bin/lazysre web --port 8000
+```
+
+Web 默认仍是 dry-run：先选择 Skill 模板、填写变量、生成计划，再决定是否复制 CLI 或执行。
+
 ## 怎么确认拿到最新 Node 版本
 
 ```bash
@@ -129,8 +142,9 @@ lazysre --version
 - install-doctor 增加代理环境预检（自动识别 SOCKS 代理并提示 `httpx[socks]`）
 - install-doctor / doctor 增加工作区密钥泄漏预检（workspace_secret_scan，输出脱敏文件:行号）
 - Web Skill Center MVP：Vue 单页控制台，内置远程服务器、K8s、Swarm、Nginx、数据库、GPU/AI、CI/CD Skill 模板，支持 Web 创建自定义 Skill 和 dry-run 预览
+- Web 本地开发入口：`lazysre web`，源码预览使用 `PYTHONPATH=src .venv/bin/lazysre web`，避免加载虚拟环境旧包
 - CLI Skill Center：`lsre skill list/show/run/add/remove`，与 Web 共用同一套 Skill 模板和自定义存储
-- 当前封版基线测试：`349 passed`
+- 当前封版基线测试：`350 passed`
 
 ## 安装方式（开箱即用）
 
@@ -150,6 +164,8 @@ lazysre
 # 首次启动会自动生成只读 LazySRE Brief，并给出下一步命令
 lazysre tui
 lazysre tui --demo
+# Web Skill Center（浏览器低门槛管理 Skills）
+lazysre web
 # TUI 内支持 Tab 自动补全、Up/Down 历史、Shift+N/T/U/R 快捷动作、空输入 Enter 自动下一步、/history 历史重放、Ctrl-L 清屏、F2/1-4 面板切换、/refresh 刷新总览、/providers 查看模型配置，并显示左侧面板标签条、面板上下文提示、Action Bar、最近活动时间线、阶段化 Trace Summary、执行时间线、建议动作、命令轨迹和底部状态栏
 # 兼容短命令
 lsre

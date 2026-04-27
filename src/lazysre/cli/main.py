@@ -1464,6 +1464,30 @@ def tui(
     _run_tui(options, demo=demo)
 
 
+@app.command("web")
+def web_console(
+    host: Annotated[str, typer.Option("--host", help="Bind host for the Web Skill Console.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Bind port for the Web Skill Console.")] = 8000,
+) -> None:
+    """Start the Web Skill Console for low-barrier skill management."""
+    if _console:
+        _console.print(
+            Panel.fit(
+                f"[bold]LazySRE Web Console[/bold]\n\n"
+                f"Open: [cyan]http://{host}:{port}/[/cyan]\n"
+                "Default mode is dry-run. High-risk actions still require explicit approval.",
+                title="Web",
+            )
+        )
+    else:
+        print(f"LazySRE Web Console: http://{host}:{port}/")
+    try:
+        import uvicorn
+    except Exception as exc:  # pragma: no cover
+        raise typer.BadParameter("uvicorn is not installed; run lazysre install-doctor first") from exc
+    uvicorn.run("lazysre.main:app", host=host, port=port, log_level="info")
+
+
 @app.command("fix")
 def fix_instruction(
     ctx: typer.Context,
@@ -19336,6 +19360,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "run",
         "chat",
         "tui",
+        "web",
         "login",
         "logout",
         "init",
