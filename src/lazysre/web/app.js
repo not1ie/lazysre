@@ -1,92 +1,12 @@
-const state = {
-  templates: [],
-  skills: [],
-  tools: [],
-  toolHealth: {},
-  agents: [],
-  workflows: [],
-  runs: [],
-  artifacts: [],
-  selectedArtifact: null,
-  selectedSkillName: null,
-  selectedWorkflowId: null,
-  selectedRunId: null,
-  eventSource: null,
-  runPoller: null,
-};
+import { createApp } from "https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.esm-browser.prod.js";
 
-const $ = (id) => document.getElementById(id);
-
-const els = {
-  missionForm: $("mission-form"),
-  missionObjective: $("mission-objective"),
-  missionMode: $("mission-mode"),
-  templateSelect: $("template-select"),
-  refreshSkills: $("refresh-skills"),
-  runSkillBtn: $("run-skill-btn"),
-  skillList: $("skill-list"),
-  skillVarsJson: $("skill-vars-json"),
-  skillResultLog: $("skill-result-log"),
-  skillForm: $("skill-form"),
-  skillName: $("skill-name"),
-  skillTitle: $("skill-title"),
-  skillDescription: $("skill-description"),
-  skillDefaultVars: $("skill-default-vars"),
-  skillReadCommands: $("skill-read-commands"),
-  workflowName: $("workflow-name"),
-  envForm: $("env-form"),
-  envMonitoringIp: $("env-monitoring-ip"),
-  envMonitoringPort: $("env-monitoring-port"),
-  envK8sUrl: $("env-k8s-url"),
-  envK8sVerifyTls: $("env-k8s-verify-tls"),
-  envK8sToken: $("env-k8s-token"),
-  toolForm: $("tool-form"),
-  toolName: $("tool-name"),
-  toolKind: $("tool-kind"),
-  toolBaseUrl: $("tool-base-url"),
-  toolDefaultQuery: $("tool-default-query"),
-  toolHeadersJson: $("tool-headers-json"),
-  toolVerifyTls: $("tool-verify-tls"),
-  toolPermission: $("tool-permission"),
-  refreshToolHealth: $("refresh-tool-health"),
-  toolList: $("tool-list"),
-  refreshAll: $("refresh-all"),
-  refreshWorkflows: $("refresh-workflows"),
-  refreshRuns: $("refresh-runs"),
-  workflowList: $("workflow-list"),
-  workflowCanvas: $("workflow-canvas"),
-  runForm: $("run-form"),
-  actorPermission: $("actor-permission"),
-  runInput: $("run-input"),
-  toolQueriesInput: $("tool-queries-input"),
-  cancelRunBtn: $("cancel-run-btn"),
-  approvalForm: $("approval-form"),
-  approverName: $("approver-name"),
-  approvalComment: $("approval-comment"),
-  approvalAdviceBtn: $("approval-advice-btn"),
-  approvalAdviceLog: $("approval-advice-log"),
-  approveBtn: $("approve-btn"),
-  rejectBtn: $("reject-btn"),
-  generateBriefingBtn: $("generate-briefing-btn"),
-  exportReportBtn: $("export-report-btn"),
-  artifactKind: $("artifact-kind"),
-  refreshArtifacts: $("refresh-artifacts"),
-  downloadArtifactBtn: $("download-artifact-btn"),
-  artifactList: $("artifact-list"),
-  artifactPreview: $("artifact-preview"),
-  compareRunsBtn: $("compare-runs-btn"),
-  compareLeftRun: $("compare-left-run"),
-  compareRightRun: $("compare-right-run"),
-  runCompareLog: $("run-compare-log"),
-  runList: $("run-list"),
-  briefingLog: $("briefing-log"),
-  eventLog: $("event-log"),
-  outputsGrid: $("outputs-grid"),
-  activeSummary: $("active-summary"),
-  agentsCount: $("agents-count"),
-  workflowsCount: $("workflows-count"),
-  runsCount: $("runs-count"),
-  successRate: $("success-rate"),
+const DEFAULT_SKILL = {
+  name: "team-nginx-check",
+  title: "团队 Nginx 巡检",
+  category: "custom",
+  description: "检查团队服务器上的 Nginx 配置和错误日志",
+  variablesJson: JSON.stringify({ ssh_target: "root@192.168.10.101" }, null, 2),
+  readCommands: "lazysre remote {ssh_target} --scenario nginx --logs",
 };
 
 async function api(path, options = {}) {
@@ -110,505 +30,11 @@ async function api(path, options = {}) {
   return await resp.text();
 }
 
-function escapeHtml(v) {
-  return String(v)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+function shortId(value) {
+  return String(value || "-").slice(0, 8);
 }
 
-function ts() {
-  return new Date().toLocaleTimeString("zh-CN", { hour12: false });
-}
-
-function log(msg) {
-  els.eventLog.textContent += `${msg}\n`;
-  els.eventLog.scrollTop = els.eventLog.scrollHeight;
-}
-
-function setBriefing(text) {
-  els.briefingLog.textContent = text;
-  els.briefingLog.scrollTop = 0;
-}
-
-function setSummary(text) {
-  els.activeSummary.textContent = text;
-}
-
-function setApprovalAdvice(text) {
-  els.approvalAdviceLog.textContent = text;
-  els.approvalAdviceLog.scrollTop = 0;
-}
-
-function setArtifactPreview(text) {
-  els.artifactPreview.textContent = text;
-  els.artifactPreview.scrollTop = 0;
-}
-
-function setSkillResult(text) {
-  els.skillResultLog.textContent = text;
-  els.skillResultLog.scrollTop = 0;
-}
-
-function setRunCompare(text) {
-  els.runCompareLog.textContent = text;
-  els.runCompareLog.scrollTop = 0;
-}
-
-function renderCounters(overview) {
-  els.agentsCount.textContent = String(overview.total_agents);
-  els.workflowsCount.textContent = String(overview.total_workflows);
-  els.runsCount.textContent = String(overview.total_runs);
-  els.successRate.textContent = `${Math.round((overview.success_rate || 0) * 100)}%`;
-}
-
-function renderTemplateOptions() {
-  els.templateSelect.innerHTML = "";
-  for (const tpl of state.templates) {
-    const opt = document.createElement("option");
-    opt.value = tpl.slug;
-    opt.textContent = `${tpl.name} · ${tpl.description}`;
-    els.templateSelect.appendChild(opt);
-  }
-  els.templateSelect.disabled = els.missionMode.value !== "template";
-}
-
-function renderSkills() {
-  els.skillList.innerHTML = "";
-  for (const skill of state.skills) {
-    const active = skill.name === state.selectedSkillName;
-    const row = document.createElement("article");
-    row.className = `skill-card ${active ? "active" : ""}`;
-    row.innerHTML = `
-      <div class="skill-top">
-        <span>${escapeHtml(skill.category)}</span>
-        <b>${escapeHtml(skill.risk_level)}</b>
-      </div>
-      <h3>${escapeHtml(skill.title)}</h3>
-      <p>${escapeHtml(skill.description || skill.instruction)}</p>
-      <div class="meta">${escapeHtml(skill.name)} · ${escapeHtml(skill.source)} · ${(skill.tags || []).slice(0, 4).map(escapeHtml).join(", ")}</div>
-    `;
-    row.onclick = () => {
-      state.selectedSkillName = skill.name;
-      els.skillVarsJson.value = JSON.stringify(skill.variables || {}, null, 2);
-      renderSkills();
-      setSummary(`已选择 Skill: ${skill.title}`);
-    };
-    els.skillList.appendChild(row);
-  }
-  if (!state.skills.length) {
-    els.skillList.innerHTML = `<div class="row-item"><div class="meta">暂无 Skill 模板</div></div>`;
-    return;
-  }
-  if (!state.selectedSkillName || !state.skills.find((x) => x.name === state.selectedSkillName)) {
-    state.selectedSkillName = state.skills[0].name;
-    els.skillVarsJson.value = JSON.stringify(state.skills[0].variables || {}, null, 2);
-    renderSkills();
-  }
-}
-
-function renderTools() {
-  els.toolList.innerHTML = "";
-  for (const tool of state.tools) {
-    const headerCount = Object.keys(tool.headers || {}).length;
-    const health = state.toolHealth[tool.id];
-    const healthText = health
-      ? health.ok
-        ? `ok ${health.latency_ms}ms`
-        : `error ${health.latency_ms}ms`
-      : "unknown";
-    const row = document.createElement("div");
-    row.className = "row-item";
-    row.innerHTML = `
-      <div class="title">${escapeHtml(tool.name)}</div>
-      <div class="meta">${escapeHtml(tool.kind)} · perm=${escapeHtml(tool.required_permission)} · headers=${headerCount} · health=${escapeHtml(healthText)}</div>
-    `;
-    els.toolList.appendChild(row);
-  }
-  if (!state.tools.length) {
-    els.toolList.innerHTML = `<div class="row-item"><div class="meta">暂无工具，可先注册 Prometheus/K8s/日志工具。</div></div>`;
-  }
-}
-
-function renderWorkflows() {
-  els.workflowList.innerHTML = "";
-  for (const wf of state.workflows) {
-    const row = document.createElement("div");
-    row.className = `row-item ${wf.id === state.selectedWorkflowId ? "active" : ""}`;
-    row.innerHTML = `
-      <div class="title">${escapeHtml(wf.name)}</div>
-      <div class="meta">${escapeHtml(wf.id.slice(0, 8))} · ${wf.nodes.length} nodes</div>
-    `;
-    row.onclick = async () => {
-      state.selectedWorkflowId = wf.id;
-      state.selectedRunId = null;
-      closeStream();
-      stopRunPoller();
-      renderWorkflows();
-      renderCanvas(wf);
-      await refreshRuns();
-      updateApprovalForm(null);
-      setSummary(`已选择 workflow: ${wf.name}`);
-    };
-    els.workflowList.appendChild(row);
-  }
-  if (!state.workflows.length) {
-    els.workflowList.innerHTML = `<div class="row-item"><div class="meta">暂无 workflow</div></div>`;
-  }
-}
-
-function renderCanvas(workflow) {
-  if (!workflow) {
-    els.workflowCanvas.innerHTML = `<div class="row-item"><div class="meta">等待工作流...</div></div>`;
-    return;
-  }
-  els.workflowCanvas.innerHTML = "";
-  for (const node of workflow.nodes) {
-    const row = document.createElement("article");
-    row.className = "node-card";
-    row.innerHTML = `
-      <h3>${escapeHtml(node.id)}</h3>
-      <p>${escapeHtml(node.instruction)}</p>
-      <div class="pipe">tool=${escapeHtml(node.tool_binding || "none")} | perm=${escapeHtml(node.required_permission)} | approval=${node.requires_approval ? "yes" : "no"}</div>
-      <div class="pipe">next: ${escapeHtml((node.next_nodes || []).join(", ") || "end")}</div>
-    `;
-    els.workflowCanvas.appendChild(row);
-  }
-}
-
-function statusColor(status) {
-  if (status === "completed") return "color:#1b8877";
-  if (status === "failed") return "color:#bd3b2f";
-  if (status === "canceled") return "color:#a55e16";
-  if (status === "waiting_approval") return "color:#d47f1a";
-  if (status === "running") return "color:#237593";
-  return "color:#60737a";
-}
-
-function renderRuns() {
-  els.runList.innerHTML = "";
-  for (const run of state.runs) {
-    const row = document.createElement("div");
-    row.className = `row-item ${run.id === state.selectedRunId ? "active" : ""}`;
-    row.innerHTML = `
-      <div class="title">${escapeHtml(run.id.slice(0, 8))}</div>
-      <div class="meta" style="${statusColor(run.status)}">${escapeHtml(run.status)}</div>
-    `;
-    row.onclick = async () => {
-      state.selectedRunId = run.id;
-      renderRuns();
-      await loadRunDetail(run.id);
-      openStream(run.id);
-    };
-    els.runList.appendChild(row);
-  }
-  if (!state.runs.length) {
-    els.runList.innerHTML = `<div class="row-item"><div class="meta">暂无 run</div></div>`;
-  }
-  renderRunCompareOptions();
-}
-
-function artifactApiPath(item) {
-  return `/v1/platform/artifacts/${encodeURIComponent(item.kind)}/${encodeURIComponent(item.name)}`;
-}
-
-function renderArtifacts() {
-  els.artifactList.innerHTML = "";
-  for (const item of state.artifacts) {
-    const key = `${item.kind}/${item.name}`;
-    const active = state.selectedArtifact && state.selectedArtifact.key === key;
-    const row = document.createElement("div");
-    row.className = `row-item ${active ? "active" : ""}`;
-    const modified = new Date(item.modified_at).toLocaleString("zh-CN");
-    row.innerHTML = `
-      <div class="title">${escapeHtml(item.name)}</div>
-      <div class="meta">${escapeHtml(item.kind)} · ${escapeHtml(modified)} · ${escapeHtml(String(item.size_bytes))} bytes</div>
-    `;
-    row.onclick = async () => {
-      state.selectedArtifact = { key, ...item };
-      renderArtifacts();
-      await loadArtifactContent(item);
-    };
-    els.artifactList.appendChild(row);
-  }
-  if (!state.artifacts.length) {
-    els.artifactList.innerHTML = `<div class="row-item"><div class="meta">暂无 artifacts，先执行 run 或生成简报。</div></div>`;
-    state.selectedArtifact = null;
-    setArtifactPreview("");
-  }
-}
-
-function renderOutputs(outputs) {
-  els.outputsGrid.innerHTML = "";
-  const entries = Object.entries(outputs || {});
-  if (!entries.length) {
-    els.outputsGrid.innerHTML = `<div class="row-item"><div class="meta">暂无节点输出</div></div>`;
-    return;
-  }
-  for (const [node, out] of entries) {
-    const card = document.createElement("article");
-    card.className = "output-card";
-    card.innerHTML = `
-      <h4>${escapeHtml(node)}</h4>
-      <p>${escapeHtml(String(out).slice(0, 360))}</p>
-    `;
-    els.outputsGrid.appendChild(card);
-  }
-}
-
-function renderRunCompareOptions() {
-  const leftSel = els.compareLeftRun;
-  const rightSel = els.compareRightRun;
-  if (!leftSel || !rightSel) return;
-
-  const prevLeft = leftSel.value;
-  const prevRight = rightSel.value;
-  leftSel.innerHTML = "";
-  rightSel.innerHTML = "";
-
-  for (const run of state.runs) {
-    const label = `${run.id.slice(0, 8)} · ${run.status}`;
-    const o1 = document.createElement("option");
-    o1.value = run.id;
-    o1.textContent = label;
-    leftSel.appendChild(o1);
-    const o2 = document.createElement("option");
-    o2.value = run.id;
-    o2.textContent = label;
-    rightSel.appendChild(o2);
-  }
-
-  if (!state.runs.length) {
-    setRunCompare("");
-    return;
-  }
-
-  leftSel.value = state.runs.find((r) => r.id === prevLeft)?.id || state.runs[0].id;
-  if (state.runs.find((r) => r.id === prevRight)?.id) {
-    rightSel.value = prevRight;
-  } else {
-    rightSel.value = state.runs[1]?.id || state.runs[0].id;
-  }
-}
-
-function updateApprovalForm(run) {
-  const waiting = run && run.status === "waiting_approval";
-  els.approvalForm.style.display = waiting ? "grid" : "none";
-  if (!waiting) {
-    setApprovalAdvice("");
-  }
-  if (waiting) {
-    const node = run.pending_node_id || "-";
-    setSummary(`run ${run.id.slice(0, 8)} 等待审批: node=${node}`);
-  }
-}
-
-async function loadOverview() {
-  const overview = await api("/v1/platform/overview");
-  renderCounters(overview);
-}
-
-async function loadTemplates() {
-  state.templates = await api("/v1/platform/templates");
-  renderTemplateOptions();
-}
-
-async function loadSkills() {
-  state.skills = await api("/v1/platform/skills");
-  renderSkills();
-}
-
-async function loadTools() {
-  state.tools = await api("/v1/platform/tools");
-  renderTools();
-}
-
-async function loadToolHealth() {
-  const healths = await api("/v1/platform/tools/health");
-  const map = {};
-  for (const item of healths || []) {
-    map[item.tool_id] = item;
-  }
-  state.toolHealth = map;
-  renderTools();
-}
-
-async function loadAgents() {
-  state.agents = await api("/v1/platform/agents");
-}
-
-async function loadWorkflows() {
-  state.workflows = await api("/v1/platform/workflows");
-  if (!state.selectedWorkflowId && state.workflows.length) {
-    state.selectedWorkflowId = state.workflows[0].id;
-  }
-}
-
-async function refreshRuns() {
-  const q = state.selectedWorkflowId
-    ? `?workflow_id=${encodeURIComponent(state.selectedWorkflowId)}`
-    : "";
-  state.runs = await api(`/v1/platform/runs${q}`);
-  if (!state.runs.find((x) => x.id === state.selectedRunId)) {
-    state.selectedRunId = state.runs[0]?.id || null;
-  }
-  renderRuns();
-}
-
-async function loadArtifacts() {
-  const kind = els.artifactKind.value || "all";
-  const q = `?kind=${encodeURIComponent(kind)}&limit=60`;
-  state.artifacts = await api(`/v1/platform/artifacts${q}`);
-  const exists =
-    state.selectedArtifact &&
-    state.artifacts.find(
-      (x) => `${x.kind}/${x.name}` === state.selectedArtifact.key
-    );
-  if (!exists) {
-    state.selectedArtifact = state.artifacts[0]
-      ? { key: `${state.artifacts[0].kind}/${state.artifacts[0].name}`, ...state.artifacts[0] }
-      : null;
-  }
-  renderArtifacts();
-  if (state.selectedArtifact) {
-    await loadArtifactContent(state.selectedArtifact);
-  }
-}
-
-async function loadArtifactContent(item) {
-  const content = await api(artifactApiPath(item), { rawText: true });
-  setArtifactPreview(
-    `# ${item.kind}/${item.name}\n\n${content}`.slice(0, 14000)
-  );
-}
-
-async function loadRunDetail(runId) {
-  const run = await api(`/v1/platform/runs/${runId}`);
-  renderOutputs(run.outputs || {});
-  updateApprovalForm(run);
-  if (run.status === "waiting_approval") {
-    await loadApprovalAdvice(run.id);
-  }
-  setSummary(
-    `run=${run.id.slice(0, 8)} status=${run.status} workflow=${run.workflow_id.slice(0, 8)}`
-  );
-  if (["completed", "failed", "canceled"].includes(run.status)) {
-    stopRunPoller();
-  } else {
-    startRunPoller();
-  }
-  return run;
-}
-
-function formatApprovalAdvice(advice) {
-  const lines = [];
-  lines.push(`run=${advice.run_id.slice(0, 8)} node=${advice.node_id}`);
-  lines.push(`risk=${advice.risk_level} action=${advice.recommended_action} perm=${advice.required_permission}`);
-  lines.push("");
-  lines.push("Reasons:");
-  for (const item of advice.reasons || []) {
-    lines.push(`- ${item}`);
-  }
-  lines.push("");
-  lines.push("Checklist:");
-  for (const item of advice.checklist || []) {
-    lines.push(`- ${item}`);
-  }
-  if (advice.suggested_comment) {
-    lines.push("");
-    lines.push(`Suggested Comment: ${advice.suggested_comment}`);
-  }
-  return lines.join("\n");
-}
-
-async function loadApprovalAdvice(runId) {
-  const advice = await api(`/v1/platform/runs/${runId}/approval/advice`);
-  setApprovalAdvice(formatApprovalAdvice(advice));
-  if (!els.approvalComment.value.trim()) {
-    els.approvalComment.value = advice.suggested_comment || "";
-  }
-}
-
-function formatRunComparison(comp) {
-  const lines = [];
-  lines.push(`left=${comp.left_run_id.slice(0, 8)} status=${comp.left_status} duration=${comp.left_duration_ms ?? "-"}ms`);
-  lines.push(`right=${comp.right_run_id.slice(0, 8)} status=${comp.right_status} duration=${comp.right_duration_ms ?? "-"}ms`);
-  lines.push("");
-  lines.push(`events: ${comp.left_event_count} -> ${comp.right_event_count}`);
-  lines.push(`tool_failed: ${comp.left_tool_failed_count} -> ${comp.right_tool_failed_count}`);
-  lines.push(`approvals: ${comp.left_approval_count} -> ${comp.right_approval_count}`);
-  lines.push("");
-  lines.push(`shared nodes: ${(comp.shared_nodes || []).join(", ") || "-"}`);
-  lines.push(`left only: ${(comp.nodes_only_left || []).join(", ") || "-"}`);
-  lines.push(`right only: ${(comp.nodes_only_right || []).join(", ") || "-"}`);
-  lines.push("");
-  lines.push("Summary:");
-  for (const item of comp.summary || []) {
-    lines.push(`- ${item}`);
-  }
-  return lines.join("\n");
-}
-
-async function compareRuns() {
-  const leftRunId = els.compareLeftRun.value;
-  const rightRunId = els.compareRightRun.value;
-  if (!leftRunId || !rightRunId) {
-    alert("请先选择要对比的两个 run");
-    return;
-  }
-  if (leftRunId === rightRunId) {
-    alert("请选择两个不同的 run");
-    return;
-  }
-  const q =
-    `?left_run_id=${encodeURIComponent(leftRunId)}` +
-    `&right_run_id=${encodeURIComponent(rightRunId)}`;
-  const comp = await api(`/v1/platform/runs/compare${q}`);
-  setRunCompare(formatRunComparison(comp));
-  setSummary(`run 对比完成: ${leftRunId.slice(0, 8)} vs ${rightRunId.slice(0, 8)}`);
-}
-
-function formatBriefing(briefing) {
-  const lines = [];
-  lines.push(`[${new Date(briefing.generated_at).toLocaleString("zh-CN")}] severity=${briefing.severity}`);
-  lines.push(briefing.headline || "");
-  if (briefing.artifact_path) {
-    lines.push(`artifact: ${briefing.artifact_path}`);
-  }
-  lines.push("");
-  lines.push("Recommendations:");
-  for (const item of briefing.recommendations || []) {
-    lines.push(`- ${item}`);
-  }
-  lines.push("");
-  lines.push("Tool Snapshot:");
-  for (const t of briefing.tool_snapshot || []) {
-    lines.push(
-      `- ${t.name} (${t.kind}) status=${t.ok ? "ok" : "error"} latency=${t.latency_ms}ms ${
-        t.ok ? "" : `error=${t.error || "-"}`
-      }`
-    );
-  }
-  lines.push("");
-  lines.push("Recent Runs:");
-  for (const r of briefing.recent_runs || []) {
-    lines.push(`- ${r.run_id.slice(0, 8)} status=${r.status} wf=${r.workflow_id.slice(0, 8)}`);
-  }
-  return lines.join("\n");
-}
-
-async function generateBriefing() {
-  const q = state.selectedWorkflowId
-    ? `?workflow_id=${encodeURIComponent(state.selectedWorkflowId)}&timeout_sec=4`
-    : "?timeout_sec=4";
-  const briefing = await api(`/v1/platform/briefing${q}`);
-  setBriefing(formatBriefing(briefing));
-  await loadArtifacts();
-  setSummary(`故障简报已生成: severity=${briefing.severity}`);
-}
-
-function formatSkillRunResult(result) {
+function formatSkillResult(result) {
   const lines = [];
   lines.push(`skill=${result.skill?.name || "-"} status=${result.status} mode=${result.dry_run ? "dry-run" : "execute"}`);
   lines.push("");
@@ -624,8 +50,8 @@ function formatSkillRunResult(result) {
     for (const item of result.outputs || []) {
       lines.push(`$ ${item.command}`);
       lines.push(`exit=${item.exit_code}`);
-      if (item.stdout) lines.push(String(item.stdout).slice(0, 1200));
-      if (item.stderr) lines.push(String(item.stderr).slice(0, 800));
+      if (item.stdout) lines.push(String(item.stdout).slice(0, 1600));
+      if (item.stderr) lines.push(String(item.stderr).slice(0, 900));
     }
     lines.push("");
   }
@@ -636,529 +62,268 @@ function formatSkillRunResult(result) {
   return lines.join("\n");
 }
 
-async function runSelectedSkill() {
-  if (!state.selectedSkillName) {
-    alert("请先选择 Skill");
-    return;
+function formatBriefing(briefing) {
+  const lines = [];
+  lines.push(`severity=${briefing.severity}`);
+  lines.push(briefing.headline || "");
+  lines.push("");
+  lines.push("Recommendations:");
+  for (const item of briefing.recommendations || []) lines.push(`- ${item}`);
+  lines.push("");
+  lines.push("Tools:");
+  for (const tool of briefing.tool_snapshot || []) {
+    lines.push(`- ${tool.name} ${tool.ok ? "ok" : "error"} ${tool.latency_ms}ms ${tool.error || ""}`);
   }
-  let variables = {};
-  try {
-    variables = JSON.parse(els.skillVarsJson.value || "{}");
-  } catch {
-    alert("Skill 变量 JSON 格式错误");
-    return;
-  }
-  const result = await api(`/v1/platform/skills/${encodeURIComponent(state.selectedSkillName)}/run`, {
-    method: "POST",
-    body: JSON.stringify({ variables, dry_run: true, apply: false, timeout_sec: 20 }),
-  });
-  setSkillResult(formatSkillRunResult(result));
-  setSummary(`Skill dry-run 已生成: ${state.selectedSkillName}`);
+  return lines.join("\n");
 }
 
-async function saveCustomSkill() {
-  let variables = {};
-  try {
-    variables = JSON.parse(els.skillDefaultVars.value || "{}");
-  } catch {
-    alert("自定义 Skill 变量 JSON 格式错误");
-    return;
-  }
-  const readCommands = (els.skillReadCommands.value || "")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-  if (!els.skillName.value.trim() || !els.skillTitle.value.trim() || !readCommands.length) {
-    alert("Skill 名称、标题和至少一条只读命令必填");
-    return;
-  }
-  const skill = await api("/v1/platform/skills", {
-    method: "POST",
-    body: JSON.stringify({
-      name: els.skillName.value.trim(),
-      title: els.skillTitle.value.trim(),
-      description: els.skillDescription.value.trim(),
-      category: "custom",
-      mode: "diagnose",
-      risk_level: "low",
-      required_permission: "read",
-      instruction: els.skillTitle.value.trim(),
-      variables,
-      read_commands: readCommands,
-      tags: ["custom", "web"],
-    }),
-  });
-  state.selectedSkillName = skill.name;
-  await loadSkills();
-  setSummary(`自定义 Skill 已保存: ${skill.name}`);
-}
-
-async function exportRunReport() {
-  if (!state.selectedRunId) {
-    alert("请先选择 run");
-    return;
-  }
-  const content = await api(`/v1/platform/runs/${state.selectedRunId}/report?format=markdown`);
-  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  const stamp = new Date().toISOString().slice(0, 19).replaceAll(":", "").replaceAll("-", "");
-  a.href = url;
-  a.download = `lazysre-run-${state.selectedRunId.slice(0, 8)}-${stamp}.md`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-  setSummary(`run ${state.selectedRunId.slice(0, 8)} 报告已导出`);
-}
-
-async function downloadSelectedArtifact() {
-  if (!state.selectedArtifact) {
-    alert("请先选择 artifact");
-    return;
-  }
-  const item = state.selectedArtifact;
-  const content = await api(artifactApiPath(item), { rawText: true });
-  const ext = item.name.includes(".") ? item.name.split(".").pop() : "txt";
-  const mime = ext === "json" ? "application/json;charset=utf-8" : "text/plain;charset=utf-8";
-  const blob = new Blob([content], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = item.name;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-  setSummary(`artifact 已下载: ${item.name}`);
-}
-
-function closeStream() {
-  if (state.eventSource) {
-    state.eventSource.close();
-    state.eventSource = null;
-  }
-}
-
-function openStream(runId) {
-  closeStream();
-  els.eventLog.textContent = "";
-  log(`[${ts()}] subscribe run=${runId.slice(0, 8)}`);
-  const es = new EventSource(`/v1/platform/runs/${runId}/stream`);
-  state.eventSource = es;
-
-  es.onmessage = (evt) => {
-    try {
-      const data = JSON.parse(evt.data);
-      const t = data.timestamp ? new Date(data.timestamp).toLocaleTimeString("zh-CN") : ts();
-      log(`[${t}] ${data.kind}: ${data.message}`);
-    } catch {
-      log(`[${ts()}] ${evt.data}`);
-    }
-  };
-
-  es.addEventListener("end", () => {
-    log(`[${ts()}] stream closed`);
-    closeStream();
-    refreshRuns();
-    loadOverview();
-  });
-
-  es.onerror = () => {
-    log(`[${ts()}] stream disconnected`);
-    closeStream();
-  };
-}
-
-function startRunPoller() {
-  if (state.runPoller) return;
-  state.runPoller = window.setInterval(async () => {
-    try {
-      if (state.selectedRunId) {
-        await loadRunDetail(state.selectedRunId);
+createApp({
+  data() {
+    return {
+      activeView: "skills",
+      statusText: "正在初始化...",
+      overview: {},
+      templates: [],
+      skills: [],
+      tools: [],
+      toolHealth: [],
+      workflows: [],
+      runs: [],
+      selectedSkillName: "",
+      selectedWorkflowId: "",
+      selectedRunId: "",
+      skillFilter: "all",
+      skillVarsJson: JSON.stringify({ ssh_target: "root@192.168.10.101" }, null, 2),
+      skillResult: "",
+      briefing: "",
+      runOutput: "",
+      customSkill: { ...DEFAULT_SKILL },
+      mission: {
+        objective: "定位并缓解 gateway 5xx 抖动，输出修复和回滚步骤",
+        mode: "autodesign",
+        name: "Prod Mission Flow",
+        template: "incident-response",
+      },
+      toolForm: {
+        name: "Prometheus Prod",
+        kind: "prometheus",
+        base_url: "http://prometheus:9090",
+        default_query: "up",
+        required_permission: "read",
+      },
+    };
+  },
+  computed: {
+    successRate() {
+      return `${Math.round((Number(this.overview.success_rate) || 0) * 100)}%`;
+    },
+    skillCategories() {
+      return [...new Set(this.skills.map((item) => item.category).filter(Boolean))].slice(0, 8);
+    },
+    filteredSkills() {
+      if (this.skillFilter === "all") return this.skills;
+      return this.skills.filter((item) => item.category === this.skillFilter);
+    },
+    selectedSkill() {
+      return this.skills.find((item) => item.name === this.selectedSkillName) || null;
+    },
+    selectedWorkflow() {
+      return this.workflows.find((item) => item.id === this.selectedWorkflowId) || null;
+    },
+    toolHealthMap() {
+      const out = {};
+      for (const item of this.toolHealth || []) out[item.tool_id] = item;
+      return out;
+    },
+  },
+  async mounted() {
+    await this.refreshAll();
+  },
+  methods: {
+    shortId,
+    async safe(action, label) {
+      try {
+        await action();
+      } catch (err) {
+        this.statusText = `${label}失败: ${err.message}`;
+        window.alert(`${label}失败: ${err.message}`);
       }
-      await refreshRuns();
-      await loadOverview();
-    } catch (err) {
-      console.error(err);
-    }
-  }, 2400);
-}
-
-function stopRunPoller() {
-  if (!state.runPoller) return;
-  window.clearInterval(state.runPoller);
-  state.runPoller = null;
-}
-
-async function createWorkflowFromMission() {
-  const objective = els.missionObjective.value.trim();
-  const name = els.workflowName.value.trim();
-  const mode = els.missionMode.value;
-  if (!objective) {
-    alert("请输入目标");
-    return;
-  }
-
-  let workflow;
-  if (mode === "quickstart") {
-    workflow = await api("/v1/platform/quickstart", {
-      method: "POST",
-      body: JSON.stringify({ objective, name: name || "Quickstart Mission" }),
-    });
-  } else if (mode === "template") {
-    workflow = await api("/v1/platform/autodesign", {
-      method: "POST",
-      body: JSON.stringify({
-        objective,
-        name: name || undefined,
-        template_slug: els.templateSelect.value || undefined,
-      }),
-    });
-  } else {
-    workflow = await api("/v1/platform/autodesign", {
-      method: "POST",
-      body: JSON.stringify({ objective, name: name || undefined }),
-    });
-  }
-
-  state.selectedWorkflowId = workflow.id;
-  await loadAgents();
-  await loadWorkflows();
-  renderWorkflows();
-  renderCanvas(workflow);
-  await refreshRuns();
-  await loadOverview();
-  setSummary(`workflow created: ${workflow.name}`);
-}
-
-async function createTool() {
-  let headers = {};
-  try {
-    headers = JSON.parse(els.toolHeadersJson.value || "{}");
-  } catch {
-    alert("Headers JSON 格式错误");
-    return;
-  }
-  if (headers && typeof headers !== "object") {
-    alert("Headers JSON 必须是对象");
-    return;
-  }
-  const payload = {
-    name: els.toolName.value.trim(),
-    kind: els.toolKind.value,
-    base_url: els.toolBaseUrl.value.trim(),
-    headers,
-    default_query: els.toolDefaultQuery.value.trim(),
-    verify_tls: els.toolVerifyTls.value === "true",
-    required_permission: els.toolPermission.value,
-  };
-  if (!payload.name || !payload.base_url) {
-    alert("Tool 名称和 URL 必填");
-    return;
-  }
-  await api("/v1/platform/tools", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  await loadTools();
-  await loadToolHealth();
-  setSummary(`tool registered: ${payload.name}`);
-}
-
-async function bootstrapEnvironment() {
-  const monitoringIp = els.envMonitoringIp.value.trim();
-  const monitoringPort = Number.parseInt(els.envMonitoringPort.value.trim(), 10);
-  const k8sApiUrl = els.envK8sUrl.value.trim();
-  const k8sVerifyTls = els.envK8sVerifyTls.value === "true";
-  const k8sToken = els.envK8sToken.value.trim();
-  if (!monitoringIp || !k8sApiUrl || Number.isNaN(monitoringPort)) {
-    alert("请完整填写监控与 K8s 环境参数");
-    return;
-  }
-
-  const resp = await api("/v1/platform/bootstrap/environment", {
-    method: "POST",
-    body: JSON.stringify({
-      monitoring_ip: monitoringIp,
-      monitoring_port: monitoringPort,
-      k8s_api_url: k8sApiUrl,
-      k8s_verify_tls: k8sVerifyTls,
-      k8s_bearer_token: k8sToken,
-      create_mission_workflow: true,
-      workflow_name: "Prod Autonomous Incident",
-    }),
-  });
-
-  await refreshAll();
-  if (resp.workflow && resp.workflow.id) {
-    state.selectedWorkflowId = resp.workflow.id;
-    renderWorkflows();
-    renderCanvas(resp.workflow);
-  }
-
-  const probeLines = Object.entries(resp.probe_results || {})
-    .slice(0, 4)
-    .map(([, v]) => v)
-    .join(" | ");
-  setSummary(`环境引导完成，primaryTool=${(resp.primary_tool_id || "").slice(0, 8)} ${probeLines}`);
-}
-
-async function approveOrReject(action) {
-  if (!state.selectedRunId) {
-    alert("请先选择 run");
-    return;
-  }
-  try {
-    await api(`/v1/platform/runs/${state.selectedRunId}/approval`, {
-      method: "POST",
-      body: JSON.stringify({
-        action,
-        approver: els.approverName.value.trim() || "oncall",
-        comment: els.approvalComment.value.trim(),
-      }),
-    });
-    log(`[${ts()}] approval action=${action}`);
-    await refreshRuns();
-    await loadOverview();
-    await loadRunDetail(state.selectedRunId);
-    openStream(state.selectedRunId);
-  } catch (err) {
-    alert(`审批失败: ${err.message}`);
-  }
-}
-
-async function refreshAll() {
-  await Promise.all([
-    loadOverview(),
-    loadTemplates(),
-    loadSkills(),
-    loadTools(),
-    loadToolHealth(),
-    loadAgents(),
-    loadWorkflows(),
-    loadArtifacts(),
-  ]);
-  renderWorkflows();
-  const wf = state.workflows.find((x) => x.id === state.selectedWorkflowId) || state.workflows[0];
-  if (wf) {
-    state.selectedWorkflowId = wf.id;
-    renderCanvas(wf);
-  } else {
-    renderCanvas(null);
-  }
-  await refreshRuns();
-  updateApprovalForm(null);
-}
-
-els.missionMode.addEventListener("change", renderTemplateOptions);
-
-els.missionForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  try {
-    await createWorkflowFromMission();
-  } catch (err) {
-    alert(`创建 workflow 失败: ${err.message}`);
-  }
-});
-
-els.refreshSkills.addEventListener("click", async () => {
-  try {
-    await loadSkills();
-    setSummary("Skill 列表已刷新");
-  } catch (err) {
-    alert(`刷新 Skill 失败: ${err.message}`);
-  }
-});
-
-els.runSkillBtn.addEventListener("click", async () => {
-  try {
-    await runSelectedSkill();
-  } catch (err) {
-    alert(`运行 Skill 失败: ${err.message}`);
-  }
-});
-
-els.skillForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  try {
-    await saveCustomSkill();
-  } catch (err) {
-    alert(`保存 Skill 失败: ${err.message}`);
-  }
-});
-
-els.toolForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  try {
-    await createTool();
-  } catch (err) {
-    alert(`注册 tool 失败: ${err.message}`);
-  }
-});
-
-els.envForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  try {
-    await bootstrapEnvironment();
-  } catch (err) {
-    alert(`环境引导失败: ${err.message}`);
-  }
-});
-
-els.runForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  if (!state.selectedWorkflowId) {
-    alert("请先创建或选择 workflow");
-    return;
-  }
-  let input = {};
-  let toolQueries = {};
-  try {
-    input = JSON.parse(els.runInput.value || "{}");
-  } catch {
-    alert("Run Input JSON 格式错误");
-    return;
-  }
-  try {
-    toolQueries = JSON.parse(els.toolQueriesInput.value || "{}");
-  } catch {
-    alert("Tool Queries JSON 格式错误");
-    return;
-  }
-
-  input.actor_permission = els.actorPermission.value;
-  input.tool_queries = toolQueries;
-
-  try {
-    const run = await api(`/v1/platform/workflows/${state.selectedWorkflowId}/runs`, {
-      method: "POST",
-      body: JSON.stringify({ input }),
-    });
-    state.selectedRunId = run.id;
-    await refreshRuns();
-    await loadOverview();
-    await loadRunDetail(run.id);
-    openStream(run.id);
-  } catch (err) {
-    alert(`启动失败: ${err.message}`);
-  }
-});
-
-els.cancelRunBtn.addEventListener("click", async () => {
-  if (!state.selectedRunId) {
-    alert("当前没有选中的 run");
-    return;
-  }
-  try {
-    await api(`/v1/platform/runs/${state.selectedRunId}/cancel`, { method: "POST" });
-    log(`[${ts()}] cancel requested`);
-    await refreshRuns();
-    await loadOverview();
-  } catch (err) {
-    alert(`取消失败: ${err.message}`);
-  }
-});
-
-els.approveBtn.addEventListener("click", () => approveOrReject("approve"));
-els.rejectBtn.addEventListener("click", () => approveOrReject("reject"));
-els.approvalAdviceBtn.addEventListener("click", async () => {
-  if (!state.selectedRunId) {
-    alert("请先选择 run");
-    return;
-  }
-  try {
-    await loadApprovalAdvice(state.selectedRunId);
-    setSummary(`审批建议已生成: run=${state.selectedRunId.slice(0, 8)}`);
-  } catch (err) {
-    alert(`生成审批建议失败: ${err.message}`);
-  }
-});
-
-els.refreshAll.addEventListener("click", async () => {
-  await refreshAll();
-  setSummary("数据已刷新");
-});
-
-els.refreshToolHealth.addEventListener("click", async () => {
-  try {
-    await loadToolHealth();
-    setSummary("工具健康探测已完成");
-  } catch (err) {
-    alert(`探测失败: ${err.message}`);
-  }
-});
-
-els.refreshWorkflows.addEventListener("click", async () => {
-  await loadWorkflows();
-  renderWorkflows();
-  const wf = state.workflows.find((x) => x.id === state.selectedWorkflowId) || state.workflows[0];
-  renderCanvas(wf || null);
-});
-
-els.refreshRuns.addEventListener("click", async () => {
-  await refreshRuns();
-  if (state.selectedRunId) {
-    await loadRunDetail(state.selectedRunId);
-  }
-});
-
-els.compareRunsBtn.addEventListener("click", async () => {
-  try {
-    await compareRuns();
-  } catch (err) {
-    alert(`run 对比失败: ${err.message}`);
-  }
-});
-
-els.artifactKind.addEventListener("change", async () => {
-  try {
-    await loadArtifacts();
-    setSummary(`artifact 列表已切换到 ${els.artifactKind.value}`);
-  } catch (err) {
-    alert(`加载 artifacts 失败: ${err.message}`);
-  }
-});
-
-els.refreshArtifacts.addEventListener("click", async () => {
-  try {
-    await loadArtifacts();
-    setSummary("artifact 列表已刷新");
-  } catch (err) {
-    alert(`刷新 artifacts 失败: ${err.message}`);
-  }
-});
-
-els.downloadArtifactBtn.addEventListener("click", async () => {
-  try {
-    await downloadSelectedArtifact();
-  } catch (err) {
-    alert(`下载 artifact 失败: ${err.message}`);
-  }
-});
-
-els.generateBriefingBtn.addEventListener("click", async () => {
-  try {
-    await generateBriefing();
-  } catch (err) {
-    alert(`生成简报失败: ${err.message}`);
-  }
-});
-
-els.exportReportBtn.addEventListener("click", async () => {
-  try {
-    await exportRunReport();
-  } catch (err) {
-    alert(`导出报告失败: ${err.message}`);
-  }
-});
-
-window.addEventListener("beforeunload", () => {
-  closeStream();
-  stopRunPoller();
-});
-
-refreshAll().catch((err) => {
-  console.error(err);
-  setSummary(`初始化失败: ${err.message}`);
-});
+    },
+    async refreshAll() {
+      await this.safe(async () => {
+        await Promise.all([
+          this.loadOverview(),
+          this.loadTemplates(),
+          this.loadSkills(),
+          this.loadTools(),
+          this.loadToolHealth(),
+          this.loadWorkflows(),
+        ]);
+        await this.refreshRuns();
+        this.statusText = "数据已刷新";
+      }, "刷新");
+    },
+    async loadOverview() {
+      this.overview = await api("/v1/platform/overview");
+    },
+    async loadTemplates() {
+      this.templates = await api("/v1/platform/templates");
+      if (!this.mission.template && this.templates[0]) this.mission.template = this.templates[0].slug;
+    },
+    async loadSkills() {
+      this.skills = await api("/v1/platform/skills");
+      if (!this.selectedSkillName && this.skills[0]) this.selectSkill(this.skills[0]);
+    },
+    async loadTools() {
+      this.tools = await api("/v1/platform/tools");
+    },
+    async loadToolHealth() {
+      this.toolHealth = await api("/v1/platform/tools/health");
+      this.statusText = "工具健康探测完成";
+    },
+    async loadWorkflows() {
+      this.workflows = await api("/v1/platform/workflows");
+      if (!this.selectedWorkflowId && this.workflows[0]) this.selectedWorkflowId = this.workflows[0].id;
+    },
+    async refreshRuns() {
+      const q = this.selectedWorkflowId ? `?workflow_id=${encodeURIComponent(this.selectedWorkflowId)}` : "";
+      this.runs = await api(`/v1/platform/runs${q}`);
+      if (!this.runs.find((item) => item.id === this.selectedRunId)) {
+        this.selectedRunId = this.runs[0]?.id || "";
+      }
+    },
+    selectSkill(skill) {
+      this.selectedSkillName = skill.name;
+      this.skillVarsJson = JSON.stringify(skill.variables || {}, null, 2);
+      this.skillResult = "";
+      this.statusText = `已选择 Skill: ${skill.title}`;
+    },
+    async runSelectedSkill() {
+      await this.safe(async () => {
+        if (!this.selectedSkillName) throw new Error("请先选择 Skill");
+        const variables = JSON.parse(this.skillVarsJson || "{}");
+        const result = await api(`/v1/platform/skills/${encodeURIComponent(this.selectedSkillName)}/run`, {
+          method: "POST",
+          body: JSON.stringify({ variables, dry_run: true, apply: false, timeout_sec: 20 }),
+        });
+        this.skillResult = formatSkillResult(result);
+        this.statusText = `Skill dry-run 已生成: ${this.selectedSkillName}`;
+      }, "运行 Skill");
+    },
+    async copySkillCommand() {
+      if (!this.selectedSkillName) return;
+      let vars = {};
+      try {
+        vars = JSON.parse(this.skillVarsJson || "{}");
+      } catch {
+        vars = {};
+      }
+      const args = Object.entries(vars)
+        .map(([key, value]) => `--var ${key}=${String(value)}`)
+        .join(" ");
+      const command = `lazysre skill run ${this.selectedSkillName}${args ? ` ${args}` : ""}`;
+      await navigator.clipboard?.writeText(command);
+      this.statusText = `已复制: ${command}`;
+    },
+    async saveCustomSkill() {
+      await this.safe(async () => {
+        const variables = JSON.parse(this.customSkill.variablesJson || "{}");
+        const readCommands = String(this.customSkill.readCommands || "")
+          .split("\n")
+          .map((item) => item.trim())
+          .filter(Boolean);
+        if (!this.customSkill.name.trim() || !this.customSkill.title.trim() || !readCommands.length) {
+          throw new Error("名称、标题和只读命令必填");
+        }
+        const skill = await api("/v1/platform/skills", {
+          method: "POST",
+          body: JSON.stringify({
+            name: this.customSkill.name.trim(),
+            title: this.customSkill.title.trim(),
+            description: this.customSkill.description.trim(),
+            category: this.customSkill.category.trim() || "custom",
+            mode: "diagnose",
+            risk_level: "low",
+            required_permission: "read",
+            instruction: this.customSkill.title.trim(),
+            variables,
+            read_commands: readCommands,
+            tags: ["custom", "web", this.customSkill.category.trim()].filter(Boolean),
+          }),
+        });
+        await this.loadSkills();
+        const selected = this.skills.find((item) => item.name === skill.name);
+        if (selected) this.selectSkill(selected);
+        this.statusText = `自定义 Skill 已保存: ${skill.name}`;
+      }, "保存 Skill");
+    },
+    resetCustomSkill() {
+      this.customSkill = { ...DEFAULT_SKILL };
+    },
+    async createWorkflow() {
+      await this.safe(async () => {
+        const payload = { objective: this.mission.objective, name: this.mission.name || undefined };
+        let workflow;
+        if (this.mission.mode === "quickstart") {
+          workflow = await api("/v1/platform/quickstart", { method: "POST", body: JSON.stringify(payload) });
+        } else {
+          workflow = await api("/v1/platform/autodesign", {
+            method: "POST",
+            body: JSON.stringify({ ...payload, template_slug: this.mission.mode === "template" ? this.mission.template : undefined }),
+          });
+        }
+        await this.loadWorkflows();
+        this.selectWorkflow(workflow);
+        await this.loadOverview();
+        this.statusText = `Workflow 已生成: ${workflow.name}`;
+      }, "生成 Workflow");
+    },
+    selectWorkflow(workflow) {
+      this.selectedWorkflowId = workflow.id;
+      this.selectedRunId = "";
+      this.refreshRuns();
+    },
+    async createTool() {
+      await this.safe(async () => {
+        await api("/v1/platform/tools", {
+          method: "POST",
+          body: JSON.stringify({ ...this.toolForm, headers: {}, verify_tls: true }),
+        });
+        await this.loadTools();
+        await this.loadToolHealth();
+        this.statusText = `Tool 已注册: ${this.toolForm.name}`;
+      }, "注册 Tool");
+    },
+    async startRun() {
+      await this.safe(async () => {
+        if (!this.selectedWorkflowId) throw new Error("请先选择 Workflow");
+        const run = await api(`/v1/platform/workflows/${this.selectedWorkflowId}/runs`, {
+          method: "POST",
+          body: JSON.stringify({ input: { actor_permission: "read" } }),
+        });
+        this.selectedRunId = run.id;
+        await this.refreshRuns();
+        await this.loadRunDetail(run.id);
+        await this.loadOverview();
+        this.activeView = "runs";
+      }, "启动 Run");
+    },
+    async loadRunDetail(runId) {
+      await this.safe(async () => {
+        const run = await api(`/v1/platform/runs/${runId}`);
+        this.selectedRunId = run.id;
+        this.runOutput = JSON.stringify({ status: run.status, summary: run.summary, outputs: run.outputs, error: run.error }, null, 2);
+        this.statusText = `Run ${shortId(run.id)} 状态: ${run.status}`;
+      }, "加载 Run");
+    },
+    async generateBriefing() {
+      await this.safe(async () => {
+        const q = this.selectedWorkflowId ? `?workflow_id=${encodeURIComponent(this.selectedWorkflowId)}&timeout_sec=4` : "?timeout_sec=4";
+        const briefing = await api(`/v1/platform/briefing${q}`);
+        this.briefing = formatBriefing(briefing);
+        this.runOutput = this.briefing;
+        this.statusText = `故障简报已生成: ${briefing.severity}`;
+      }, "生成简报");
+    },
+  },
+}).mount("#app");

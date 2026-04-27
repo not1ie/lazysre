@@ -128,9 +128,9 @@ lazysre --version
 - Provider 错误提示增强：Gemini/OpenAI/Anthropic/兼容网关异常会输出脱敏且可执行的修复建议
 - install-doctor 增加代理环境预检（自动识别 SOCKS 代理并提示 `httpx[socks]`）
 - install-doctor / doctor 增加工作区密钥泄漏预检（workspace_secret_scan，输出脱敏文件:行号）
-- Web Skill Center MVP：内置远程服务器、K8s、Swarm、Nginx、数据库、GPU/AI、CI/CD Skill 模板，支持 Web 创建自定义 Skill 和 dry-run 预览
+- Web Skill Center MVP：Vue 单页控制台，内置远程服务器、K8s、Swarm、Nginx、数据库、GPU/AI、CI/CD Skill 模板，支持 Web 创建自定义 Skill 和 dry-run 预览
 - CLI Skill Center：`lsre skill list/show/run/add/remove`，与 Web 共用同一套 Skill 模板和自定义存储
-- 当前封版基线测试：`347 passed`
+- 当前封版基线测试：`349 passed`
 
 ## 安装方式（开箱即用）
 
