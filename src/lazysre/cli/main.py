@@ -91,6 +91,16 @@ from lazysre.commands.timeline import (
     render_timeline_mermaid,
     render_timeline_rich_text,
 )
+from lazysre.runbook import (
+    GeneratedRunbookStore,
+    build_runbook_payload_from_incident,
+    default_generated_runbook_dir,
+    diff_runbook_versions,
+    find_best_matching_runbook,
+    find_incident_by_id,
+    normalize_runbook_name,
+    render_runbook_diff_text,
+)
 from lazysre.cli.tools import build_default_registry
 from lazysre.cli.types import DispatchEvent, DispatchResult, ExecResult
 from lazysre.cli.tools.marketplace import (
@@ -1388,6 +1398,23 @@ def skill_run(
     except ValueError as exc:
         raise typer.BadParameter(_safe_exception_text(exc)) from exc
     rendered_commands, _ = render_skill_commands(item, overrides=values)
+    generated_store = GeneratedRunbookStore(default_generated_runbook_dir())
+    runbook_query = " ".join(
+        [
+            item.name,
+            item.title,
+            item.description,
+            " ".join(str(x) for x in rendered_commands.get("read", [])[:3]),
+            " ".join(str(x) for x in rendered_commands.get("apply", [])[:3]),
+        ]
+    ).strip()
+    match = find_best_matching_runbook(generated_store, query=runbook_query)
+    if match and match[1] >= 0.15:
+        related, score = match
+        typer.echo(
+            f"找到相关 Runbook: {related.name}-{related.version} (score={score:.2f})，"
+            "可用 `lazysre runbook show <name> --generated` 查看并参考。"
+        )
     preflight_risk_payload: dict[str, Any] | None = None
     if apply and execute and (not skip_preflight):
         candidate_commands = [
@@ -3308,21 +3335,52 @@ def _handle_incident_inline_command(text: str, *, path: Path | None = None) -> s
 def runbook_list(
     runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
     custom_only: Annotated[bool, typer.Option("--custom-only", help="Show custom runbooks only.")] = False,
+    generated_dir: Annotated[str, typer.Option("--generated-dir", help="Generated runbook directory (versioned yaml).")] = str(default_generated_runbook_dir()),
+    generated_only: Annotated[bool, typer.Option("--generated-only", help="Show generated runbooks only.")] = False,
 ) -> None:
-    store = RunbookStore(Path(runbook_file))
-    items = store.list_custom() if custom_only else all_runbooks(store=store)
-    if not (_console and Table):
-        for item in items:
-            typer.echo(f"{item.name} [{item.mode}] ({item.source}) {item.title}")
+    generated_store = GeneratedRunbookStore(Path(generated_dir))
+    generated_names = generated_store.list_names()
+
+    if not generated_only:
+        store = RunbookStore(Path(runbook_file))
+        items = store.list_custom() if custom_only else all_runbooks(store=store)
+        if not (_console and Table):
+            for item in items:
+                typer.echo(f"{item.name} [{item.mode}] ({item.source}) {item.title}")
+        else:
+            table = Table(title="Template Runbooks")
+            table.add_column("Name", style="cyan", no_wrap=True)
+            table.add_column("Mode", style="magenta", no_wrap=True)
+            table.add_column("Source", style="yellow", no_wrap=True)
+            table.add_column("Title", style="white")
+            table.add_column("Description", style="green")
+            for item in items:
+                table.add_row(item.name, item.mode, item.source, item.title, item.description)
+            _console.print(table)
+
+    if not generated_names:
+        if generated_only:
+            typer.echo("No generated runbooks found.")
         return
-    table = Table(title="Runbooks")
+    if not (_console and Table):
+        typer.echo("")
+        typer.echo("Generated Runbooks")
+        for name in generated_names:
+            latest = generated_store.latest_version(name) or "-"
+            versions = ",".join(generated_store.list_versions(name))
+            typer.echo(f"{name} latest={latest} versions={versions}")
+        return
+    table = Table(title="Generated Runbooks")
     table.add_column("Name", style="cyan", no_wrap=True)
-    table.add_column("Mode", style="magenta", no_wrap=True)
-    table.add_column("Source", style="yellow", no_wrap=True)
-    table.add_column("Title", style="white")
-    table.add_column("Description", style="green")
-    for item in items:
-        table.add_row(item.name, item.mode, item.source, item.title, item.description)
+    table.add_column("Latest", style="yellow", no_wrap=True)
+    table.add_column("Versions", style="white")
+    table.add_column("Incident", style="magenta")
+    for name in generated_names:
+        latest = generated_store.latest_version(name) or "-"
+        rec = generated_store.load(name, latest if latest != "-" else None)
+        incident = rec.source_incident_id if rec else "-"
+        versions = ", ".join(generated_store.list_versions(name))
+        table.add_row(name, latest, versions, incident)
     _console.print(table)
 
 
@@ -3330,9 +3388,22 @@ def runbook_list(
 def runbook_show(
     name: Annotated[str, typer.Argument(help="Runbook name.")],
     runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
+    generated_dir: Annotated[str, typer.Option("--generated-dir", help="Generated runbook directory (versioned yaml).")] = str(default_generated_runbook_dir()),
+    version: Annotated[str, typer.Option("--version", help="Generated runbook version, e.g. v1. Default latest.")] = "",
+    generated: Annotated[bool, typer.Option("--generated", help="Read from generated runbooks.")] = False,
 ) -> None:
+    if generated:
+        selected = GeneratedRunbookStore(Path(generated_dir)).load(name, version.strip() or None)
+        if not selected:
+            raise typer.BadParameter(f"generated runbook not found: {name} {version or '(latest)'}")
+        typer.echo(json.dumps(selected.payload, ensure_ascii=False, indent=2))
+        return
     item = find_runbook(name, store=RunbookStore(Path(runbook_file)))
     if not item:
+        selected = GeneratedRunbookStore(Path(generated_dir)).load(name, version.strip() or None)
+        if selected:
+            typer.echo(json.dumps(selected.payload, ensure_ascii=False, indent=2))
+            return
         raise typer.BadParameter(f"runbook not found: {name}")
     payload = {
         "name": item.name,
@@ -3344,6 +3415,72 @@ def runbook_show(
         "variables": item.variables,
     }
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@runbook_app.command("generate")
+def runbook_generate(
+    from_incident: Annotated[str, typer.Option("--from-incident", help="Incident ID, e.g. CHG-xxxx / INC-xxxx.")],
+    output: Annotated[str, typer.Option("--output", help="Generated runbook root directory.")] = "",
+    incident_file: Annotated[str, typer.Option("--incident-file", help="Incident store JSON path.")] = str(Path(settings.data_dir) / "lsre-incident.json"),
+    evidence_file: Annotated[str, typer.Option("--evidence-file", help="Optional evidence JSON path.")] = "",
+) -> None:
+    target_dir = Path(output.strip() or str(default_generated_runbook_dir())).expanduser()
+    store = GeneratedRunbookStore(target_dir)
+    incident_store = IncidentStore(Path(incident_file).expanduser())
+    record = find_incident_by_id(incident_store, from_incident)
+    if record is None:
+        raise typer.BadParameter(f"incident not found: {from_incident}")
+    evidence_payload: dict[str, Any] = {}
+    if evidence_file.strip():
+        path = Path(evidence_file.strip()).expanduser()
+        if not path.exists():
+            raise typer.BadParameter(f"evidence file not found: {path}")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise typer.BadParameter(f"invalid evidence json: {_safe_exception_text(exc)}") from exc
+        if isinstance(raw, dict):
+            evidence_payload = raw
+    if not evidence_payload:
+        default_evidence = Path(settings.data_dir) / "skill-evidence.json"
+        if default_evidence.exists():
+            try:
+                raw = json.loads(default_evidence.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    evidence_payload = raw
+            except Exception:
+                evidence_payload = {}
+    payload = build_runbook_payload_from_incident(
+        incident=record,
+        evidence_payload=evidence_payload,
+    )
+    base_name = normalize_runbook_name(record.title) or normalize_runbook_name(record.id) or "incident-runbook"
+    saved = store.save_new_version(base_name, payload)
+    typer.echo(
+        f"Generated runbook: {saved.name} {saved.version}\n"
+        f"path: {saved.path}\n"
+        f"incident: {saved.source_incident_id}"
+    )
+
+
+@runbook_app.command("diff")
+def runbook_diff(
+    name: Annotated[str, typer.Argument(help="Generated runbook name.")],
+    version: Annotated[list[str], typer.Option("--version", help="Specify exactly two versions, e.g. --version v1 --version v2")] = [],
+    generated_dir: Annotated[str, typer.Option("--generated-dir", help="Generated runbook directory (versioned yaml).")] = str(default_generated_runbook_dir()),
+) -> None:
+    if len(version) != 2:
+        raise typer.BadParameter("runbook diff requires two --version values, e.g. --version v1 --version v2")
+    store = GeneratedRunbookStore(Path(generated_dir))
+    try:
+        lines = diff_runbook_versions(store, name=name, version_a=version[0], version_b=version[1])
+    except ValueError as exc:
+        raise typer.BadParameter(_safe_exception_text(exc)) from exc
+    text = render_runbook_diff_text(lines)
+    if _console and Panel:
+        _console.print(Panel(text or "No differences.", title=f"Runbook Diff: {name} {version[0]} -> {version[1]}", border_style="cyan"))
+        return
+    typer.echo(text or "No differences.")
 
 
 @runbook_app.command("add")
@@ -3794,6 +3931,8 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
     subcmd = tokens[0].lower()
     if subcmd in {"list", "ls"}:
         custom_only = False
+        generated_only = False
+        generated_dir = str(default_generated_runbook_dir())
         runbook_file = settings.runbook_store_file
         idx = 1
         while idx < len(tokens):
@@ -3802,11 +3941,24 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
                 custom_only = True
                 idx += 1
                 continue
+            if token == "--generated-only":
+                generated_only = True
+                idx += 1
+                continue
+            if token == "--generated-dir" or token.startswith("--generated-dir="):
+                generated_dir, idx = _opt_value(tokens, idx, "--generated-dir")
+                continue
             if token == "--runbook-file" or token.startswith("--runbook-file="):
                 runbook_file, idx = _opt_value(tokens, idx, "--runbook-file")
                 continue
             raise ValueError(f"unknown option for list: {token}")
-        return {"action": "list", "custom_only": custom_only, "runbook_file": runbook_file}
+        return {
+            "action": "list",
+            "custom_only": custom_only,
+            "generated_only": generated_only,
+            "generated_dir": generated_dir,
+            "runbook_file": runbook_file,
+        }
 
     def _parse_run_args(args: list[str]) -> tuple[str, bool, list[str], str]:
         runbook_file = settings.runbook_store_file
@@ -3832,11 +3984,24 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
             raise ValueError(f"usage: /runbook {subcmd} <name> [k=v]")
         name = tokens[1]
         runbook_file = settings.runbook_store_file
+        generated = False
+        generated_dir = str(default_generated_runbook_dir())
+        version = ""
         args = tokens[2:]
         cleaned: list[str] = []
         idx = 0
         while idx < len(args):
             token = args[idx]
+            if token == "--generated":
+                generated = True
+                idx += 1
+                continue
+            if token == "--generated-dir" or token.startswith("--generated-dir="):
+                generated_dir, idx = _opt_value(args, idx, "--generated-dir")
+                continue
+            if token == "--version" or token.startswith("--version="):
+                version, idx = _opt_value(args, idx, "--version")
+                continue
             if token == "--runbook-file" or token.startswith("--runbook-file="):
                 runbook_file, idx = _opt_value(args, idx, "--runbook-file")
                 continue
@@ -3849,6 +4014,68 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
             "var_items": var_items,
             "extra": extra,
             "runbook_file": runbook_file,
+            "generated": generated,
+            "generated_dir": generated_dir,
+            "version": version,
+        }
+
+    if subcmd == "generate":
+        from_incident = ""
+        output = ""
+        incident_file = str(Path(settings.data_dir) / "lsre-incident.json")
+        evidence_file = ""
+        args = tokens[1:]
+        idx = 0
+        while idx < len(args):
+            token = args[idx]
+            if token == "--from-incident" or token.startswith("--from-incident="):
+                from_incident, idx = _opt_value(args, idx, "--from-incident")
+                continue
+            if token == "--output" or token.startswith("--output="):
+                output, idx = _opt_value(args, idx, "--output")
+                continue
+            if token == "--incident-file" or token.startswith("--incident-file="):
+                incident_file, idx = _opt_value(args, idx, "--incident-file")
+                continue
+            if token == "--evidence-file" or token.startswith("--evidence-file="):
+                evidence_file, idx = _opt_value(args, idx, "--evidence-file")
+                continue
+            raise ValueError(f"unknown option for generate: {token}")
+        if not from_incident.strip():
+            raise ValueError("usage: /runbook generate --from-incident <id> [--output dir]")
+        return {
+            "action": "generate",
+            "from_incident": from_incident,
+            "output": output,
+            "incident_file": incident_file,
+            "evidence_file": evidence_file,
+        }
+
+    if subcmd == "diff":
+        if len(tokens) < 2:
+            raise ValueError("usage: /runbook diff <name> --version v1 --version v2")
+        name = tokens[1]
+        generated_dir = str(default_generated_runbook_dir())
+        versions: list[str] = []
+        args = tokens[2:]
+        idx = 0
+        while idx < len(args):
+            token = args[idx]
+            if token == "--generated-dir" or token.startswith("--generated-dir="):
+                generated_dir, idx = _opt_value(args, idx, "--generated-dir")
+                continue
+            if token == "--version" or token.startswith("--version="):
+                value, idx = _opt_value(args, idx, "--version")
+                versions.append(value)
+                continue
+            raise ValueError(f"unknown option for diff: {token}")
+        if len(versions) != 2:
+            raise ValueError("usage: /runbook diff <name> --version v1 --version v2")
+        return {
+            "action": "diff",
+            "name": name,
+            "versions": versions,
+            "generated_dir": generated_dir,
         }
 
     if subcmd == "add":
@@ -11774,7 +12001,10 @@ def _render_chat_short_help() -> None:
         "- /template run <name> [--apply] [--var k=v]: 运行模板（支持审批门禁）",
         "- /runbook list: 查看 runbook 模板",
         "- /runbook show <name>: 查看 runbook 定义",
+        "- /runbook show <name> --generated [--version vN]: 查看自动生成的版本化 runbook",
         "- /runbook render <name> [k=v]: 预览渲染后的 runbook 指令",
+        "- /runbook generate --from-incident <id>: 从故障记录自动生成版本化 runbook",
+        "- /runbook diff <name> --version v1 --version v2: 对比两个版本差异",
         "- /runbook add <name> --title ... --instruction ... [--mode fix] [k=v]: 新增 runbook",
         "- /runbook remove <name> [--yes]: 删除自定义 runbook",
         "- /runbook export --output <file> [--scope custom|effective]: 导出 runbook",
@@ -16176,7 +16406,31 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 runbook_list(
                     runbook_file=str(command.get("runbook_file", settings.runbook_store_file)),
                     custom_only=bool(command.get("custom_only", False)),
+                    generated_dir=str(command.get("generated_dir", str(default_generated_runbook_dir()))),
+                    generated_only=bool(command.get("generated_only", False)),
                 )
+                continue
+            if action == "generate":
+                try:
+                    runbook_generate(
+                        from_incident=str(command.get("from_incident", "")),
+                        output=str(command.get("output", "")),
+                        incident_file=str(command.get("incident_file", str(Path(settings.data_dir) / "lsre-incident.json"))),
+                        evidence_file=str(command.get("evidence_file", "")),
+                    )
+                except typer.BadParameter as exc:
+                    typer.echo(f"runbook generate failed: {_safe_exception_text(exc)}")
+                continue
+            if action == "diff":
+                try:
+                    versions = [str(x) for x in list(command.get("versions", []))]
+                    runbook_diff(
+                        name=str(command.get("name", "")),
+                        version=versions,
+                        generated_dir=str(command.get("generated_dir", str(default_generated_runbook_dir()))),
+                    )
+                except typer.BadParameter as exc:
+                    typer.echo(f"runbook diff failed: {_safe_exception_text(exc)}")
                 continue
             if action == "add":
                 try:
@@ -16227,6 +16481,21 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
 
             runbook_name = str(command.get("name", ""))
             runbook_file = str(command.get("runbook_file", settings.runbook_store_file))
+            generated_mode = bool(command.get("generated", False))
+            generated_dir = str(command.get("generated_dir", str(default_generated_runbook_dir())))
+            generated_version = str(command.get("version", "")).strip()
+            if generated_mode:
+                try:
+                    runbook_show(
+                        name=runbook_name,
+                        runbook_file=runbook_file,
+                        generated_dir=generated_dir,
+                        version=generated_version,
+                        generated=True,
+                    )
+                except typer.BadParameter as exc:
+                    typer.echo(f"runbook show failed: {_safe_exception_text(exc)}")
+                continue
             template = find_runbook(runbook_name, store=RunbookStore(Path(runbook_file)))
             if not template:
                 typer.echo(f"runbook not found: {runbook_name}")

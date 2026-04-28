@@ -134,6 +134,34 @@ lazysre preflight --plan-file .data/remediation-plan.json --json
 
 当 `risk_score >= 70` 时，会在输出中标记审批升级建议（strict/审批单号）。
 
+## Incident Runbook（版本化 YAML）
+
+```bash
+# 从历史故障生成 runbook（v1/v2... 自动递增）
+lazysre runbook generate \
+  --from-incident CHG-20260428-001 \
+  --incident-file .data/lsre-incident.json \
+  --evidence-file .data/skill-evidence.json
+
+# 查看模板 runbook + 生成 runbook
+lazysre runbook list
+
+# 仅查看生成 runbook
+lazysre runbook list --generated-only
+
+# 查看生成 runbook 最新版 / 指定版本
+lazysre runbook show swarm-api-timeout-spike --generated
+lazysre runbook show swarm-api-timeout-spike --generated --version v2
+
+# 对比两个版本
+lazysre runbook diff swarm-api-timeout-spike --version v1 --version v2
+```
+
+生成 runbook 默认存储在 `~/.lazysre/runbooks/<name>/vN.yaml`，字段包含：
+`trigger_patterns / diagnosis_steps / remediation_steps / verify_steps / rollback_steps`。
+
+`lazysre skill run` 执行时会自动检索相似生成 runbook，并提示参考版本。
+
 ## 模型与 Key 配置
 
 ```bash
