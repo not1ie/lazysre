@@ -101,6 +101,7 @@ from lazysre.runbook import (
     normalize_runbook_name,
     render_runbook_diff_text,
 )
+from lazysre.topology import TopologyGraph, analyze_impact, discover_topology, render_topology_ascii
 from lazysre.cli.tools import build_default_registry
 from lazysre.cli.types import DispatchEvent, DispatchResult, ExecResult
 from lazysre.cli.tools.marketplace import (
@@ -150,6 +151,7 @@ approval_app = typer.Typer(help="Approval ticket lifecycle for high-risk executi
 runbook_app = typer.Typer(help="Workflow runbook templates.")
 template_app = typer.Typer(help="One-click remediation templates.")
 skill_app = typer.Typer(help="CLI managed SRE skills.")
+topology_app = typer.Typer(help="Service topology discovery and impact analysis.")
 
 
 @app.callback(invoke_without_command=True)
@@ -422,6 +424,141 @@ def timeline_command(
         typer.echo(render_timeline_mermaid(datasets))
         return
     typer.echo(render_timeline_rich_text(datasets))
+
+
+@topology_app.command("discover")
+def topology_discover(
+    target: Annotated[str, typer.Option("--target", help="Target descriptor, e.g. ssh://host or local.")] = "",
+    format: Annotated[str, typer.Option("--format", help="Output format: rich|dot|json")] = "rich",
+    output: Annotated[str, typer.Option("--output", help="Optional output file path.")] = "",
+) -> None:
+    fmt = str(format or "rich").strip().lower()
+    if fmt not in {"rich", "dot", "json"}:
+        raise typer.BadParameter("format must be rich|dot|json")
+    graph = discover_topology(target=target, now_iso=datetime.now(timezone.utc).replace(microsecond=0).isoformat())
+    env_name = str(graph.env).strip() or "local"
+    store_path = _topology_store_path(env_name)
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps(graph.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    rendered = _render_topology_output(graph, fmt=fmt)
+    if output.strip():
+        out = Path(output.strip()).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered, encoding="utf-8")
+        typer.echo(f"Topology exported: {out}")
+    else:
+        typer.echo(rendered)
+    typer.echo(f"Topology stored: {store_path}")
+
+
+@topology_app.command("show")
+def topology_show(
+    service_name: Annotated[str, typer.Argument(help="Service node id or keyword.")],
+    depth: Annotated[int, typer.Option("--depth", help="Impact chain depth.")] = 2,
+    env: Annotated[str, typer.Option("--env", help="Topology environment name.")] = "local",
+) -> None:
+    graph = _load_topology_graph(env)
+    if graph is None:
+        raise typer.BadParameter(f"topology not found for env: {env}. run `lazysre topology discover` first.")
+    hits = _match_topology_nodes(graph, service_name)
+    payload = {
+        "env": graph.env,
+        "source": graph.source,
+        "matches": hits[:20],
+        "depth": max(1, min(depth, 4)),
+    }
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@topology_app.command("impact")
+def topology_impact(
+    service_name: Annotated[str, typer.Argument(help="Service node id or keyword.")],
+    env: Annotated[str, typer.Option("--env", help="Topology environment name.")] = "local",
+    depth: Annotated[int, typer.Option("--depth", help="Transitive impact depth (max 4).")] = 2,
+) -> None:
+    graph = _load_topology_graph(env)
+    if graph is None:
+        raise typer.BadParameter(f"topology not found for env: {env}. run `lazysre topology discover` first.")
+    hits = _match_topology_nodes(graph, service_name)
+    if not hits:
+        raise typer.BadParameter(f"service not found in topology: {service_name}")
+    selected = hits[0]
+    report = analyze_impact(graph, selected, depth=max(1, min(depth, 4)))
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def _topology_store_path(env: str) -> Path:
+    safe = str(env or "local").strip().lower()
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "-" for ch in safe).strip("-") or "local"
+    return (Path.home() / ".lazysre" / "topology" / f"{safe}.json").expanduser()
+
+
+def _load_topology_graph(env: str) -> TopologyGraph | None:
+    path = _topology_store_path(env)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    nodes = payload.get("nodes", [])
+    edges = payload.get("edges", [])
+    notes = payload.get("notes", [])
+    return TopologyGraph(
+        env=str(payload.get("env", env)),
+        source=str(payload.get("source", "unknown")),
+        generated_at=str(payload.get("generated_at", "")),
+        nodes=[x for x in nodes if isinstance(x, dict)] if isinstance(nodes, list) else [],
+        edges=[x for x in edges if isinstance(x, dict)] if isinstance(edges, list) else [],
+        notes=[str(x) for x in notes if str(x).strip()] if isinstance(notes, list) else [],
+    )
+
+
+def _render_topology_output(graph: TopologyGraph, *, fmt: str) -> str:
+    if fmt == "json":
+        return json.dumps(graph.to_dict(), ensure_ascii=False, indent=2)
+    if fmt == "dot":
+        lines = ["digraph lazysre_topology {"]
+        for node in graph.nodes:
+            node_id = str(node.get("id", "")).replace('"', '\\"')
+            health = str(node.get("health", "unknown"))
+            color = {"green": "green", "yellow": "goldenrod", "red": "red"}.get(health, "gray")
+            if node_id:
+                lines.append(f'  "{node_id}" [color={color}];')
+        for edge in graph.edges:
+            src = str(edge.get("source", "")).replace('"', '\\"')
+            dst = str(edge.get("target", "")).replace('"', '\\"')
+            rel = str(edge.get("relation", "")).replace('"', '\\"')
+            if src and dst:
+                lines.append(f'  "{src}" -> "{dst}" [label="{rel}"];')
+        lines.append("}")
+        return "\n".join(lines)
+    return render_topology_ascii(graph)
+
+
+def _match_topology_nodes(graph: TopologyGraph, keyword: str) -> list[str]:
+    raw = str(keyword or "").strip().lower()
+    if not raw:
+        return []
+    tokens = [raw]
+    tokens.extend(re.findall(r"[a-z0-9][a-z0-9._:/-]{1,63}", raw))
+    tokens = [x for x in tokens if x]
+    items: list[str] = []
+    seen: set[str] = set()
+    for row in graph.nodes:
+        node_id = str(row.get("id", "")).strip()
+        if not node_id:
+            continue
+        lowered = node_id.lower()
+        if any(token in lowered for token in tokens):
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            items.append(node_id)
+    items.sort()
+    return items
 
 
 @app.command("swarm")
@@ -1949,6 +2086,10 @@ def _run_once(
     session_hint = session.build_context_hint(instruction)
     dialogue_context = session.build_dialogue_context(max_chars=2200)
     memory_context = _build_memory_context(instruction)
+    topology_context = _build_topology_context(instruction)
+    memory_plus = memory_context
+    if topology_context:
+        memory_plus = f"{memory_plus}\n\n[topology]\n{topology_context}".strip()
     prompt = instruction
     if session_hint:
         prompt = f"{instruction}\n\n[session]\n{session_hint}"
@@ -1956,6 +2097,8 @@ def _run_once(
         prompt = f"{prompt}\n\n[dialogue]\n{dialogue_context}"
     if memory_context:
         prompt = f"{prompt}\n\n[memory]\n{memory_context}"
+    if topology_context:
+        prompt = f"{prompt}\n\n[topology]\n{topology_context}"
     prompt = context_window.fit_text(prompt, max_chars=9000)
 
     streamed_chunks: list[str] = []
@@ -1987,7 +2130,7 @@ def _run_once(
                 max_steps=max_steps,
                 text_stream=None,
                 conversation_context=dialogue_context,
-                memory_context=memory_context,
+                memory_context=memory_plus,
             )
             )
     else:
@@ -2009,7 +2152,7 @@ def _run_once(
                 max_steps=max_steps,
                 text_stream=_stream_text if stream_enabled else None,
                 conversation_context=dialogue_context,
-                memory_context=memory_context,
+                memory_context=memory_plus,
             )
         )
     if _console and streamed_chunks:
@@ -2072,6 +2215,10 @@ def _run_fix(
     session_hint = session.build_context_hint(instruction)
     dialogue_context = session.build_dialogue_context(max_chars=2200)
     memory_context = _build_memory_context(instruction)
+    topology_context = _build_topology_context(instruction)
+    memory_plus = memory_context
+    if topology_context:
+        memory_plus = f"{memory_plus}\n\n[topology]\n{topology_context}".strip()
     prompt = compose_fix_instruction(instruction)
     if session_hint:
         prompt = f"{prompt}\n\n[session]\n{session_hint}"
@@ -2079,6 +2226,8 @@ def _run_fix(
         prompt = f"{prompt}\n\n[dialogue]\n{dialogue_context}"
     if memory_context:
         prompt = f"{prompt}\n\n[memory]\n{memory_context}"
+    if topology_context:
+        prompt = f"{prompt}\n\n[topology]\n{topology_context}"
     watch_context = _build_latest_watch_context(instruction)
     if watch_context:
         prompt = f"{prompt}\n\n[latest_watch]\n{watch_context}"
@@ -2113,7 +2262,7 @@ def _run_fix(
                     max_steps=max_steps,
                     text_stream=None,
                     conversation_context=dialogue_context,
-                    memory_context=memory_context,
+                    memory_context=memory_plus,
                 )
             )
     else:
@@ -2135,7 +2284,7 @@ def _run_fix(
                 max_steps=max_steps,
                 text_stream=_stream_text if stream_enabled else None,
                 conversation_context=dialogue_context,
-                memory_context=memory_context,
+                memory_context=memory_plus,
             )
         )
     if _console and streamed_chunks:
@@ -4457,6 +4606,7 @@ app.add_typer(approval_app, name="approval")
 app.add_typer(runbook_app, name="runbook")
 app.add_typer(template_app, name="template")
 app.add_typer(skill_app, name="skill")
+app.add_typer(topology_app, name="topology")
 
 
 def _render_timeline(events) -> None:
@@ -20142,6 +20292,33 @@ def _build_memory_context(instruction: str) -> str:
         return ""
 
 
+def _build_topology_context(instruction: str, *, env: str = "local") -> str:
+    graph = _load_topology_graph(env)
+    if graph is None:
+        return ""
+    hits = _match_topology_nodes(graph, instruction)
+    if not hits:
+        return ""
+    lines = [
+        f"topology_env={graph.env} source={graph.source} generated_at={graph.generated_at}",
+        f"matches={', '.join(hits[:6])}",
+    ]
+    target = hits[0]
+    impact = analyze_impact(graph, target, depth=2)
+    direct = impact.get("direct_dependents", [])
+    chains = impact.get("transitive_impact_chain", [])
+    if isinstance(direct, list) and direct:
+        lines.append(f"direct_dependents={', '.join(str(x) for x in direct[:8])}")
+    if isinstance(chains, list) and chains:
+        chain_text: list[str] = []
+        for item in chains[:6]:
+            if isinstance(item, list):
+                chain_text.append(" -> ".join(str(x) for x in item))
+        if chain_text:
+            lines.append("impact_chains=" + " ; ".join(chain_text))
+    return "\n".join(lines)[:1800]
+
+
 def _build_latest_watch_context(instruction: str, *, path: Path | None = None, max_chars: int = 3200) -> str:
     if not _looks_like_latest_watch_reference(instruction):
         return ""
@@ -20475,6 +20652,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "template",
         "runbook",
         "skill",
+        "topology",
         "pack",
         "target",
         "history",
@@ -20552,6 +20730,7 @@ def _should_launch_default_tui(tokens: list[str]) -> bool:
         "template",
         "runbook",
         "skill",
+        "topology",
         "pack",
         "target",
         "history",
@@ -20628,6 +20807,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "template",
         "runbook",
         "skill",
+        "topology",
         "pack",
         "target",
         "history",

@@ -162,6 +162,22 @@ lazysre runbook diff swarm-api-timeout-spike --version v1 --version v2
 
 `lazysre skill run` 执行时会自动检索相似生成 runbook，并提示参考版本。
 
+## 服务拓扑与影响分析
+
+```bash
+# 自动发现拓扑（Swarm/K8s），并落盘到 ~/.lazysre/topology/<env>.json
+lazysre topology discover --target prod --format rich
+
+# 导出 dot 图（可配合 graphviz）
+lazysre topology discover --target prod --format dot --output .data/topology.dot
+
+# 查询节点命中
+lazysre topology show payment --env prod
+
+# 分析某服务故障影响链（默认 2 跳）
+lazysre topology impact payment --env prod --depth 2
+```
+
 ## 模型与 Key 配置
 
 ```bash
