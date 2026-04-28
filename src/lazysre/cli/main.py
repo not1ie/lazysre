@@ -2159,6 +2159,79 @@ def channel_gateway(
     uvicorn.run("lazysre.main:app", host=host, port=port, log_level="info")
 
 
+@app.command("channel-recipe")
+def channel_recipe(
+    provider: Annotated[str, typer.Option("--provider", help="generic|feishu|dingtalk|telegram|onebot")] = "generic",
+    base_url: Annotated[str, typer.Option("--base-url", help="Gateway base URL, e.g. http://127.0.0.1:8010")] = "http://127.0.0.1:8010",
+    token: Annotated[str, typer.Option("--token", help="Inbound X-LazySRE-Channel-Token value.")] = "",
+    as_json: Annotated[bool, typer.Option("--json", help="Print recipe as JSON.")] = False,
+) -> None:
+    """Print provider-specific webhook recipe and smoke curl example."""
+    name = str(provider or "generic").strip().lower()
+    if name not in {"generic", "feishu", "dingtalk", "telegram", "onebot", "qq"}:
+        raise typer.BadParameter("provider must be generic|feishu|dingtalk|telegram|onebot")
+    normalized = "onebot" if name == "qq" else name
+    url_base = str(base_url or "http://127.0.0.1:8010").strip().rstrip("/")
+    inbound_token = token.strip() or os.environ.get("LAZYSRE_CHANNEL_TOKEN", "").strip() or "<CHANNEL_TOKEN>"
+    path = f"/v1/channels/{normalized}/webhook"
+    webhook_url = f"{url_base}{path}"
+
+    headers = {"Content-Type": "application/json", "X-LazySRE-Channel-Token": inbound_token}
+    provider_hints: list[str] = [
+        "默认是 dry-run 诊断入口；生产执行建议走 approval ticket + CLI execute。",
+        "首次联调建议先用 `--provider mock` 启动 gateway。",
+    ]
+    payload: dict[str, Any]
+    if normalized == "feishu":
+        payload = {"event": {"message": {"chat_id": "oc_xxx", "message_id": "om_xxx", "content": "{\"text\":\"检查 swarm\"}"}, "sender": {"sender_id": {"open_id": "ou_xxx"}}}}
+        provider_hints.append("若开启签名：设置 LAZYSRE_FEISHU_SIGN_SECRET，并透传 X-Lark-Request-Timestamp / X-Lark-Signature。")
+    elif normalized == "dingtalk":
+        payload = {"conversationId": "cid_xxx", "senderStaffId": "u_xxx", "msgId": "m_xxx", "text": {"content": "检查 swarm"}}
+        provider_hints.append("若开启签名：设置 LAZYSRE_DINGTALK_WEBHOOK_SECRET，并在 query 带 timestamp/sign。")
+    elif normalized == "telegram":
+        payload = {"update_id": 1001, "message": {"message_id": 99, "chat": {"id": 12345}, "from": {"id": 67890}, "text": "检查 swarm"}}
+        provider_hints.append("若开启秘钥头：设置 LAZYSRE_TELEGRAM_SECRET_TOKEN，并传 X-Telegram-Bot-Api-Secret-Token。")
+    elif normalized == "onebot":
+        payload = {"message_id": 88, "user_id": 10001, "group_id": 20001, "raw_message": "检查 swarm"}
+    else:
+        payload = {"text": "检查 swarm", "user_id": "u-demo", "chat_id": "c-demo", "event_id": "evt-001"}
+
+    curl_lines = [
+        "curl -sS -X POST \\",
+        f"  '{webhook_url}' \\",
+        "  -H 'Content-Type: application/json' \\",
+        f"  -H 'X-LazySRE-Channel-Token: {inbound_token}' \\",
+        f"  -d '{json.dumps(payload, ensure_ascii=False)}'",
+    ]
+    recipe = {
+        "provider": normalized,
+        "webhook_url": webhook_url,
+        "headers": headers,
+        "sample_payload": payload,
+        "curl": "\n".join(curl_lines),
+        "hints": provider_hints,
+    }
+    if as_json:
+        typer.echo(json.dumps(recipe, ensure_ascii=False, indent=2))
+        return
+    lines = [
+        f"LazySRE channel recipe [{normalized}]",
+        f"webhook: {webhook_url}",
+        "",
+        "headers:",
+    ]
+    for k, v in headers.items():
+        lines.append(f"- {k}: {v}")
+    lines.append("")
+    lines.append("hints:")
+    for hint in provider_hints:
+        lines.append(f"- {hint}")
+    lines.append("")
+    lines.append("curl example:")
+    lines.extend(curl_lines)
+    typer.echo("\n".join(lines))
+
+
 @app.command("verify-artifact")
 def verify_artifact(
     path: Annotated[str, typer.Argument(help="Path to channel run artifact JSON file.")],

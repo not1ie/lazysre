@@ -234,6 +234,9 @@ lazysre status
 ```bash
 # 启动 webhook 网关（默认 dry-run + strict）
 lazysre gateway --host 127.0.0.1 --port 8010 --provider mock
+
+# 生成某个渠道的接入配方（URL/Header/测试curl）
+lazysre channel-recipe --provider feishu --base-url http://127.0.0.1:8010
 ```
 
 支持 webhook 路径：
