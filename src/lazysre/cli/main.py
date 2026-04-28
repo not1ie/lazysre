@@ -101,6 +101,16 @@ from lazysre.runbook import (
     normalize_runbook_name,
     render_runbook_diff_text,
 )
+from lazysre.slo import (
+    detect_burn_alert,
+    default_slo_config_path,
+    evaluate_slo_items,
+    init_slo_config,
+    load_slo_items,
+    post_webhook,
+    render_slo_burn_text,
+    render_slo_status_text,
+)
 from lazysre.topology import TopologyGraph, analyze_impact, discover_topology, render_topology_ascii
 from lazysre.cli.tools import build_default_registry
 from lazysre.cli.types import DispatchEvent, DispatchResult, ExecResult
@@ -152,6 +162,7 @@ runbook_app = typer.Typer(help="Workflow runbook templates.")
 template_app = typer.Typer(help="One-click remediation templates.")
 skill_app = typer.Typer(help="CLI managed SRE skills.")
 topology_app = typer.Typer(help="Service topology discovery and impact analysis.")
+slo_app = typer.Typer(help="SLO status and error budget burn alerts.")
 
 
 @app.callback(invoke_without_command=True)
@@ -487,6 +498,149 @@ def topology_impact(
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+@slo_app.command("init")
+def slo_init(
+    config_file: Annotated[str, typer.Option("--config-file", help="SLO config path.")] = str(default_slo_config_path()),
+) -> None:
+    path = init_slo_config(Path(config_file).expanduser())
+    typer.echo(f"SLO config ready: {path}")
+
+
+@slo_app.command("status")
+def slo_status(
+    config_file: Annotated[str, typer.Option("--config-file", help="SLO config path.")] = str(default_slo_config_path()),
+    window: Annotated[str, typer.Option("--window", help="Window for status sample: 1h|6h|24h.")] = "6h",
+    as_json: Annotated[bool, typer.Option("--json", help="JSON output.")] = False,
+) -> None:
+    path = Path(config_file).expanduser()
+    items = load_slo_items(path)
+    if not items:
+        raise typer.BadParameter(f"no SLO items found in {path}. run `lazysre slo init` first.")
+    samples = _evaluate_slo_samples(items, windows=[window])
+    if as_json:
+        typer.echo(json.dumps({"samples": [x.to_dict() for x in samples]}, ensure_ascii=False, indent=2))
+        return
+    typer.echo(render_slo_status_text(samples))
+
+
+@slo_app.command("burn-rate")
+def slo_burn_rate(
+    window: Annotated[str, typer.Option("--window", help="Window: 1h|6h|24h")] = "1h",
+    config_file: Annotated[str, typer.Option("--config-file", help="SLO config path.")] = str(default_slo_config_path()),
+    as_json: Annotated[bool, typer.Option("--json", help="JSON output.")] = False,
+) -> None:
+    win = str(window or "1h").strip().lower()
+    if win not in {"1h", "6h", "24h"}:
+        raise typer.BadParameter("window must be 1h|6h|24h")
+    items = load_slo_items(Path(config_file).expanduser())
+    if not items:
+        raise typer.BadParameter(f"no SLO items found in {config_file}. run `lazysre slo init` first.")
+    samples = _evaluate_slo_samples(items, windows=[win, "1h", "6h", "24h"])
+    if as_json:
+        typer.echo(json.dumps({"window": win, "samples": [x.to_dict() for x in samples]}, ensure_ascii=False, indent=2))
+        return
+    typer.echo(render_slo_burn_text(samples, window=win))
+
+
+@slo_app.command("alert")
+def slo_alert(
+    config_file: Annotated[str, typer.Option("--config-file", help="SLO config path.")] = str(default_slo_config_path()),
+    simulate: Annotated[bool, typer.Option("--simulate", help="Force alert simulation even when healthy.")] = False,
+    webhook_url: Annotated[str, typer.Option("--webhook-url", help="IM webhook URL (optional).")] = "",
+    as_json: Annotated[bool, typer.Option("--json", help="JSON output.")] = False,
+) -> None:
+    items = load_slo_items(Path(config_file).expanduser())
+    if not items:
+        raise typer.BadParameter(f"no SLO items found in {config_file}. run `lazysre slo init` first.")
+    samples = _evaluate_slo_samples(items, windows=["1h", "6h", "24h"])
+    alerts = detect_burn_alert(samples)
+    if simulate and not alerts and samples:
+        first = samples[0]
+        alerts = [
+            {
+                "name": first.name,
+                "severity": "warning",
+                "burn_1h": first.burn_rates.get("1h", 0.0),
+                "burn_6h": first.burn_rates.get("6h", 0.0),
+                "burn_24h": first.burn_rates.get("24h", 0.0),
+                "target_ratio": first.target_ratio,
+                "note": "simulate mode",
+            }
+        ]
+    pushed: list[dict[str, Any]] = []
+    incidents: list[str] = []
+    suggestions: list[str] = []
+    if alerts:
+        try:
+            generated_store = GeneratedRunbookStore(default_generated_runbook_dir())
+        except Exception:
+            generated_store = GeneratedRunbookStore(Path(settings.data_dir) / "generated-runbooks")
+        incident_store = IncidentStore(_default_incident_file_path())
+        for alert in alerts:
+            title = f"SLO burn alert: {alert.get('name', 'unknown')}"
+            try:
+                rec = incident_store.open_incident(
+                    title=title,
+                    severity="high" if str(alert.get("severity", "")) == "critical" else "medium",
+                    summary=f"burn_1h={alert.get('burn_1h')} burn_6h={alert.get('burn_6h')} burn_24h={alert.get('burn_24h')}",
+                    source="slo-alert",
+                    tags=["slo", str(alert.get("name", "")).strip()],
+                )
+                incidents.append(rec.id)
+            except Exception:
+                active = incident_store.active()
+                if active:
+                    active_note = f"SLO alert {alert.get('name')}: burn_1h={alert.get('burn_1h')} burn_6h={alert.get('burn_6h')}"
+                    try:
+                        incident_store.add_note(active_note, author="slo")
+                        incidents.append(active.id)
+                    except Exception:
+                        pass
+            match = find_best_matching_runbook(
+                generated_store,
+                query=f"{alert.get('name', '')} slo burn rate incident",
+            )
+            if match and match[1] >= 0.1:
+                suggestions.append(f"{match[0].name}-{match[0].version}")
+
+        url = str(webhook_url or os.environ.get("LAZYSRE_CHANNEL_WEBHOOK_URL", "")).strip()
+        if url:
+            payload = {
+                "event": "slo_burn_alert",
+                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "alerts": alerts,
+                "incidents": incidents,
+                "runbook_suggestions": suggestions[:6],
+            }
+            ok, detail = post_webhook(url, payload)
+            pushed.append({"url": url, "ok": ok, "detail": detail})
+    output = {
+        "alerts": alerts,
+        "samples": [x.to_dict() for x in samples],
+        "incidents": incidents,
+        "runbook_suggestions": suggestions[:6],
+        "webhook": pushed,
+    }
+    if as_json:
+        typer.echo(json.dumps(output, ensure_ascii=False, indent=2))
+        return
+    if not alerts:
+        typer.echo("No SLO burn alert triggered.")
+        return
+    typer.echo(f"SLO alerts triggered: {len(alerts)}")
+    for item in alerts:
+        typer.echo(
+            f"- {item.get('name')}: severity={item.get('severity')} burn_1h={item.get('burn_1h')} burn_6h={item.get('burn_6h')}"
+        )
+    if incidents:
+        typer.echo(f"Incidents: {', '.join(incidents)}")
+    if suggestions:
+        typer.echo(f"Related runbooks: {', '.join(suggestions[:6])}")
+    if pushed:
+        for item in pushed:
+            typer.echo(f"Webhook: ok={item.get('ok')} detail={item.get('detail')}")
+
+
 def _topology_store_path(env: str) -> Path:
     safe = str(env or "local").strip().lower()
     safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "-" for ch in safe).strip("-") or "local"
@@ -559,6 +713,15 @@ def _match_topology_nodes(graph: TopologyGraph, keyword: str) -> list[str]:
             items.append(node_id)
     items.sort()
     return items
+
+
+def _evaluate_slo_samples(items: list[Any], *, windows: list[str]) -> list[Any]:
+    target = TargetEnvStore(Path(settings.target_profile_file)).load()
+    prom = str(getattr(target, "prometheus_url", "") or settings.target_prometheus_url or "").strip()
+    selected_windows = [str(x).strip().lower() for x in windows if str(x).strip()]
+    if not selected_windows:
+        selected_windows = ["1h", "6h", "24h"]
+    return evaluate_slo_items(items=items, prometheus_url=prom, windows=selected_windows)
 
 
 @app.command("swarm")
@@ -4385,6 +4548,82 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
     }
 
 
+def _parse_chat_slo_command(tail: str) -> dict[str, object]:
+    text = tail.strip()
+    if not text:
+        return {"action": "status"}
+    try:
+        tokens = shlex.split(text)
+    except ValueError as exc:
+        raise ValueError(f"invalid quoting: {_safe_exception_text(exc)}") from exc
+    if not tokens:
+        return {"action": "status"}
+    action = tokens[0].lower()
+    if action not in {"init", "status", "burn-rate", "alert"}:
+        return {"action": "status"}
+
+    parsed: dict[str, object] = {"action": action}
+    idx = 1
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token in {"--simulate", "--json"}:
+            parsed[token.lstrip("-").replace("-", "_")] = True
+            idx += 1
+            continue
+        for key in ("--config-file", "--window", "--webhook-url"):
+            if token == key:
+                if idx + 1 >= len(tokens):
+                    raise ValueError(f"missing value for {key}")
+                parsed[key.lstrip("-").replace("-", "_")] = tokens[idx + 1]
+                idx += 2
+                break
+            if token.startswith(f"{key}="):
+                parsed[key.lstrip("-").replace("-", "_")] = token.split("=", 1)[1]
+                idx += 1
+                break
+        else:
+            raise ValueError(f"unknown option for /slo: {token}")
+    return parsed
+
+
+def _parse_chat_topology_command(tail: str) -> dict[str, object]:
+    text = tail.strip()
+    if not text:
+        return {"action": "discover"}
+    try:
+        tokens = shlex.split(text)
+    except ValueError as exc:
+        raise ValueError(f"invalid quoting: {_safe_exception_text(exc)}") from exc
+    if not tokens:
+        return {"action": "discover"}
+    action = tokens[0].lower()
+    if action not in {"discover", "show", "impact"}:
+        action = "discover"
+    parsed: dict[str, object] = {"action": action}
+    args = tokens[1:]
+    if action in {"show", "impact"}:
+        if not args:
+            raise ValueError(f"usage: /topology {action} <service> [--env name] [--depth N]")
+        parsed["service_name"] = args[0]
+        args = args[1:]
+    idx = 0
+    while idx < len(args):
+        token = args[idx]
+        if token in {"--target", "--format", "--output", "--env", "--depth"}:
+            if idx + 1 >= len(args):
+                raise ValueError(f"missing value for {token}")
+            parsed[token.lstrip("-").replace("-", "_")] = args[idx + 1]
+            idx += 2
+            continue
+        if "=" in token and token.split("=", 1)[0] in {"--target", "--format", "--output", "--env", "--depth"}:
+            key, value = token.split("=", 1)
+            parsed[key.lstrip("-").replace("-", "_")] = value
+            idx += 1
+            continue
+        raise ValueError(f"unknown option for /topology: {token}")
+    return parsed
+
+
 def _parse_chat_report_command(tail: str) -> dict[str, object]:
     text = tail.strip()
     tokens: list[str] = []
@@ -4607,6 +4846,7 @@ app.add_typer(runbook_app, name="runbook")
 app.add_typer(template_app, name="template")
 app.add_typer(skill_app, name="skill")
 app.add_typer(topology_app, name="topology")
+app.add_typer(slo_app, name="slo")
 
 
 def _render_timeline(events) -> None:
@@ -5905,6 +6145,9 @@ def _build_overview_brief_report(
         "scan": scan_report,
         "remote": remote_report,
     }
+    slo_payload = _build_brief_slo_summary()
+    if slo_payload:
+        report["slo"] = slo_payload
     report["briefing"] = _build_overview_briefing(scan_report=scan_report, remote_report=remote_report)
     report["recommended_commands"] = _build_overview_recommended_commands(report)
     return report
@@ -6002,6 +6245,25 @@ def _build_overview_recommended_commands(report: dict[str, object]) -> list[str]
     return _dedupe_strings([item for item in commands if item.strip()])[:8]
 
 
+def _build_brief_slo_summary() -> dict[str, object]:
+    path = default_slo_config_path()
+    items = load_slo_items(path)
+    if not items:
+        return {}
+    try:
+        samples = _evaluate_slo_samples(items, windows=["1h", "6h", "24h"])
+    except Exception as exc:
+        return {"error": _safe_exception_text(exc), "count": len(items)}
+    alerts = detect_burn_alert(samples)
+    return {
+        "config_path": str(path),
+        "count": len(samples),
+        "alert_count": len(alerts),
+        "samples": [x.to_dict() for x in samples[:8]],
+        "alerts": alerts[:8],
+    }
+
+
 def _render_overview_brief_report(report: dict[str, object]) -> None:
     if not (_console and Table):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
@@ -6037,6 +6299,29 @@ def _render_overview_brief_report(report: dict[str, object]) -> None:
         remote_briefing = remote_report.get("briefing", {})
         if isinstance(remote_briefing, dict) and Panel:
             _console.print(Panel(str(remote_briefing.get("headline", "")), title="Remote", border_style="cyan"))
+    slo_payload = report.get("slo", {})
+    if isinstance(slo_payload, dict) and slo_payload:
+        if Panel:
+            alerts = slo_payload.get("alerts", [])
+            samples = slo_payload.get("samples", [])
+            lines = [
+                f"configured={slo_payload.get('count', 0)}",
+                f"alerts={slo_payload.get('alert_count', 0)}",
+            ]
+            if isinstance(alerts, list) and alerts:
+                for item in alerts[:4]:
+                    if isinstance(item, dict):
+                        lines.append(
+                            f"- {item.get('name', '-')}: {item.get('severity', '-')} "
+                            f"(1h={item.get('burn_1h', '-')}, 6h={item.get('burn_6h', '-')})"
+                        )
+            elif isinstance(samples, list):
+                for item in samples[:3]:
+                    if isinstance(item, dict):
+                        burns = item.get("burn_rates", {})
+                        b6 = burns.get("6h", burns.get("1h", "-")) if isinstance(burns, dict) else "-"
+                        lines.append(f"- {item.get('name', '-')}: status={item.get('status', '-')} burn6h={b6}")
+            _console.print(Panel("\n".join(lines), title="SLO Summary", border_style="yellow"))
 
 
 def _collect_swarm_health_report(
@@ -12161,6 +12446,10 @@ def _render_chat_short_help() -> None:
         "- /runbook import --input <file> [--merge|--replace]: 导入 runbook",
         "- /runbook run <name> [--apply] [k=v]: 执行 runbook（fix 模板可直接 apply）",
         "- /runbook <name> [--apply] [k=v]: 执行 runbook（简写）",
+        "- /topology discover [--target prod] [--format rich|dot|json]: 自动发现服务依赖拓扑",
+        "- /topology show <service>: 查看拓扑命中节点",
+        "- /topology impact <service>: 分析上下游影响链",
+        "- /slo init|status|burn-rate|alert: SLO 管理、预算燃烧率与告警",
         "- /report [--format json] [--no-doctor] [--push-to-git]: 导出复盘报告",
         "- /incident status|open|note|assign|severity|timeline|close|list|export: 事故生命周期管理",
         "- /fix <问题>: 进入修复计划模式",
@@ -16691,6 +16980,69 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 options=options,
             )
             continue
+        if text.lower().startswith("/topology"):
+            tail = text[len("/topology") :].strip()
+            try:
+                command = _parse_chat_topology_command(tail)
+            except ValueError as exc:
+                typer.echo(f"topology 命令格式错误: {_safe_exception_text(exc)}")
+                continue
+            action = str(command.get("action", "discover"))
+            try:
+                if action == "discover":
+                    topology_discover(
+                        target=str(command.get("target", "")),
+                        format=str(command.get("format", "rich")),
+                        output=str(command.get("output", "")),
+                    )
+                elif action == "show":
+                    topology_show(
+                        service_name=str(command.get("service_name", "")),
+                        depth=int(command.get("depth", 2) or 2),
+                        env=str(command.get("env", "local")),
+                    )
+                else:
+                    topology_impact(
+                        service_name=str(command.get("service_name", "")),
+                        env=str(command.get("env", "local")),
+                        depth=int(command.get("depth", 2) or 2),
+                    )
+            except typer.BadParameter as exc:
+                typer.echo(f"topology 执行失败: {_safe_exception_text(exc)}")
+            continue
+        if text.lower().startswith("/slo"):
+            tail = text[len("/slo") :].strip()
+            try:
+                command = _parse_chat_slo_command(tail)
+            except ValueError as exc:
+                typer.echo(f"slo 命令格式错误: {_safe_exception_text(exc)}")
+                continue
+            action = str(command.get("action", "status"))
+            try:
+                if action == "init":
+                    slo_init(config_file=str(command.get("config_file", str(default_slo_config_path()))))
+                elif action == "burn-rate":
+                    slo_burn_rate(
+                        window=str(command.get("window", "1h")),
+                        config_file=str(command.get("config_file", str(default_slo_config_path()))),
+                        as_json=bool(command.get("json", False)),
+                    )
+                elif action == "alert":
+                    slo_alert(
+                        config_file=str(command.get("config_file", str(default_slo_config_path()))),
+                        simulate=bool(command.get("simulate", False)),
+                        webhook_url=str(command.get("webhook_url", "")),
+                        as_json=bool(command.get("json", False)),
+                    )
+                else:
+                    slo_status(
+                        config_file=str(command.get("config_file", str(default_slo_config_path()))),
+                        window=str(command.get("window", "6h")),
+                        as_json=bool(command.get("json", False)),
+                    )
+            except typer.BadParameter as exc:
+                typer.echo(f"slo 执行失败: {_safe_exception_text(exc)}")
+            continue
         if text.lower().startswith("/report"):
             tail = text[len("/report") :].strip()
             try:
@@ -20653,6 +21005,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "runbook",
         "skill",
         "topology",
+        "slo",
         "pack",
         "target",
         "history",
@@ -20731,6 +21084,7 @@ def _should_launch_default_tui(tokens: list[str]) -> bool:
         "runbook",
         "skill",
         "topology",
+        "slo",
         "pack",
         "target",
         "history",
@@ -20808,6 +21162,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "runbook",
         "skill",
         "topology",
+        "slo",
         "pack",
         "target",
         "history",

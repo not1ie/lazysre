@@ -178,6 +178,30 @@ lazysre topology show payment --env prod
 lazysre topology impact payment --env prod --depth 2
 ```
 
+## SLO 看护与预算燃烧
+
+```bash
+# 初始化 SLO 配置
+lazysre slo init
+
+# 查看当前 SLO 状态
+lazysre slo status
+
+# 查看 1h/6h/24h 燃烧率
+lazysre slo burn-rate --window 1h
+lazysre slo burn-rate --window 6h
+lazysre slo burn-rate --window 24h
+
+# 触发告警评估（--simulate 可演练）
+lazysre slo alert --simulate
+```
+
+默认配置文件：`~/.lazysre/slos.yaml`。  
+当 burn-rate 超阈值时，会联动：
+- 创建/更新 incident ticket
+- 推荐相似 runbook
+- 可选推送到 `LAZYSRE_CHANNEL_WEBHOOK_URL`
+
 ## 模型与 Key 配置
 
 ```bash
