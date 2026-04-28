@@ -115,11 +115,15 @@ async def test_skill_catalog_create_and_dry_run(tmp_path: Path) -> None:
             required_permission="read",
             instruction="检查 Nginx",
             variables={"ssh_target": "root@host"},
+            precheck_commands=["echo precheck"],
             read_commands=["lazysre remote {ssh_target} --scenario nginx"],
+            postcheck_commands=["echo postcheck"],
             tags=["nginx"],
         )
     )
     assert custom.source == "custom"
+    assert custom.precheck_commands == ["echo precheck"]
+    assert custom.postcheck_commands == ["echo postcheck"]
 
     result = await service.run_skill(
         "team-nginx",
@@ -127,7 +131,9 @@ async def test_skill_catalog_create_and_dry_run(tmp_path: Path) -> None:
     )
 
     assert result.status == "planned"
+    assert result.commands["precheck"] == ["echo precheck"]
     assert result.commands["read"] == ["lazysre remote root@192.168.10.101 --scenario nginx"]
+    assert result.commands["postcheck"] == ["echo postcheck"]
 
 
 async def test_platform_overview_metrics(tmp_path: Path) -> None:

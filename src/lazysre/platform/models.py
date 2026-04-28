@@ -122,10 +122,13 @@ class SkillDefinition(BaseModel):
     required_permission: str = "read"
     instruction: str = Field(min_length=1, max_length=4000)
     variables: dict[str, str] = Field(default_factory=dict)
+    precheck_commands: list[str] = Field(default_factory=list)
     read_commands: list[str] = Field(default_factory=list)
     apply_commands: list[str] = Field(default_factory=list)
     verify_commands: list[str] = Field(default_factory=list)
+    postcheck_commands: list[str] = Field(default_factory=list)
     rollback_commands: list[str] = Field(default_factory=list)
+    auto_rollback_on_failure: bool = True
     tags: list[str] = Field(default_factory=list)
     source: str = "builtin"
 
@@ -140,10 +143,13 @@ class SkillCreateRequest(BaseModel):
     required_permission: str = "read"
     instruction: str = Field(min_length=1, max_length=4000)
     variables: dict[str, str] = Field(default_factory=dict)
+    precheck_commands: list[str] = Field(default_factory=list)
     read_commands: list[str] = Field(default_factory=list)
     apply_commands: list[str] = Field(default_factory=list)
     verify_commands: list[str] = Field(default_factory=list)
+    postcheck_commands: list[str] = Field(default_factory=list)
     rollback_commands: list[str] = Field(default_factory=list)
+    auto_rollback_on_failure: bool = True
     tags: list[str] = Field(default_factory=list)
 
 
@@ -152,6 +158,7 @@ class SkillRunRequest(BaseModel):
     dry_run: bool = True
     apply: bool = False
     timeout_sec: int = 20
+    auto_rollback_on_failure: bool | None = None
 
 
 class SkillRunResult(BaseModel):
@@ -162,6 +169,10 @@ class SkillRunResult(BaseModel):
     commands: dict[str, list[str]] = Field(default_factory=dict)
     status: str
     outputs: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_graph: dict[str, Any] = Field(default_factory=dict)
+    rollback_executed: bool = False
+    rollback_status: str = "not_required"
+    failed_phase: str = ""
     next_actions: list[str] = Field(default_factory=list)
 
 

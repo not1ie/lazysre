@@ -1,9 +1,14 @@
 from pathlib import Path
+import json
 
+import pytest
+
+from lazysre.cli.approval import ApprovalStore
 from lazysre.cli.audit import AuditLogger
 from lazysre.cli.dispatcher import Dispatcher
 from lazysre.cli.executor import SafeExecutor
 from lazysre.cli.llm import MockFunctionCallingLLM
+from lazysre.cli.policy_center import PolicyCenter
 from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.tools import build_default_registry
 
@@ -140,3 +145,94 @@ async def test_dispatcher_stream_callback_receives_tokens() -> None:
     result = await dispatcher.run("随便问一个不会触发工具的提示")
     assert result.final_text
     assert chunks
+
+
+async def test_safe_executor_applies_tenant_policy_center(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.json"
+    center = PolicyCenter(policy_path)
+    center.set_role_max_risk(
+        tenant="default",
+        environment="prod",
+        role="operator",
+        max_risk="high",
+    )
+    center.set_environment_guard(
+        tenant="default",
+        environment="prod",
+        min_approval_risk="medium",
+        require_ticket_for_critical=True,
+    )
+    executor = SafeExecutor(
+        dry_run=True,
+        approval_mode="balanced",
+        policy_file=str(policy_path),
+        tenant="default",
+        environment="prod",
+        actor_role="operator",
+    )
+    result = await executor.run(["docker", "service", "update", "--force", "api"])
+    assert result.ok is True
+    assert result.requires_approval is True
+    policy_meta = result.risk_report.get("policy", {})
+    assert isinstance(policy_meta, dict)
+    assert policy_meta.get("tenant") == "default"
+    assert policy_meta.get("environment") == "prod"
+
+
+async def test_safe_executor_requires_valid_approval_ticket_for_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy_path = tmp_path / "policy.json"
+    center = PolicyCenter(policy_path)
+    payload = center.show()
+    env_cfg = payload["tenants"]["default"]["environments"]["prod"]
+    env_cfg["blocked_command_patterns"] = []
+    env_cfg["role_max_risk"]["operator"] = "critical"
+    policy_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    approval_store_path = tmp_path / "approvals.json"
+    store = ApprovalStore(approval_store_path)
+    ticket = store.create(
+        reason="critical action",
+        risk_level="critical",
+        tenant="default",
+        environment="prod",
+        actor_role="operator",
+        requester="alice",
+        expires_hours=2,
+        command_prefix="kubectl rollout restart",
+        target_hint="deploy/api",
+    )
+    monkeypatch.setenv("LAZYSRE_APPROVAL_STORE", str(approval_store_path))
+    monkeypatch.setenv("LAZYSRE_APPROVAL_TICKET", ticket.id)
+
+    executor = SafeExecutor(
+        dry_run=True,
+        approval_mode="balanced",
+        policy_file=str(policy_path),
+        tenant="default",
+        environment="prod",
+        actor_role="operator",
+    )
+    blocked = await executor.run(["kubectl", "rollout", "restart", "deploy/api"])
+    assert blocked.ok is False
+    assert blocked.blocked is True
+    assert "approval ticket" in blocked.stderr.lower()
+
+    store.approve(ticket.id, approver="bob", comment="ok")
+    allowed = await executor.run(["kubectl", "rollout", "restart", "deploy/api"])
+    assert allowed.ok is True
+    assert allowed.blocked is False
+    policy_meta = allowed.risk_report.get("policy", {})
+    assert isinstance(policy_meta, dict)
+    assert policy_meta.get("approval_ticket_valid") is True
+    assert policy_meta.get("approval_ticket_status") == "ok"
+
+    scoped_blocked = await executor.run(["kubectl", "rollout", "restart", "deploy/order"])
+    assert scoped_blocked.ok is False
+    assert scoped_blocked.blocked is True
+    scoped_meta = scoped_blocked.risk_report.get("policy", {})
+    assert isinstance(scoped_meta, dict)
+    assert scoped_meta.get("approval_ticket_valid") is False
+    assert scoped_meta.get("approval_ticket_status") == "target_mismatch"

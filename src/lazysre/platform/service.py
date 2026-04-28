@@ -153,10 +153,13 @@ class PlatformService:
                 "required_permission": req.required_permission,
                 "instruction": req.instruction,
                 "variables": req.variables,
+                "precheck_commands": req.precheck_commands,
                 "read_commands": req.read_commands,
                 "apply_commands": req.apply_commands,
                 "verify_commands": req.verify_commands,
+                "postcheck_commands": req.postcheck_commands,
                 "rollback_commands": req.rollback_commands,
+                "auto_rollback_on_failure": req.auto_rollback_on_failure,
                 "tags": req.tags,
             },
             source="custom",
@@ -176,6 +179,7 @@ class PlatformService:
             dry_run=req.dry_run,
             apply=req.apply,
             timeout_sec=req.timeout_sec,
+            auto_rollback_on_failure=req.auto_rollback_on_failure,
         )
         payload = result.to_dict()
         return SkillRunResult(
@@ -186,6 +190,10 @@ class PlatformService:
             commands=payload["commands"],
             status=payload["status"],
             outputs=payload["outputs"],
+            evidence_graph=payload.get("evidence_graph", {}),
+            rollback_executed=bool(payload.get("rollback_executed", False)),
+            rollback_status=str(payload.get("rollback_status", "not_required")),
+            failed_phase=str(payload.get("failed_phase", "")),
             next_actions=payload["next_actions"],
         )
 
@@ -1460,10 +1468,13 @@ def _skill_definition(item: SkillTemplate) -> SkillDefinition:
         required_permission=item.required_permission,
         instruction=item.instruction,
         variables=dict(item.variables),
+        precheck_commands=list(item.precheck_commands),
         read_commands=list(item.read_commands),
         apply_commands=list(item.apply_commands),
         verify_commands=list(item.verify_commands),
+        postcheck_commands=list(item.postcheck_commands),
         rollback_commands=list(item.rollback_commands),
+        auto_rollback_on_failure=bool(item.auto_rollback_on_failure),
         tags=list(item.tags),
         source=item.source,
     )

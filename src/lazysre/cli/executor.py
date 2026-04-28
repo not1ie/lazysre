@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
+from lazysre.cli.approval import ApprovalStore
 from lazysre.cli.audit import AuditLogger
 from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
+from lazysre.cli.policy_center import PolicyCenter, PolicyContext
 from lazysre.cli.types import ExecResult
 
 
@@ -17,9 +21,15 @@ class SafeExecutor:
     approval_granted: bool = False
     approval_callback: Callable[[list[str], PolicyDecision], bool] | None = None
     audit_logger: AuditLogger | None = None
+    policy_file: str = ".data/lsre-policy.json"
+    tenant: str = ""
+    environment: str = ""
+    actor_role: str = ""
+    actor_id: str = ""
     allowed_binaries: set[str] = field(
         default_factory=lambda: {"kubectl", "docker", "curl", "tail"}
     )
+    _policy_center: PolicyCenter | None = None
 
     def preflight(
         self, command: list[str]
@@ -53,6 +63,41 @@ class SafeExecutor:
             return None, result, approved
 
         decision = assess_command(command, approval_mode=self.approval_mode)
+        policy_center = self._get_policy_center()
+        context = self._resolve_context(policy_center)
+        policy_ticket = os.environ.get("LAZYSRE_APPROVAL_TICKET", "").strip()
+        ticket_valid, ticket_status = self._validate_approval_ticket(
+            policy_ticket,
+            command=command,
+            context=context,
+            risk_level=decision.risk_level,
+        )
+        if policy_center:
+            patch = policy_center.evaluate(
+                command=command,
+                risk_level=decision.risk_level,
+                requires_approval=decision.requires_approval,
+                approval_mode=self.approval_mode,
+                context=context,
+                has_approval_ticket=ticket_valid,
+            )
+            if patch.reasons:
+                decision.reasons.extend([x for x in patch.reasons if x not in decision.reasons])
+            decision.requires_approval = bool(decision.requires_approval or patch.requires_approval)
+            if patch.blocked:
+                decision.blocked = True
+                decision.blocked_reason = patch.blocked_reason or decision.blocked_reason
+            if patch.metadata:
+                decision.policy_metadata.update(patch.metadata)
+            if policy_ticket:
+                decision.policy_metadata["approval_ticket"] = policy_ticket
+                decision.policy_metadata["approval_ticket_valid"] = ticket_valid
+                decision.policy_metadata["approval_ticket_status"] = ticket_status
+                decision.policy_metadata["approval_ticket_scope"] = {
+                    "tenant": context.tenant,
+                    "environment": context.environment,
+                    "actor_role": context.actor_role,
+                }
         destructive = _contains_destructive_action(command)
         if destructive:
             decision.requires_approval = True
@@ -61,6 +106,8 @@ class SafeExecutor:
             if "destructive keyword detected, force confirm mode" not in decision.reasons:
                 decision.reasons.append("destructive keyword detected, force confirm mode")
         risk_report = build_risk_report(command, decision)
+        if decision.policy_metadata:
+            risk_report["policy"] = dict(decision.policy_metadata)
         if decision.blocked:
             result = ExecResult(
                 ok=False,
@@ -128,6 +175,8 @@ class SafeExecutor:
             return blocked
         assert decision is not None
         risk_report = build_risk_report(command, decision)
+        if decision.policy_metadata:
+            risk_report["policy"] = dict(decision.policy_metadata)
 
         if self.dry_run:
             result = ExecResult(
@@ -218,6 +267,61 @@ class SafeExecutor:
                 "stdout_preview": result.stdout[:300],
             }
         )
+
+    def _get_policy_center(self) -> PolicyCenter | None:
+        if self._policy_center is not None:
+            return self._policy_center
+        try:
+            policy_path = self.policy_file or os.environ.get("LAZYSRE_POLICY_FILE", ".data/lsre-policy.json")
+            path = Path(policy_path).expanduser()
+            self._policy_center = PolicyCenter(path)
+        except Exception:
+            self._policy_center = None
+        return self._policy_center
+
+    def _resolve_context(self, policy_center: PolicyCenter | None) -> PolicyContext:
+        if policy_center:
+            return policy_center.resolve_context(
+                tenant=self.tenant or os.environ.get("LAZYSRE_TENANT", ""),
+                environment=self.environment or os.environ.get("LAZYSRE_ENVIRONMENT", ""),
+                actor_role=self.actor_role or os.environ.get("LAZYSRE_ACTOR_ROLE", ""),
+                actor_id=self.actor_id or os.environ.get("LAZYSRE_ACTOR_ID", ""),
+            )
+        tenant = (self.tenant or os.environ.get("LAZYSRE_TENANT", "")).strip() or "default"
+        environment = (self.environment or os.environ.get("LAZYSRE_ENVIRONMENT", "")).strip() or "prod"
+        actor_role = (self.actor_role or os.environ.get("LAZYSRE_ACTOR_ROLE", "")).strip() or "operator"
+        actor_id = (self.actor_id or os.environ.get("LAZYSRE_ACTOR_ID", "")).strip()
+        return PolicyContext(
+            tenant=tenant,
+            environment=environment,
+            actor_role=actor_role,
+            actor_id=actor_id,
+        )
+
+    def _validate_approval_ticket(
+        self,
+        ticket_id: str,
+        *,
+        command: list[str],
+        context: PolicyContext,
+        risk_level: str,
+    ) -> tuple[bool, str]:
+        text = str(ticket_id or "").strip()
+        if not text:
+            return False, "missing"
+        try:
+            store_path = Path(os.environ.get("LAZYSRE_APPROVAL_STORE", ".data/lsre-approvals.json")).expanduser()
+            valid, reason, _ticket = ApprovalStore(store_path).validate_for_execution(
+                text,
+                tenant=context.tenant,
+                environment=context.environment,
+                actor_role=context.actor_role,
+                risk_level=risk_level,
+                command=command,
+            )
+            return valid, reason
+        except Exception:
+            return False, "store_error"
 
 
 def _sanitize_command(command: list[str]) -> list[str]:

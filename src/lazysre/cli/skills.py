@@ -20,10 +20,13 @@ class SkillTemplate:
     required_permission: str
     instruction: str
     variables: dict[str, str] = field(default_factory=dict)
+    precheck_commands: list[str] = field(default_factory=list)
     read_commands: list[str] = field(default_factory=list)
     apply_commands: list[str] = field(default_factory=list)
     verify_commands: list[str] = field(default_factory=list)
+    postcheck_commands: list[str] = field(default_factory=list)
     rollback_commands: list[str] = field(default_factory=list)
+    auto_rollback_on_failure: bool = True
     tags: list[str] = field(default_factory=list)
     source: str = "builtin"
 
@@ -40,6 +43,10 @@ class SkillRunResult:
     commands: dict[str, list[str]]
     status: str
     outputs: list[dict[str, Any]] = field(default_factory=list)
+    evidence_graph: dict[str, Any] = field(default_factory=dict)
+    rollback_executed: bool = False
+    rollback_status: str = "not_required"
+    failed_phase: str = ""
     next_actions: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,6 +58,10 @@ class SkillRunResult:
             "commands": {k: list(v) for k, v in self.commands.items()},
             "status": self.status,
             "outputs": list(self.outputs),
+            "evidence_graph": dict(self.evidence_graph),
+            "rollback_executed": self.rollback_executed,
+            "rollback_status": self.rollback_status,
+            "failed_phase": self.failed_phase,
             "next_actions": list(self.next_actions),
         }
 
@@ -146,6 +157,7 @@ def builtin_skills() -> list[SkillTemplate]:
             required_permission="read",
             instruction="检查远程服务器健康，优先输出异常、证据和下一步。",
             variables={"ssh_target": "root@192.168.10.101"},
+            precheck_commands=("ssh -o BatchMode=yes -o ConnectTimeout=6 {ssh_target} 'echo ok'",),
             read_commands=("lazysre remote {ssh_target} --scenario all --logs",),
             verify_commands=("lazysre remote {ssh_target} --scenario all --json",),
             tags=["remote", "linux", "swarm", "nginx", "database", "gpu", "ai"],
@@ -160,6 +172,7 @@ def builtin_skills() -> list[SkillTemplate]:
             required_permission="read",
             instruction="列出 Swarm 不健康 service，并给出只读证据。",
             variables={"service": "", "tail": "200"},
+            precheck_commands=("docker info --format '{{.Swarm.LocalNodeState}} {{.Swarm.ControlAvailable}}'",),
             read_commands=("lazysre swarm --logs --tail {tail}",),
             verify_commands=("lazysre swarm --logs --tail {tail}",),
             tags=["docker", "swarm", "service"],
@@ -174,12 +187,13 @@ def builtin_skills() -> list[SkillTemplate]:
             required_permission="read",
             instruction="检查 K8s 集群基础健康状态。",
             variables={"namespace": "default"},
+            precheck_commands=("kubectl version --short",),
             read_commands=(
                 "kubectl get ns",
                 "kubectl get pods -A --field-selector=status.phase!=Running",
                 "kubectl get events -A --sort-by=.lastTimestamp | tail -n 40",
             ),
-            verify_commands=("kubectl get pods -A | head -n 40",),
+            postcheck_commands=("kubectl get pods -A | head -n 40",),
             tags=["k8s", "pod", "event"],
         ),
         SkillTemplate(
@@ -192,6 +206,7 @@ def builtin_skills() -> list[SkillTemplate]:
             required_permission="read",
             instruction="检查远程 Nginx 配置和最近错误。",
             variables={"ssh_target": "root@192.168.10.101"},
+            precheck_commands=("ssh -o BatchMode=yes -o ConnectTimeout=6 {ssh_target} 'echo ok'",),
             read_commands=("lazysre remote {ssh_target} --scenario nginx --logs",),
             verify_commands=("lazysre remote {ssh_target} --scenario nginx --json",),
             tags=["nginx", "remote"],
@@ -206,6 +221,7 @@ def builtin_skills() -> list[SkillTemplate]:
             required_permission="read",
             instruction="检查远程数据库组件是否运行和是否异常。",
             variables={"ssh_target": "root@192.168.10.101"},
+            precheck_commands=("ssh -o BatchMode=yes -o ConnectTimeout=6 {ssh_target} 'echo ok'",),
             read_commands=("lazysre remote {ssh_target} --scenario db",),
             verify_commands=("lazysre remote {ssh_target} --scenario db --json",),
             tags=["database", "mysql", "postgres", "redis", "remote"],
@@ -220,6 +236,7 @@ def builtin_skills() -> list[SkillTemplate]:
             required_permission="read",
             instruction="检查远程 GPU 和 AI 推理服务状态。",
             variables={"ssh_target": "root@192.168.10.101"},
+            precheck_commands=("ssh -o BatchMode=yes -o ConnectTimeout=6 {ssh_target} 'echo ok'",),
             read_commands=("lazysre remote {ssh_target} --scenario gpu --scenario ai",),
             verify_commands=("lazysre remote {ssh_target} --scenario gpu --scenario ai --json",),
             tags=["gpu", "ai", "llm", "remote"],
@@ -234,6 +251,7 @@ def builtin_skills() -> list[SkillTemplate]:
             required_permission="read",
             instruction="检查远程 CI/CD Runner 是否运行和是否异常。",
             variables={"ssh_target": "root@192.168.10.101"},
+            precheck_commands=("ssh -o BatchMode=yes -o ConnectTimeout=6 {ssh_target} 'echo ok'",),
             read_commands=("lazysre remote {ssh_target} --scenario cicd",),
             verify_commands=("lazysre remote {ssh_target} --scenario cicd --json",),
             tags=["cicd", "runner", "jenkins", "remote"],
@@ -288,9 +306,11 @@ def render_skill_commands(
     if overrides:
         values.update({str(k): str(v) for k, v in overrides.items()})
     commands = {
+        "precheck": [_safe_format(command, values) for command in skill.precheck_commands],
         "read": [_safe_format(command, values) for command in skill.read_commands],
         "apply": [_safe_format(command, values) for command in skill.apply_commands],
         "verify": [_safe_format(command, values) for command in skill.verify_commands],
+        "postcheck": [_safe_format(command, values) for command in skill.postcheck_commands],
         "rollback": [_safe_format(command, values) for command in skill.rollback_commands],
     }
     return commands, values
@@ -303,17 +323,25 @@ def run_skill(
     dry_run: bool = True,
     apply: bool = False,
     timeout_sec: int = 20,
+    auto_rollback_on_failure: bool | None = None,
 ) -> SkillRunResult:
     commands, values = render_skill_commands(skill, overrides=overrides)
-    selected = list(commands["read"])
+    selected: list[tuple[str, str]] = [("precheck", x) for x in commands["precheck"]]
+    selected.extend(("read", x) for x in commands["read"])
     if apply:
-        selected.extend(commands["apply"])
-        selected.extend(commands["verify"])
+        selected.extend(("apply", x) for x in commands["apply"])
+        selected.extend(("verify", x) for x in commands["verify"])
+        selected.extend(("postcheck", x) for x in commands["postcheck"])
     outputs: list[dict[str, Any]] = []
     status = "planned"
+    failed_phase = ""
+    rollback_executed = False
+    rollback_status = "not_required"
+    enable_auto_rollback = skill.auto_rollback_on_failure if auto_rollback_on_failure is None else bool(auto_rollback_on_failure)
     if not dry_run:
         status = "executed"
-        for command in selected:
+        for phase, command in selected:
+            started = _now_utc_iso()
             completed = subprocess.run(
                 command,
                 shell=True,
@@ -322,17 +350,50 @@ def run_skill(
                 timeout=max(1, timeout_sec),
                 check=False,
             )
+            finished = _now_utc_iso()
             outputs.append(
                 {
+                    "phase": phase,
                     "command": command,
                     "exit_code": completed.returncode,
                     "stdout": completed.stdout[-4000:],
                     "stderr": completed.stderr[-2000:],
+                    "started_at": started,
+                    "finished_at": finished,
                 }
             )
             if completed.returncode != 0:
                 status = "failed"
+                failed_phase = phase
                 break
+        if status == "failed" and apply and enable_auto_rollback and commands["rollback"]:
+            rollback_executed = True
+            rollback_status = "executed"
+            for command in commands["rollback"]:
+                started = _now_utc_iso()
+                completed = subprocess.run(
+                    command,
+                    shell=True,
+                    text=True,
+                    capture_output=True,
+                    timeout=max(1, timeout_sec),
+                    check=False,
+                )
+                finished = _now_utc_iso()
+                outputs.append(
+                    {
+                        "phase": "rollback",
+                        "command": command,
+                        "exit_code": completed.returncode,
+                        "stdout": completed.stdout[-4000:],
+                        "stderr": completed.stderr[-2000:],
+                        "started_at": started,
+                        "finished_at": finished,
+                    }
+                )
+                if completed.returncode != 0:
+                    rollback_status = "failed"
+                    break
     next_actions = []
     if dry_run:
         next_actions.append(f"确认命令无误后执行: lazysre skill run {skill.name} --execute")
@@ -340,6 +401,14 @@ def run_skill(
         next_actions.append(f"如需修复，执行: lazysre skill run {skill.name} --apply --execute")
     if skill.rollback_commands:
         next_actions.append("执行写操作前确认 rollback_commands 已满足预期。")
+    if status == "failed":
+        if failed_phase:
+            next_actions.append(f"故障阶段: {failed_phase}。先修复该阶段依赖，再重试 skill。")
+        if rollback_executed:
+            next_actions.append(f"已触发自动回滚，状态: {rollback_status}。建议执行 verify/postcheck 复核环境。")
+        elif commands["rollback"]:
+            next_actions.append(f"可手动回滚: lazysre skill run {skill.name} --apply --execute")
+    evidence_graph = _build_evidence_graph(outputs)
     return SkillRunResult(
         skill=skill,
         variables=values,
@@ -348,6 +417,10 @@ def run_skill(
         commands=commands,
         status=status,
         outputs=outputs,
+        evidence_graph=evidence_graph,
+        rollback_executed=rollback_executed,
+        rollback_status=rollback_status,
+        failed_phase=failed_phase,
         next_actions=next_actions,
     )
 
@@ -364,10 +437,13 @@ def skill_from_dict(name: str, raw: dict[str, Any], *, source: str) -> SkillTemp
         required_permission=str(raw.get("required_permission", "read")).strip().lower() or "read",
         instruction=str(raw.get("instruction", "")).strip(),
         variables={str(k): str(v) for k, v in variables.items()} if isinstance(variables, dict) else {},
+        precheck_commands=_string_list(raw.get("precheck_commands", [])),
         read_commands=_string_list(raw.get("read_commands", [])),
         apply_commands=_string_list(raw.get("apply_commands", [])),
         verify_commands=_string_list(raw.get("verify_commands", [])),
+        postcheck_commands=_string_list(raw.get("postcheck_commands", [])),
         rollback_commands=_string_list(raw.get("rollback_commands", [])),
+        auto_rollback_on_failure=_to_bool(raw.get("auto_rollback_on_failure", True), default=True),
         tags=_string_list(raw.get("tags", [])),
         source=source,
     )
@@ -391,8 +467,12 @@ def validate_skill(skill: SkillTemplate) -> None:
         raise ValueError("required_permission must be read, write or admin")
     if not skill.instruction.strip():
         raise ValueError("skill instruction is required")
-    if not (skill.read_commands or skill.apply_commands):
-        raise ValueError("skill must include at least one read or apply command")
+    if not (skill.precheck_commands or skill.read_commands or skill.apply_commands):
+        raise ValueError("skill must include at least one precheck/read/apply command")
+    if skill.mode in {"fix", "workflow"} and skill.apply_commands and not skill.rollback_commands:
+        raise ValueError("fix/workflow skills with apply commands must include rollback_commands")
+    if skill.apply_commands and not (skill.verify_commands or skill.postcheck_commands):
+        raise ValueError("skills with apply commands should include verify_commands or postcheck_commands")
 
 
 def normalize_skill_name(name: str) -> str:
@@ -419,3 +499,45 @@ def _safe_format(command: str, values: dict[str, str]) -> str:
     for key, value in values.items():
         rendered = rendered.replace("{" + key + "}", str(value))
     return rendered
+
+
+def _to_bool(value: Any, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _build_evidence_graph(outputs: list[dict[str, Any]]) -> dict[str, Any]:
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, str]] = []
+    previous_id = ""
+    for idx, row in enumerate(outputs, start=1):
+        phase = str(row.get("phase", "unknown"))
+        command = str(row.get("command", ""))
+        node_id = f"{phase}-{idx}"
+        nodes.append(
+            {
+                "id": node_id,
+                "phase": phase,
+                "command": command,
+                "exit_code": int(row.get("exit_code", 1)),
+                "started_at": str(row.get("started_at", "")),
+                "finished_at": str(row.get("finished_at", "")),
+            }
+        )
+        if previous_id:
+            edges.append({"from": previous_id, "to": node_id, "relation": "next"})
+        previous_id = node_id
+    return {"nodes": nodes, "edges": edges}
+
+
+def _now_utc_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()

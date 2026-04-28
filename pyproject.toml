@@ -35,9 +35,6 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-"lazysre" = ["web/*.html", "web/*.css", "web/*.js"]
-
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"

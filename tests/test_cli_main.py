@@ -956,7 +956,7 @@ def test_should_launch_assistant_is_no_longer_default_surface() -> None:
     assert _should_launch_assistant(["autopilot"]) is False
     assert _should_launch_assistant(["remediate"]) is False
     assert _should_launch_assistant(["tui"]) is False
-    assert _should_launch_assistant(["web"]) is False
+    assert _should_launch_assistant(["gateway"]) is False
     assert _should_launch_assistant(["connect"]) is False
     assert _should_launch_assistant(["remote"]) is False
     assert _should_launch_assistant(["doctor"]) is False

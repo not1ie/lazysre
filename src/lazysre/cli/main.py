@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import sqlite3
@@ -24,6 +25,7 @@ from typing import Annotated
 import typer
 
 from lazysre import __version__
+from lazysre.cli.approval import ApprovalStore
 from lazysre.cli.audit import AuditLogger
 from lazysre.cli.brain import BrainContext
 from lazysre.cli.context_window import ContextWindowManager
@@ -45,6 +47,7 @@ from lazysre.cli.llm import (
 )
 from lazysre.cli.permissions import ToolPermissionContext
 from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
+from lazysre.cli.policy_center import PolicyCenter
 from lazysre.cli.session import SessionStore
 from lazysre.cli.memory import IncidentMemoryStore, MemoryCase, format_memory_context
 from lazysre.cli.incident import IncidentStore, IncidentRecord, render_incident_markdown
@@ -121,9 +124,11 @@ target_profile_app = typer.Typer(help="Multi-cluster target profile management."
 history_app = typer.Typer(help="Session history management.")
 memory_app = typer.Typer(help="Long-term incident memory management.")
 incident_app = typer.Typer(help="Incident lifecycle management.")
+policy_app = typer.Typer(help="Multi-tenant policy center and guardrails.")
+approval_app = typer.Typer(help="Approval ticket lifecycle for high-risk execution.")
 runbook_app = typer.Typer(help="Workflow runbook templates.")
 template_app = typer.Typer(help="One-click remediation templates.")
-skill_app = typer.Typer(help="Web/CLI managed SRE skills.")
+skill_app = typer.Typer(help="CLI managed SRE skills.")
 
 
 @app.callback(invoke_without_command=True)
@@ -138,6 +143,12 @@ def root(
     approval_mode: Annotated[str, typer.Option(help="Policy level: strict|balanced|permissive")] = "balanced",
     audit_log: Annotated[str, typer.Option(help="Audit jsonl path for command execution records.")] = ".data/lsre-audit.jsonl",
     lock_file: Annotated[str, typer.Option(help="Tool pack lock file path.")] = ".data/lsre-tool-lock.json",
+    policy_file: Annotated[str, typer.Option(help="Policy center JSON path.")] = ".data/lsre-policy.json",
+    approval_store: Annotated[str, typer.Option(help="Approval ticket store JSON path.")] = ".data/lsre-approvals.json",
+    tenant: Annotated[str, typer.Option(help="Policy tenant context (optional).")] = "",
+    environment: Annotated[str, typer.Option(help="Policy environment context (optional).")] = "",
+    actor_role: Annotated[str, typer.Option(help="Policy actor role, e.g. viewer/operator/admin.")] = "",
+    actor_id: Annotated[str, typer.Option(help="Policy actor id for audit trace.")] = "",
     session_file: Annotated[str, typer.Option(help="Session memory file path.")] = ".data/lsre-session.json",
     incident_file: Annotated[str, typer.Option(help="Incident lifecycle store path.")] = str((Path(settings.data_dir) / "lsre-incident.json").expanduser()),
     deny_tool: Annotated[list[str], typer.Option("--deny-tool", help="Block specific tools by name, can be repeated.")] = [],
@@ -160,6 +171,12 @@ def root(
         "approval_mode": approval_mode,
         "audit_log": audit_log,
         "lock_file": lock_file,
+        "policy_file": policy_file,
+        "approval_store": approval_store,
+        "tenant": tenant,
+        "environment": environment,
+        "actor_role": actor_role,
+        "actor_id": actor_id,
         "session_file": session_file,
         "incident_file": incident_file,
         "deny_tool": list(deny_tool),
@@ -170,6 +187,18 @@ def root(
         "provider": provider,
         "max_steps": max(1, min(max_steps, 12)),
     }
+    if policy_file.strip():
+        os.environ["LAZYSRE_POLICY_FILE"] = policy_file.strip()
+    if approval_store.strip():
+        os.environ["LAZYSRE_APPROVAL_STORE"] = approval_store.strip()
+    if tenant.strip():
+        os.environ["LAZYSRE_TENANT"] = tenant.strip()
+    if environment.strip():
+        os.environ["LAZYSRE_ENVIRONMENT"] = environment.strip()
+    if actor_role.strip():
+        os.environ["LAZYSRE_ACTOR_ROLE"] = actor_role.strip()
+    if actor_id.strip():
+        os.environ["LAZYSRE_ACTOR_ID"] = actor_id.strip()
     if ctx.invoked_subcommand is None and _should_launch_default_tui(sys.argv[1:]):
         options = _merged_options(
             ctx,
@@ -1215,13 +1244,61 @@ def skill_show(
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+@skill_app.command("graph")
+def skill_graph(
+    name: Annotated[str, typer.Argument(help="Skill name.")],
+    var: Annotated[list[str], typer.Option("--var", "-v", help="Skill variables key=value, can be repeated.")] = [],
+    apply: Annotated[bool, typer.Option("--apply", help="Include apply/verify/postcheck phases in graph.")] = False,
+    evidence_file: Annotated[str, typer.Option("--evidence-file", help="Use evidence JSON from skill run result to render actual execution path.")] = "",
+    output: Annotated[str, typer.Option("--output", help="Optional output markdown path.")] = "",
+    skill_file: Annotated[str, typer.Option("--skill-file", help="Skill store JSON path.")] = settings.skill_store_file,
+) -> None:
+    payload: dict[str, object] = {}
+    if evidence_file.strip():
+        path = Path(evidence_file.strip()).expanduser()
+        if not path.exists():
+            raise typer.BadParameter(f"evidence file not found: {path}")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise typer.BadParameter(f"invalid evidence json: {_safe_exception_text(exc)}") from exc
+        if isinstance(raw, dict):
+            payload = raw
+    if not payload:
+        item = find_skill(name, store=SkillStore(Path(skill_file)))
+        if not item:
+            raise typer.BadParameter(f"skill not found: {name}")
+        try:
+            values = parse_skill_vars(list(var))
+        except ValueError as exc:
+            raise typer.BadParameter(_safe_exception_text(exc)) from exc
+        result = execute_skill_template(
+            item,
+            overrides=values,
+            dry_run=True,
+            apply=apply,
+            timeout_sec=20,
+        )
+        payload = result.to_dict()
+    text = _render_skill_graph_markdown(payload)
+    if output.strip():
+        out = Path(output.strip()).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        typer.echo(f"Skill graph exported: {out}")
+    else:
+        typer.echo(text)
+
+
 @skill_app.command("run")
 def skill_run(
     name: Annotated[str, typer.Argument(help="Skill name.")],
     var: Annotated[list[str], typer.Option("--var", "-v", help="Skill variables key=value, can be repeated.")] = [],
     apply: Annotated[bool, typer.Option("--apply", help="Include apply and verify commands.")] = False,
     execute: Annotated[bool, typer.Option("--execute", help="Execute commands. Default is dry-run.")] = False,
+    auto_rollback: Annotated[bool, typer.Option("--auto-rollback/--no-auto-rollback", help="Auto-run rollback commands when apply flow fails.")] = True,
     timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Command timeout seconds.")] = 20,
+    evidence_file: Annotated[str, typer.Option("--evidence-file", help="Optional path to export execution evidence JSON.")] = "",
     skill_file: Annotated[str, typer.Option("--skill-file", help="Skill store JSON path.")] = settings.skill_store_file,
 ) -> None:
     item = find_skill(name, store=SkillStore(Path(skill_file)))
@@ -1237,8 +1314,12 @@ def skill_run(
         dry_run=not execute,
         apply=apply,
         timeout_sec=max(1, min(timeout_sec, 300)),
+        auto_rollback_on_failure=auto_rollback,
     )
-    _render_skill_run_result(result.to_dict())
+    payload = result.to_dict()
+    if evidence_file.strip():
+        _write_json_file(Path(evidence_file.strip()), payload)
+    _render_skill_run_result(payload)
 
 
 @skill_app.command("add")
@@ -1246,10 +1327,13 @@ def skill_add(
     name: Annotated[str, typer.Argument(help="Skill name.")],
     title: Annotated[str, typer.Option("--title", help="Skill title.")],
     instruction: Annotated[str, typer.Option("--instruction", help="Natural language goal/instruction.")],
+    precheck_command: Annotated[list[str], typer.Option("--precheck-command", help="Precheck command, repeatable.")] = [],
     read_command: Annotated[list[str], typer.Option("--read-command", help="Read-only command, repeatable.")] = [],
     apply_command: Annotated[list[str], typer.Option("--apply-command", help="Apply command, repeatable.")] = [],
     verify_command: Annotated[list[str], typer.Option("--verify-command", help="Verify command, repeatable.")] = [],
+    postcheck_command: Annotated[list[str], typer.Option("--postcheck-command", help="Postcheck command, repeatable.")] = [],
     rollback_command: Annotated[list[str], typer.Option("--rollback-command", help="Rollback command, repeatable.")] = [],
+    auto_rollback_on_failure: Annotated[bool, typer.Option("--auto-rollback-on-failure/--no-auto-rollback-on-failure", help="Enable auto rollback when apply/verify/postcheck fails.")] = True,
     category: Annotated[str, typer.Option("--category", help="Skill category.")] = "custom",
     mode: Annotated[str, typer.Option("--mode", help="diagnose|fix|workflow")] = "diagnose",
     risk_level: Annotated[str, typer.Option("--risk-level", help="low|medium|high|critical")] = "low",
@@ -1278,10 +1362,13 @@ def skill_add(
             "required_permission": required_permission,
             "instruction": instruction,
             "variables": variables,
+            "precheck_commands": list(precheck_command),
             "read_commands": list(read_command),
             "apply_commands": list(apply_command),
             "verify_commands": list(verify_command),
+            "postcheck_commands": list(postcheck_command),
             "rollback_commands": list(rollback_command),
+            "auto_rollback_on_failure": auto_rollback_on_failure,
             "tags": list(tag),
         },
         source="custom",
@@ -1464,28 +1551,73 @@ def tui(
     _run_tui(options, demo=demo)
 
 
-@app.command("web")
-def web_console(
-    host: Annotated[str, typer.Option("--host", help="Bind host for the Web Skill Console.")] = "127.0.0.1",
-    port: Annotated[int, typer.Option("--port", help="Bind port for the Web Skill Console.")] = 8000,
+@app.command("gateway")
+def channel_gateway(
+    host: Annotated[str, typer.Option("--host", help="Bind host for the message channel gateway.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Bind port for the message channel gateway.")] = 8010,
+    token: Annotated[str, typer.Option("--token", help="Shared inbound token for channel webhooks. Defaults to LAZYSRE_CHANNEL_TOKEN or generated local token.")] = "",
+    provider: Annotated[str, typer.Option("--provider", help=f"LLM provider for channel replies: {provider_mode_help_text()}")] = "mock",
 ) -> None:
-    """Start the Web Skill Console for low-barrier skill management."""
+    """Start webhook endpoints for Feishu/DingTalk/Telegram/QQ natural-language ops."""
+    channel_token = token.strip() or os.environ.get("LAZYSRE_CHANNEL_TOKEN", "").strip() or secrets.token_urlsafe(24)
+    os.environ["LAZYSRE_CHANNEL_TOKEN"] = channel_token
+    os.environ["LAZYSRE_CHANNEL_PROVIDER"] = provider
     if _console:
         _console.print(
             Panel.fit(
-                f"[bold]LazySRE Web Console[/bold]\n\n"
-                f"Open: [cyan]http://{host}:{port}/[/cyan]\n"
-                "Default mode is dry-run. High-risk actions still require explicit approval.",
-                title="Web",
+                f"[bold]LazySRE Channel Gateway[/bold]\n\n"
+                f"Base URL: [cyan]http://{host}:{port}[/cyan]\n"
+                "Webhook paths:\n"
+                f"- /v1/channels/feishu/webhook\n"
+                f"- /v1/channels/dingtalk/webhook\n"
+                f"- /v1/channels/telegram/webhook\n"
+                f"- /v1/channels/onebot/webhook\n"
+                f"- /v1/channels/generic/webhook\n\n"
+                f"Header: [bold]X-LazySRE-Channel-Token: {channel_token}[/bold]\n"
+                "Mode: dry-run only, approval strict by default.",
+                title="Gateway",
             )
         )
     else:
-        print(f"LazySRE Web Console: http://{host}:{port}/")
+        print(f"LazySRE Channel Gateway: http://{host}:{port}")
+        print(f"X-LazySRE-Channel-Token: {channel_token}")
     try:
         import uvicorn
     except Exception as exc:  # pragma: no cover
         raise typer.BadParameter("uvicorn is not installed; run lazysre install-doctor first") from exc
     uvicorn.run("lazysre.main:app", host=host, port=port, log_level="info")
+
+
+@app.command("verify-artifact")
+def verify_artifact(
+    path: Annotated[str, typer.Argument(help="Path to channel run artifact JSON file.")],
+    hmac_key: Annotated[str, typer.Option("--hmac-key", help="Optional HMAC key to validate signed artifacts.")] = "",
+    as_json: Annotated[bool, typer.Option("--json", help="Print verification result as JSON.")] = False,
+) -> None:
+    from lazysre.main import _verify_channel_run_artifact
+
+    result = _verify_channel_run_artifact(path, hmac_key=hmac_key)
+    if as_json:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        ok = bool(result.get("ok"))
+        signed = bool(result.get("signed"))
+        signature_valid = result.get("signature_valid")
+        status_text = "ok" if ok else "failed"
+        sig_text = "n/a" if signature_valid is None else ("true" if signature_valid else "false")
+        typer.echo(
+            "artifact verify "
+            f"{status_text} path={result.get('path', '')} "
+            f"trace_id={result.get('trace_id', '')} "
+            f"digest_match={str(bool(result.get('digest_match'))).lower()} "
+            f"signed={str(signed).lower()} "
+            f"signature_valid={sig_text}"
+        )
+        error = str(result.get("error", "")).strip()
+        if error:
+            typer.echo(f"error: {error}")
+    if not bool(result.get("ok")):
+        raise typer.Exit(code=1)
 
 
 @app.command("fix")
@@ -2398,6 +2530,226 @@ def memory_search(
     _render_memory_cases(rows, title=f"Incident Memory Search: {query}")
 
 
+@memory_app.command("recommend")
+def memory_recommend(
+    query: Annotated[str, typer.Argument(help="Diagnosis query to retrieve closest historical fix.")],
+    limit: Annotated[int, typer.Option("--limit", help="Max similar cases to inspect.")] = 5,
+) -> None:
+    store = _open_incident_memory_store()
+    if not store:
+        typer.echo("memory store is unavailable.")
+        return
+    rows = store.search_similar(query, limit=limit)
+    if not rows:
+        typer.echo("No similar incident found.")
+        return
+    top = rows[0]
+    payload = {
+        "query": query,
+        "case_id": top.id,
+        "score": round(top.score, 4),
+        "symptom": top.symptom,
+        "root_cause": top.root_cause,
+        "fix_commands": top.fix_commands[:5],
+        "rollback_commands": top.rollback_commands[:3],
+        "suggested_next": top.fix_commands[0] if top.fix_commands else "",
+    }
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@policy_app.command("init")
+def policy_init(
+    policy_file: Annotated[str, typer.Option("--policy-file", help="Policy center JSON path.")] = ".data/lsre-policy.json",
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing policy file.")] = False,
+) -> None:
+    center = PolicyCenter(Path(policy_file).expanduser())
+    payload = center.init(force=force)
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@policy_app.command("show")
+def policy_show(
+    policy_file: Annotated[str, typer.Option("--policy-file", help="Policy center JSON path.")] = ".data/lsre-policy.json",
+) -> None:
+    center = PolicyCenter(Path(policy_file).expanduser())
+    typer.echo(json.dumps(center.show(), ensure_ascii=False, indent=2))
+
+
+@policy_app.command("context")
+def policy_context(
+    policy_file: Annotated[str, typer.Option("--policy-file", help="Policy center JSON path.")] = ".data/lsre-policy.json",
+    tenant: Annotated[str, typer.Option("--tenant", help="Default tenant.")] = "",
+    environment: Annotated[str, typer.Option("--environment", help="Default environment.")] = "",
+    actor_role: Annotated[str, typer.Option("--actor-role", help="Default actor role (viewer/operator/admin).")] = "",
+    actor_id: Annotated[str, typer.Option("--actor-id", help="Default actor id.")] = "",
+) -> None:
+    center = PolicyCenter(Path(policy_file).expanduser())
+    payload = center.update_defaults(
+        tenant=tenant or None,
+        environment=environment or None,
+        actor_role=actor_role or None,
+        actor_id=actor_id if actor_id != "" else None,
+    )
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@policy_app.command("guard")
+def policy_guard(
+    policy_file: Annotated[str, typer.Option("--policy-file", help="Policy center JSON path.")] = ".data/lsre-policy.json",
+    tenant: Annotated[str, typer.Option("--tenant", help="Tenant name.")] = "default",
+    environment: Annotated[str, typer.Option("--environment", help="Environment name.")] = "prod",
+    min_approval_risk: Annotated[str, typer.Option("--min-approval-risk", help="low|medium|high|critical")] = "",
+    require_ticket_for_critical: Annotated[bool, typer.Option("--require-ticket-for-critical/--no-require-ticket-for-critical", help="Critical command must have LAZYSRE_APPROVAL_TICKET.")] = True,
+    high_risk_min_approvers: Annotated[int | None, typer.Option("--high-risk-min-approvers", help="Minimum approvers required for high-risk actions.")] = None,
+    critical_risk_min_approvers: Annotated[int | None, typer.Option("--critical-risk-min-approvers", help="Minimum approvers required for critical-risk actions.")] = None,
+) -> None:
+    center = PolicyCenter(Path(policy_file).expanduser())
+    payload = center.set_environment_guard(
+        tenant=tenant,
+        environment=environment,
+        min_approval_risk=min_approval_risk or None,
+        require_ticket_for_critical=bool(require_ticket_for_critical),
+        high_risk_min_approvers=high_risk_min_approvers,
+        critical_risk_min_approvers=critical_risk_min_approvers,
+    )
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@policy_app.command("role")
+def policy_role(
+    policy_file: Annotated[str, typer.Option("--policy-file", help="Policy center JSON path.")] = ".data/lsre-policy.json",
+    tenant: Annotated[str, typer.Option("--tenant", help="Tenant name.")] = "default",
+    environment: Annotated[str, typer.Option("--environment", help="Environment name.")] = "prod",
+    role: Annotated[str, typer.Option("--role", help="Role name, e.g. viewer/operator/admin.")] = "operator",
+    max_risk: Annotated[str, typer.Option("--max-risk", help="low|medium|high|critical")] = "high",
+) -> None:
+    center = PolicyCenter(Path(policy_file).expanduser())
+    payload = center.set_role_max_risk(
+        tenant=tenant,
+        environment=environment,
+        role=role,
+        max_risk=max_risk,
+    )
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@policy_app.command("block")
+def policy_block(
+    policy_file: Annotated[str, typer.Option("--policy-file", help="Policy center JSON path.")] = ".data/lsre-policy.json",
+    tenant: Annotated[str, typer.Option("--tenant", help="Tenant name.")] = "default",
+    environment: Annotated[str, typer.Option("--environment", help="Environment name.")] = "prod",
+    pattern: Annotated[str, typer.Option("--pattern", help="Lowercase match pattern in command text.")] = "",
+) -> None:
+    if not pattern.strip():
+        raise typer.BadParameter("--pattern is required")
+    center = PolicyCenter(Path(policy_file).expanduser())
+    payload = center.add_block_pattern(tenant=tenant, environment=environment, pattern=pattern)
+    typer.echo(json.dumps({"blocked_command_patterns": payload}, ensure_ascii=False, indent=2))
+
+
+@policy_app.command("allow-binary")
+def policy_allow_binary(
+    policy_file: Annotated[str, typer.Option("--policy-file", help="Policy center JSON path.")] = ".data/lsre-policy.json",
+    tenant: Annotated[str, typer.Option("--tenant", help="Tenant name.")] = "default",
+    environment: Annotated[str, typer.Option("--environment", help="Environment name.")] = "prod",
+    binary: Annotated[str, typer.Option("--binary", help="Allowed binary name.")] = "",
+) -> None:
+    if not binary.strip():
+        raise typer.BadParameter("--binary is required")
+    center = PolicyCenter(Path(policy_file).expanduser())
+    payload = center.add_allowed_binary(tenant=tenant, environment=environment, binary=binary)
+    typer.echo(json.dumps({"allowed_binaries": payload}, ensure_ascii=False, indent=2))
+
+
+@approval_app.command("create")
+def approval_create(
+    reason: Annotated[str, typer.Option("--reason", help="Change reason / impact statement.")],
+    risk_level: Annotated[str, typer.Option("--risk-level", help="low|medium|high|critical")] = "critical",
+    tenant: Annotated[str, typer.Option("--tenant", help="Tenant name.")] = "",
+    environment: Annotated[str, typer.Option("--environment", help="Environment name.")] = "",
+    actor_role: Annotated[str, typer.Option("--actor-role", help="Actor role.")] = "",
+    requester: Annotated[str, typer.Option("--requester", help="Requester id/name.")] = "unknown",
+    required_approvers: Annotated[int | None, typer.Option("--required-approvers", help="Override required approvers count.")] = None,
+    command_prefix: Annotated[str, typer.Option("--command-prefix", help="Limit ticket to commands starting with this prefix.")] = "",
+    target_hint: Annotated[str, typer.Option("--target-hint", help="Limit ticket to commands containing this target hint.")] = "",
+    scope_note: Annotated[str, typer.Option("--scope-note", help="Human-readable scope note for this approval.")] = "",
+    expires_hours: Annotated[int, typer.Option("--expires-hours", help="Expiry hours for ticket.")] = 8,
+    store_file: Annotated[str, typer.Option("--store-file", help="Approval store JSON path.")] = ".data/lsre-approvals.json",
+) -> None:
+    center = PolicyCenter(Path(os.environ.get("LAZYSRE_POLICY_FILE", ".data/lsre-policy.json")).expanduser())
+    ctx = center.resolve_context(
+        tenant=tenant,
+        environment=environment,
+        actor_role=actor_role,
+    )
+    store = ApprovalStore(Path(store_file).expanduser())
+    min_required = center.min_approvers_required(
+        tenant=ctx.tenant,
+        environment=ctx.environment,
+        risk_level=risk_level,
+    )
+    required = max(1, min(required_approvers if required_approvers is not None else min_required, 5))
+    item = store.create(
+        reason=reason,
+        risk_level=risk_level,
+        tenant=ctx.tenant,
+        environment=ctx.environment,
+        actor_role=ctx.actor_role,
+        requester=requester,
+        expires_hours=expires_hours,
+        required_approvers=required,
+        command_prefix=command_prefix,
+        target_hint=target_hint,
+        scope_note=scope_note,
+    )
+    payload = item.to_dict()
+    payload["export"] = f"export LAZYSRE_APPROVAL_TICKET={item.id}"
+    payload["store"] = str(store.path)
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@approval_app.command("approve")
+def approval_approve(
+    ticket_id: Annotated[str, typer.Argument(help="Approval ticket id, e.g. CHG-...")],
+    approver: Annotated[str, typer.Option("--approver", help="Approver id/name.")] = "oncall",
+    comment: Annotated[str, typer.Option("--comment", help="Approval comment.")] = "",
+    store_file: Annotated[str, typer.Option("--store-file", help="Approval store JSON path.")] = ".data/lsre-approvals.json",
+) -> None:
+    store = ApprovalStore(Path(store_file).expanduser())
+    item = store.approve(ticket_id, approver=approver, comment=comment)
+    if not item:
+        raise typer.BadParameter(f"ticket not found: {ticket_id}")
+    typer.echo(json.dumps(item.to_dict(), ensure_ascii=False, indent=2))
+
+
+@approval_app.command("list")
+def approval_list(
+    status: Annotated[str, typer.Option("--status", help="all|pending|approved|rejected|expired")] = "all",
+    limit: Annotated[int, typer.Option("--limit", help="Maximum records to output.")] = 30,
+    store_file: Annotated[str, typer.Option("--store-file", help="Approval store JSON path.")] = ".data/lsre-approvals.json",
+) -> None:
+    store = ApprovalStore(Path(store_file).expanduser())
+    rows = store.list(status=status, limit=limit)
+    typer.echo(
+        json.dumps(
+            [item.to_dict() for item in rows],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+@approval_app.command("use")
+def approval_use(
+    ticket_id: Annotated[str, typer.Argument(help="Approval ticket id.")],
+    store_file: Annotated[str, typer.Option("--store-file", help="Approval store JSON path.")] = ".data/lsre-approvals.json",
+) -> None:
+    store = ApprovalStore(Path(store_file).expanduser())
+    if not store.is_approved_and_valid(ticket_id):
+        raise typer.BadParameter("ticket is not approved or already expired")
+    typer.echo(f"export LAZYSRE_APPROVAL_TICKET={ticket_id}")
+
+
 @incident_app.command("open")
 def incident_open(
     ctx: typer.Context,
@@ -2573,6 +2925,50 @@ def incident_export(
     typer.echo(f"Incident exported: {out_path}")
 
 
+@incident_app.command("postmortem")
+def incident_postmortem(
+    ctx: typer.Context,
+    output: Annotated[str, typer.Option("--output", help="Output markdown path.")] = "",
+    evidence_file: Annotated[str, typer.Option("--evidence-file", help="Optional skill evidence JSON path.")] = "",
+    memory_limit: Annotated[int, typer.Option("--memory-limit", help="Number of similar historical cases to include.")] = 3,
+    incident_file: Annotated[str | None, typer.Option("--incident-file", help="Override incident store path.")] = None,
+) -> None:
+    store = IncidentStore(_resolve_incident_file(ctx, incident_file))
+    rec = store.active()
+    if not rec:
+        rows = store.list_recent(limit=1)
+        rec = rows[0] if rows else None
+    if not rec:
+        typer.echo("No incident found to generate postmortem.")
+        return
+    evidence_payload: dict[str, object] = {}
+    if evidence_file.strip():
+        path = Path(evidence_file.strip()).expanduser()
+        if not path.exists():
+            raise typer.BadParameter(f"evidence file not found: {path}")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                evidence_payload = raw
+        except Exception as exc:
+            raise typer.BadParameter(f"invalid evidence json: {_safe_exception_text(exc)}") from exc
+    memory_rows: list[MemoryCase] = []
+    mem_store = _open_incident_memory_store()
+    if mem_store:
+        query = f"{rec.title}\n{rec.summary}".strip()
+        memory_rows = mem_store.search_similar(query, limit=max(1, min(memory_limit, 8)))
+    markdown = _render_incident_postmortem_markdown(
+        incident=rec,
+        evidence_payload=evidence_payload,
+        similar_cases=memory_rows,
+    )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out_path = Path(output.strip() or str(Path(settings.data_dir) / f"{rec.id.lower()}-postmortem-{stamp}.md"))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(markdown, encoding="utf-8")
+    typer.echo(f"Postmortem exported: {out_path}")
+
+
 def _resolve_incident_file(ctx: typer.Context, incident_file: str | None) -> Path:
     if incident_file and incident_file.strip():
         return Path(incident_file).expanduser()
@@ -2624,6 +3020,84 @@ def _render_incident_timeline_text(rec: IncidentRecord, *, limit: int = 12) -> s
             f"- {item.get('at_utc', '-')}: {item.get('kind', '-')}: {item.get('message', '')}"
         )
     return "\n".join(lines)
+
+
+def _render_incident_postmortem_markdown(
+    *,
+    incident: IncidentRecord,
+    evidence_payload: dict[str, object],
+    similar_cases: list[MemoryCase],
+) -> str:
+    lines: list[str] = [
+        f"# Postmortem: {incident.title}",
+        "",
+        "## Incident Summary",
+        f"- ID: `{incident.id}`",
+        f"- Severity: `{incident.severity}`",
+        f"- Status: `{incident.status}`",
+        f"- Assignee: `{incident.assignee}`",
+        f"- Opened: `{incident.opened_at_utc}`",
+        f"- Updated: `{incident.updated_at_utc}`",
+        f"- Closed: `{incident.closed_at_utc or '-'}`",
+        "",
+        "## Impact",
+        f"- Summary: {incident.summary or '-'}",
+        f"- Resolution: {incident.resolution or '-'}",
+        "",
+        "## Timeline",
+    ]
+    if not incident.timeline:
+        lines.append("- (empty)")
+    else:
+        for item in incident.timeline:
+            lines.append(
+                f"- `{item.get('at_utc', '-')}` `{item.get('kind', '-')}` {item.get('message', '')}"
+            )
+    lines.extend(["", "## Evidence"])
+    evidence_graph = evidence_payload.get("evidence_graph", {}) if isinstance(evidence_payload, dict) else {}
+    if isinstance(evidence_graph, dict) and isinstance(evidence_graph.get("nodes"), list) and evidence_graph.get("nodes"):
+        nodes = evidence_graph.get("nodes", [])
+        lines.append(f"- Execution nodes: {len(nodes)}")
+        for item in nodes[:12]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- [{item.get('phase', '-')}] exit={item.get('exit_code', '-')} cmd={str(item.get('command', ''))[:180]}"
+            )
+    else:
+        lines.append("- No structured evidence provided.")
+    lines.extend(["", "## Root Cause Hypothesis"])
+    candidate = _extract_root_cause_from_timeline(incident.timeline)
+    lines.append(f"- {candidate}")
+    lines.extend(["", "## Action Items"])
+    lines.append("- [ ] Add/refresh runbook for this failure mode.")
+    lines.append("- [ ] Add alert and SLO guardrail if missing.")
+    lines.append("- [ ] Add precheck/postcheck to related skill template.")
+    lines.extend(["", "## Similar Historical Cases"])
+    if similar_cases:
+        for item in similar_cases[:6]:
+            lines.append(f"- case#{item.id} score={item.score:.2f} symptom={item.symptom[:120]}")
+            lines.append(f"  - root_cause={item.root_cause[:160]}")
+            if item.fix_commands:
+                lines.append(f"  - fix={' | '.join(item.fix_commands[:2])[:200]}")
+    else:
+        lines.append("- (none)")
+    lines.extend(["", "## Prevention / Follow-ups"])
+    lines.append("- 在生产策略中要求 high/critical 双人审批。")
+    lines.append("- 对关键变更强制审批单号和过期校验。")
+    lines.append("- 保持 dry-run 默认，先证据后执行。")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _extract_root_cause_from_timeline(timeline: list[dict[str, str]]) -> str:
+    if not timeline:
+        return "需要补充时间线与证据后再确认。"
+    latest = timeline[-1] if isinstance(timeline[-1], dict) else {}
+    msg = str(latest.get("message", "")).strip()
+    if msg:
+        return msg[:240]
+    return "从时间线中暂未提取到明确根因，建议补充 verify/postcheck 证据。"
 
 
 def _handle_incident_inline_command(text: str, *, path: Path | None = None) -> str:
@@ -3638,6 +4112,8 @@ app.add_typer(target_app, name="target")
 app.add_typer(history_app, name="history")
 app.add_typer(memory_app, name="memory")
 app.add_typer(incident_app, name="incident")
+app.add_typer(policy_app, name="policy")
+app.add_typer(approval_app, name="approval")
 app.add_typer(runbook_app, name="runbook")
 app.add_typer(template_app, name="template")
 app.add_typer(skill_app, name="skill")
@@ -13959,7 +14435,7 @@ def _render_skill_run_result(result: dict[str, object]) -> None:
     else:
         typer.echo(f"Skill Run: {skill_name} status={status} mode={'dry-run' if dry_run else 'execute'}")
     if isinstance(commands, dict):
-        for group in ("read", "apply", "verify", "rollback"):
+        for group in ("precheck", "read", "apply", "verify", "postcheck", "rollback"):
             rows = commands.get(group, [])
             if not isinstance(rows, list) or not rows:
                 continue
@@ -13972,7 +14448,9 @@ def _render_skill_run_result(result: dict[str, object]) -> None:
         for item in outputs:
             if not isinstance(item, dict):
                 continue
-            typer.echo(f"$ {item.get('command', '')}")
+            phase = str(item.get("phase", "")).strip()
+            prefix = f"[{phase}] " if phase else ""
+            typer.echo(f"{prefix}$ {item.get('command', '')}")
             typer.echo(f"exit={item.get('exit_code', '-')}")
             stdout = str(item.get("stdout", "") or "").strip()
             stderr = str(item.get("stderr", "") or "").strip()
@@ -13980,11 +14458,78 @@ def _render_skill_run_result(result: dict[str, object]) -> None:
                 typer.echo(stdout[:1600])
             if stderr:
                 typer.echo(stderr[:1200])
+    rollback_executed = bool(result.get("rollback_executed", False))
+    rollback_status = str(result.get("rollback_status", "not_required"))
+    failed_phase = str(result.get("failed_phase", "")).strip()
+    if rollback_executed or failed_phase:
+        typer.echo("\n[guardrail]")
+        if failed_phase:
+            typer.echo(f"- failed_phase={failed_phase}")
+        typer.echo(f"- rollback_executed={rollback_executed}")
+        typer.echo(f"- rollback_status={rollback_status}")
+    evidence_graph = result.get("evidence_graph", {})
+    if isinstance(evidence_graph, dict):
+        nodes = evidence_graph.get("nodes", [])
+        edges = evidence_graph.get("edges", [])
+        if isinstance(nodes, list) and nodes:
+            typer.echo("\n[evidence]")
+            typer.echo(f"- nodes={len(nodes)}")
+            if isinstance(edges, list):
+                typer.echo(f"- edges={len(edges)}")
     next_actions = result.get("next_actions", [])
     if isinstance(next_actions, list) and next_actions:
         typer.echo("\n[next]")
         for item in next_actions:
             typer.echo(f"- {item}")
+
+
+def _render_skill_graph_markdown(payload: dict[str, object]) -> str:
+    skill = payload.get("skill", {})
+    skill_name = str(skill.get("name", "-")) if isinstance(skill, dict) else "-"
+    status = str(payload.get("status", "planned"))
+    lines = [f"# Skill Graph: {skill_name}", "", f"- status: {status}", "", "```mermaid", "graph TD"]
+    evidence = payload.get("evidence_graph", {})
+    if isinstance(evidence, dict) and isinstance(evidence.get("nodes"), list) and evidence.get("nodes"):
+        nodes = evidence.get("nodes", [])
+        edges = evidence.get("edges", [])
+        for item in nodes:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("id", "")).strip() or "n"
+            phase = str(item.get("phase", "step")).strip()
+            command = str(item.get("command", "")).strip().replace('"', "'")
+            exit_code = str(item.get("exit_code", "-")).strip()
+            label = f"{phase}: {command[:48]} (exit={exit_code})".replace('"', "'")
+            lines.append(f'  {node_id}["{label}"]')
+        if isinstance(edges, list):
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                src = str(edge.get("from", "")).strip()
+                dst = str(edge.get("to", "")).strip()
+                if src and dst:
+                    lines.append(f"  {src} --> {dst}")
+    else:
+        commands = payload.get("commands", {})
+        seq: list[tuple[str, str]] = []
+        if isinstance(commands, dict):
+            for phase in ("precheck", "read", "apply", "verify", "postcheck", "rollback"):
+                rows = commands.get(phase, [])
+                if isinstance(rows, list):
+                    for cmd in rows:
+                        text = str(cmd).strip()
+                        if text:
+                            seq.append((phase, text))
+        prev = ""
+        for idx, (phase, cmd) in enumerate(seq, start=1):
+            node_id = f"s{idx}"
+            label = f"{phase}: {cmd[:56]}".replace('"', "'")
+            lines.append(f'  {node_id}["{label}"]')
+            if prev:
+                lines.append(f"  {prev} --> {node_id}")
+            prev = node_id
+    lines.extend(["```", ""])
+    return "\n".join(lines)
 
 
 def _should_auto_fallback_to_mock(*, provider_mode: str, error: Exception) -> bool:
@@ -19360,7 +19905,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "run",
         "chat",
         "tui",
-        "web",
+        "gateway",
         "login",
         "logout",
         "init",
@@ -19386,6 +19931,8 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "setup",
         "report",
         "incident",
+        "policy",
+        "approval",
         "template",
         "runbook",
         "skill",
@@ -19460,6 +20007,8 @@ def _should_launch_default_tui(tokens: list[str]) -> bool:
         "setup",
         "report",
         "incident",
+        "policy",
+        "approval",
         "template",
         "runbook",
         "skill",
@@ -19533,6 +20082,8 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "setup",
         "report",
         "incident",
+        "policy",
+        "approval",
         "template",
         "runbook",
         "skill",

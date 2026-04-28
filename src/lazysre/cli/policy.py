@@ -13,6 +13,7 @@ class PolicyDecision:
     requires_approval: bool = False
     blocked: bool = False
     blocked_reason: str = ""
+    policy_metadata: dict[str, object] = field(default_factory=dict)
 
 
 def assess_command(command: list[str], approval_mode: str = "balanced") -> PolicyDecision:
