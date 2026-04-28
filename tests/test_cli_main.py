@@ -910,6 +910,7 @@ def test_should_launch_default_tui_with_only_options() -> None:
     assert _should_launch_default_tui(["logout"]) is False
     assert _should_launch_default_tui(["status"]) is False
     assert _should_launch_default_tui(["brief"]) is False
+    assert _should_launch_default_tui(["timeline"]) is False
     assert _should_launch_default_tui(["scan"]) is False
     assert _should_launch_default_tui(["swarm"]) is False
     assert _should_launch_default_tui(["watch"]) is False
@@ -949,6 +950,7 @@ def test_should_launch_assistant_is_no_longer_default_surface() -> None:
     assert _should_launch_assistant(["logout"]) is False
     assert _should_launch_assistant(["status"]) is False
     assert _should_launch_assistant(["brief"]) is False
+    assert _should_launch_assistant(["timeline"]) is False
     assert _should_launch_assistant(["scan"]) is False
     assert _should_launch_assistant(["swarm"]) is False
     assert _should_launch_assistant(["watch"]) is False

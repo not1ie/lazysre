@@ -80,6 +80,17 @@ from lazysre.cli.remediation_templates import (
 )
 from lazysre.cli.target import TargetEnvStore, probe_target_environment
 from lazysre.cli.target_profiles import ClusterProfileStore
+from lazysre.commands.preflight_risk import (
+    build_preflight_risk_result,
+    collect_preflight_risk_context,
+    render_preflight_risk_payload,
+)
+from lazysre.commands.timeline import (
+    collect_timeline_datasets,
+    render_timeline_json,
+    render_timeline_mermaid,
+    render_timeline_rich_text,
+)
 from lazysre.cli.tools import build_default_registry
 from lazysre.cli.types import DispatchEvent, DispatchResult, ExecResult
 from lazysre.cli.tools.marketplace import (
@@ -374,6 +385,33 @@ def brief(
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
         return
     _render_overview_brief_report(report)
+
+
+@app.command("timeline")
+def timeline_command(
+    evidence_file: Annotated[str, typer.Option("--evidence-file", help="Evidence file path, e.g. .data/skill-evidence.json or .data/channel-runs/*.json")] = "",
+    incident_id: Annotated[str, typer.Option("--incident-id", help="Incident or trace id to resolve from channel-runs artifacts.")] = "",
+    format: Annotated[str, typer.Option("--format", help="Output format: rich|mermaid|json")] = "rich",
+    compare: Annotated[list[str], typer.Option("--compare", help="Additional evidence file for comparison, repeatable.")] = [],
+) -> None:
+    view = str(format or "rich").strip().lower()
+    if view not in {"rich", "mermaid", "json"}:
+        raise typer.BadParameter("format must be rich|mermaid|json")
+    datasets = collect_timeline_datasets(
+        evidence_file=evidence_file,
+        incident_id=incident_id,
+        compare=list(compare),
+        default_data_dir=Path(settings.data_dir),
+    )
+    if not datasets:
+        raise typer.BadParameter("no timeline evidence found. provide --evidence-file or --incident-id")
+    if view == "json":
+        typer.echo(render_timeline_json(datasets))
+        return
+    if view == "mermaid":
+        typer.echo(render_timeline_mermaid(datasets))
+        return
+    typer.echo(render_timeline_rich_text(datasets))
 
 
 @app.command("swarm")
@@ -790,6 +828,9 @@ def preflight(
     profile_file: Annotated[str, typer.Option("--profile-file", help="Target profile JSON path.")] = settings.target_profile_file,
     timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Probe timeout seconds for doctor checks.")] = 6,
     dry_run_probe: Annotated[bool, typer.Option("--dry-run-probe", help="Run doctor probes in dry-run mode.")] = True,
+    command: Annotated[str, typer.Option("--command", help="Command text for AI risk scoring.")] = "",
+    plan_file: Annotated[str, typer.Option("--plan-file", help="Plan JSON file containing command lists (apply/verify/rollback).")] = "",
+    context: Annotated[str, typer.Option("--context", help="Policy environment context, e.g. prod/staging.")] = "",
     strict: Annotated[bool, typer.Option("--strict", help="Treat warnings as failure (CI-friendly).")] = False,
     staged: Annotated[bool, typer.Option("--staged/--all-files", help="Secret scan scope: staged files only (default) or all files.")] = True,
     max_findings: Annotated[int, typer.Option("--max-findings", help="Maximum suspicious token findings to keep.")] = 8,
@@ -823,10 +864,47 @@ def preflight(
         max_findings=max_findings,
         audit_log=Path(str(options["audit_log"])),
     )
+    risk_command = _resolve_preflight_command_text(command=command, plan_file=plan_file)
+    if risk_command:
+        dependency_summary = _collect_preflight_dependency_summary(timeout_sec=max(3, min(timeout_sec, 12)))
+        context_data = collect_preflight_risk_context(
+            command_text=risk_command,
+            context_name=context,
+            policy_file=Path(str(options.get("policy_file", ".data/lsre-policy.json"))),
+            audit_log=Path(str(options["audit_log"])),
+            incidents_file=Path(str(options.get("incident_file", Path(settings.data_dir) / "lsre-incident.json"))),
+            dependency_summary=dependency_summary,
+        )
+        risk = build_preflight_risk_result(
+            command_text=risk_command,
+            context_data=context_data,
+            source="heuristic",
+        )
+        risk_payload = risk.to_dict()
+        risk_payload["command"] = risk_command
+        risk_payload = _maybe_llm_enrich_preflight_risk(
+            command_text=risk_command,
+            context_data=context_data,
+            risk_payload=risk_payload,
+            provider=str(options.get("provider", "auto")),
+            model=str(options.get("model", settings.model_name)),
+        )
+        report["risk"] = risk_payload
+        if int(risk_payload.get("risk_score", 0) or 0) >= 70:
+            report["scope"]["approval_mode_escalated"] = "strict"
+            report["risk"]["approval_escalated"] = True
+            report["risk"]["next"] = "高风险变更，建议切换 strict 审批并绑定审批单号后执行。"
+        else:
+            report["risk"]["approval_escalated"] = False
     if as_json or (not _console):
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         _render_doctor_report(report)
+        if "risk" in report:
+            typer.echo("")
+            risk_payload = report.get("risk", {})
+            if isinstance(risk_payload, dict):
+                typer.echo(render_preflight_risk_payload(risk_payload))
     gate = report.get("gate", {})
     if strict and isinstance(gate, dict) and (not bool(gate.get("healthy", True))):
         raise typer.Exit(code=2)
@@ -1297,6 +1375,7 @@ def skill_run(
     apply: Annotated[bool, typer.Option("--apply", help="Include apply and verify commands.")] = False,
     execute: Annotated[bool, typer.Option("--execute", help="Execute commands. Default is dry-run.")] = False,
     auto_rollback: Annotated[bool, typer.Option("--auto-rollback/--no-auto-rollback", help="Auto-run rollback commands when apply flow fails.")] = True,
+    skip_preflight: Annotated[bool, typer.Option("--skip-preflight", help="Skip risk preflight scoring before apply execution.")] = False,
     timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="Command timeout seconds.")] = 20,
     evidence_file: Annotated[str, typer.Option("--evidence-file", help="Optional path to export execution evidence JSON.")] = "",
     skill_file: Annotated[str, typer.Option("--skill-file", help="Skill store JSON path.")] = settings.skill_store_file,
@@ -1308,6 +1387,38 @@ def skill_run(
         values = parse_skill_vars(list(var))
     except ValueError as exc:
         raise typer.BadParameter(_safe_exception_text(exc)) from exc
+    rendered_commands, _ = render_skill_commands(item, overrides=values)
+    preflight_risk_payload: dict[str, Any] | None = None
+    if apply and execute and (not skip_preflight):
+        candidate_commands = [
+            *list(rendered_commands.get("apply", [])),
+            *list(rendered_commands.get("verify", [])),
+            *list(rendered_commands.get("rollback", [])),
+        ]
+        command_text = next((str(x).strip() for x in candidate_commands if str(x).strip()), "")
+        if command_text:
+            dependency_summary = _collect_preflight_dependency_summary(timeout_sec=max(3, min(timeout_sec, 12)))
+            risk_context = collect_preflight_risk_context(
+                command_text=command_text,
+                context_name="",
+                policy_file=Path(".data/lsre-policy.json"),
+                audit_log=Path(".data/lsre-audit.jsonl"),
+                incidents_file=Path(str(Path(settings.data_dir) / "lsre-incident.json")),
+                dependency_summary=dependency_summary,
+            )
+            risk = build_preflight_risk_result(
+                command_text=command_text,
+                context_data=risk_context,
+                source="heuristic",
+            )
+            preflight_risk_payload = risk.to_dict()
+            preflight_risk_payload["command"] = command_text
+            if risk.risk_score >= 70:
+                typer.echo(render_preflight_risk_payload(preflight_risk_payload))
+                raise typer.BadParameter(
+                    "preflight blocked high-risk apply. "
+                    "请先走审批流程，或紧急情况下使用 --skip-preflight 显式绕过。"
+                )
     result = execute_skill_template(
         item,
         overrides=values,
@@ -1317,6 +1428,8 @@ def skill_run(
         auto_rollback_on_failure=auto_rollback,
     )
     payload = result.to_dict()
+    if preflight_risk_payload:
+        payload["preflight_risk"] = preflight_risk_payload
     if evidence_file.strip():
         _write_json_file(Path(evidence_file.strip()), payload)
     _render_skill_run_result(payload)
@@ -9739,6 +9852,67 @@ def _collect_preflight_report(
     }
     result["gate"] = _build_doctor_gate(result, strict=strict)
     return result
+
+
+def _resolve_preflight_command_text(*, command: str, plan_file: str) -> str:
+    direct = str(command or "").strip()
+    if direct:
+        return direct
+    path = Path(str(plan_file or "").strip()).expanduser()
+    if not path.exists():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    candidates: list[str] = []
+    for key in (
+        "apply_commands",
+        "verify_commands",
+        "rollback_commands",
+        "diagnose_commands",
+        "commands",
+    ):
+        rows = payload.get(key, [])
+        if isinstance(rows, list):
+            candidates.extend([str(x).strip() for x in rows if str(x).strip()])
+    plan = payload.get("plan", {})
+    if isinstance(plan, dict):
+        for key in ("apply_commands", "verify_commands", "rollback_commands", "diagnose_commands"):
+            rows = plan.get(key, [])
+            if isinstance(rows, list):
+                candidates.extend([str(x).strip() for x in rows if str(x).strip()])
+    if not candidates:
+        return ""
+    risk_order = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+    selected = candidates[0]
+    selected_rank = 0
+    for item in candidates:
+        argv = [x for x in item.split(" ") if x]
+        level = assess_command(argv, approval_mode="balanced").risk_level
+        rank = risk_order.get(level, 1)
+        if rank > selected_rank:
+            selected = item
+            selected_rank = rank
+    return selected
+
+
+def _collect_preflight_dependency_summary(*, timeout_sec: int) -> dict[str, Any]:
+    report = _collect_swarm_health_report(include_logs=False, tail=60, timeout_sec=max(2, timeout_sec))
+    summary = report.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    unhealthy = report.get("unhealthy_services", [])
+    bad_nodes = report.get("bad_nodes", [])
+    return {
+        "ok": bool(report.get("ok", False)),
+        "warn": int(summary.get("warn", 0) or 0),
+        "error": int(summary.get("error", 0) or 0),
+        "unhealthy_services": len(unhealthy) if isinstance(unhealthy, list) else 0,
+        "bad_nodes": len(bad_nodes) if isinstance(bad_nodes, list) else 0,
+    }
 
 
 def _safe_run_command(command: list[str], *, timeout_sec: int) -> dict[str, object]:
@@ -19858,6 +20032,101 @@ def _generate_impact_statement(
     return f"该操作将影响 {scope}，潜在影响范围为 {radius}，请确认业务窗口与回滚条件。"
 
 
+def _maybe_llm_enrich_preflight_risk(
+    *,
+    command_text: str,
+    context_data: dict[str, Any],
+    risk_payload: dict[str, Any],
+    provider: str,
+    model: str,
+) -> dict[str, Any]:
+    mode = str(provider or "auto").strip().lower()
+    if mode == "mock":
+        return risk_payload
+    prompt = (
+        "你是 SRE 变更风险分析器。仅输出 JSON，不要输出解释文字。\n"
+        "输出字段: risk_score(0-100), risk_factors([{factor,weight,detail}]), "
+        "blast_radius, recommended_time, safer_alternative。\n"
+        f"command: {command_text}\n"
+        f"context: {json.dumps(context_data, ensure_ascii=False)}\n"
+        f"baseline: {json.dumps(risk_payload, ensure_ascii=False)}\n"
+        "要求：在 baseline 基础上微调，不要缺字段。"
+    )
+    try:
+        _, resolved_model, llm = _build_cli_llm(provider=mode, model=model)
+        turn = asyncio.run(
+            llm.respond(
+                model=resolved_model,
+                tools=[],
+                system_prompt="You are a strict JSON generator.",
+                user_input=prompt,
+                text_stream=None,
+            )
+        )
+    except Exception:
+        return risk_payload
+    raw_text = str(turn.text or "").strip()
+    parsed = _extract_json_object(raw_text)
+    if not isinstance(parsed, dict):
+        return risk_payload
+    merged = dict(risk_payload)
+    if "risk_score" in parsed:
+        merged["risk_score"] = max(0, min(100, _safe_int(parsed.get("risk_score", merged.get("risk_score", 0)))))
+        merged["risk_level"] = _score_to_risk_level(int(merged["risk_score"]))
+    for key in ("blast_radius", "recommended_time", "safer_alternative"):
+        value = str(parsed.get(key, "")).strip()
+        if value:
+            merged[key] = value
+    factors = parsed.get("risk_factors", [])
+    if isinstance(factors, list):
+        normalized: list[dict[str, Any]] = []
+        for raw in factors[:10]:
+            if not isinstance(raw, dict):
+                continue
+            normalized.append(
+                {
+                    "factor": str(raw.get("factor", "")).strip()[:80],
+                    "weight": _safe_int(raw.get("weight", 0)),
+                    "detail": str(raw.get("detail", "")).strip()[:240],
+                }
+            )
+        if normalized:
+            merged["risk_factors"] = normalized
+    merged["source"] = f"llm:{mode}"
+    return merged
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    candidate = raw[start : end + 1]
+    try:
+        payload = json.loads(candidate)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _score_to_risk_level(score: int) -> str:
+    if score >= 85:
+        return "critical"
+    if score >= 70:
+        return "high"
+    if score >= 45:
+        return "medium"
+    return "low"
+
+
 def _write_text_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -19916,6 +20185,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "approve",
         "status",
         "brief",
+        "timeline",
         "scan",
         "swarm",
         "watch",
@@ -19992,6 +20262,7 @@ def _should_launch_default_tui(tokens: list[str]) -> bool:
         "approve",
         "status",
         "brief",
+        "timeline",
         "scan",
         "swarm",
         "watch",
@@ -20067,6 +20338,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "approve",
         "status",
         "brief",
+        "timeline",
         "scan",
         "swarm",
         "watch",

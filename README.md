@@ -91,9 +91,48 @@ lazysre skill run swarm-health
 # 执行并在失败时自动回滚，导出证据链
 lazysre skill run swarm-health --apply --execute --auto-rollback --evidence-file .data/skill-evidence.json
 
+# apply 前默认会做 preflight 风险评分（高风险会拦截）
+lazysre skill run swarm-health --apply --execute
+
+# 紧急情况可显式跳过 preflight
+lazysre skill run swarm-health --apply --execute --skip-preflight
+
 # 生成执行路径图（Mermaid）
 lazysre skill graph swarm-health --apply --output .data/swarm-skill-graph.md
 ```
+
+## 故障时间轴（Timeline）
+
+```bash
+# 自动读取 .data/skill-evidence.json 或最新 channel-runs artifact
+lazysre timeline
+
+# 指定证据文件
+lazysre timeline --evidence-file .data/skill-evidence.json
+
+# 指定 trace/incident 标识（从 .data/channel-runs 检索）
+lazysre timeline --incident-id trc-xxxx
+
+# 输出 Mermaid（可贴 GitHub/Confluence）
+lazysre timeline --evidence-file .data/skill-evidence.json --format mermaid
+
+# 对比两次故障
+lazysre timeline --evidence-file .data/a.json --compare .data/b.json --format json
+```
+
+支持阶段：`precheck / tool_call / llm_response / apply / verify / rollback`，并标注根因推断时刻、首次修复动作时刻与 `MTTD/MTTR`。
+
+## Preflight 风险评分
+
+```bash
+# 单命令风险评分（含 maintenance window、7d 成功率、依赖健康、历史故障）
+lazysre preflight --command "kubectl rollout restart deploy/payment" --context prod
+
+# 从修复计划文件抽取命令评分
+lazysre preflight --plan-file .data/remediation-plan.json --json
+```
+
+当 `risk_score >= 70` 时，会在输出中标记审批升级建议（strict/审批单号）。
 
 ## 模型与 Key 配置
 
