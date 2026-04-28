@@ -155,6 +155,12 @@ lazysre runbook show swarm-api-timeout-spike --generated --version v2
 
 # 对比两个版本
 lazysre runbook diff swarm-api-timeout-spike --version v1 --version v2
+
+# 执行 fix runbook 时默认 preflight 门禁（高风险阻断）
+lazysre runbook run payment-latency-fix --apply --execute
+
+# 紧急情况可显式跳过 preflight
+lazysre runbook run payment-latency-fix --apply --execute --skip-preflight
 ```
 
 生成 runbook 默认存储在 `~/.lazysre/runbooks/<name>/vN.yaml`，字段包含：

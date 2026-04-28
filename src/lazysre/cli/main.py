@@ -3905,6 +3905,7 @@ def runbook_run(
     ctx: typer.Context,
     name: Annotated[str, typer.Argument(help="Runbook name.")],
     apply: Annotated[bool, typer.Option("--apply", help="Apply generated fix steps (fix runbooks only).")] = False,
+    skip_preflight: Annotated[bool, typer.Option("--skip-preflight", help="Skip risk preflight scoring before apply execution.")] = False,
     var: Annotated[list[str], typer.Option("--var", "-v", help="Runbook variables in key=value format. Can be repeated.")] = [],
     extra: Annotated[str, typer.Option("--extra", help="Extra context appended to runbook instruction.")] = "",
     runbook_file: Annotated[str, typer.Option("--runbook-file", help="Runbook store JSON path.")] = settings.runbook_store_file,
@@ -3963,6 +3964,7 @@ def runbook_run(
         template=template,
         instruction=instruction,
         apply=apply,
+        skip_preflight=skip_preflight,
         options=options,
     )
 
@@ -4272,9 +4274,10 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
             "runbook_file": runbook_file,
         }
 
-    def _parse_run_args(args: list[str]) -> tuple[str, bool, list[str], str]:
+    def _parse_run_args(args: list[str]) -> tuple[str, bool, bool, list[str], str]:
         runbook_file = settings.runbook_store_file
         apply = False
+        skip_preflight = False
         cleaned: list[str] = []
         idx = 0
         while idx < len(args):
@@ -4286,10 +4289,14 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
                 apply = True
                 idx += 1
                 continue
+            if token == "--skip-preflight":
+                skip_preflight = True
+                idx += 1
+                continue
             cleaned.append(token)
             idx += 1
         var_items, extra = _parse_chat_runbook_var_extra(cleaned)
-        return runbook_file, apply, var_items, extra
+        return runbook_file, apply, skip_preflight, var_items, extra
 
     if subcmd in {"show", "render"}:
         if len(tokens) < 2:
@@ -4526,24 +4533,26 @@ def _parse_chat_runbook_command(tail: str) -> dict[str, object]:
 
     if subcmd == "run":
         if len(tokens) < 2:
-            raise ValueError("usage: /runbook run <name> [--apply] [k=v]")
-        runbook_file, apply, var_items, extra = _parse_run_args(tokens[2:])
+            raise ValueError("usage: /runbook run <name> [--apply] [--skip-preflight] [k=v]")
+        runbook_file, apply, skip_preflight, var_items, extra = _parse_run_args(tokens[2:])
         return {
             "action": "run",
             "name": tokens[1],
             "var_items": var_items,
             "extra": extra,
             "apply": apply,
+            "skip_preflight": skip_preflight,
             "runbook_file": runbook_file,
         }
 
-    runbook_file, apply, var_items, extra = _parse_run_args(tokens[1:])
+    runbook_file, apply, skip_preflight, var_items, extra = _parse_run_args(tokens[1:])
     return {
         "action": "run",
         "name": tokens[0],
         "var_items": var_items,
         "extra": extra,
         "apply": apply,
+        "skip_preflight": skip_preflight,
         "runbook_file": runbook_file,
     }
 
@@ -4931,10 +4940,37 @@ def _execute_runbook(
     template: RunbookTemplate,
     instruction: str,
     apply: bool,
+    skip_preflight: bool = False,
     options: dict[str, object],
 ) -> None:
     typer.echo(f"Running runbook: {template.name} ({template.mode}) - {template.title}")
     if template.mode == "fix":
+        if apply and bool(options.get("execute")) and (not skip_preflight):
+            command_candidates = _extract_command_candidates(instruction, max_items=5)
+            command_text = command_candidates[0] if command_candidates else instruction.strip()
+            if command_text:
+                dependency_summary = _collect_preflight_dependency_summary(timeout_sec=6)
+                risk_context = collect_preflight_risk_context(
+                    command_text=command_text,
+                    context_name="",
+                    policy_file=Path(".data/lsre-policy.json"),
+                    audit_log=Path(".data/lsre-audit.jsonl"),
+                    incidents_file=Path(str(Path(settings.data_dir) / "lsre-incident.json")),
+                    dependency_summary=dependency_summary,
+                )
+                risk = build_preflight_risk_result(
+                    command_text=command_text,
+                    context_data=risk_context,
+                    source="heuristic",
+                )
+                risk_payload = risk.to_dict()
+                risk_payload["command"] = command_text
+                if risk.risk_score >= 70:
+                    typer.echo(render_preflight_risk_payload(risk_payload))
+                    raise typer.BadParameter(
+                        "preflight blocked high-risk runbook apply. "
+                        "请先走审批流程，或紧急情况下使用 --skip-preflight 显式绕过。"
+                    )
         _run_fix(
             instruction=instruction,
             apply=apply,
@@ -12444,8 +12480,8 @@ def _render_chat_short_help() -> None:
         "- /runbook remove <name> [--yes]: 删除自定义 runbook",
         "- /runbook export --output <file> [--scope custom|effective]: 导出 runbook",
         "- /runbook import --input <file> [--merge|--replace]: 导入 runbook",
-        "- /runbook run <name> [--apply] [k=v]: 执行 runbook（fix 模板可直接 apply）",
-        "- /runbook <name> [--apply] [k=v]: 执行 runbook（简写）",
+        "- /runbook run <name> [--apply] [--skip-preflight] [k=v]: 执行 runbook（fix 模板可直接 apply）",
+        "- /runbook <name> [--apply] [--skip-preflight] [k=v]: 执行 runbook（简写）",
         "- /topology discover [--target prod] [--format rich|dot|json]: 自动发现服务依赖拓扑",
         "- /topology show <service>: 查看拓扑命中节点",
         "- /topology impact <service>: 分析上下游影响链",
@@ -16977,6 +17013,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 template=template,
                 instruction=instruction,
                 apply=bool(command.get("apply", False)),
+                skip_preflight=bool(command.get("skip_preflight", False)),
                 options=options,
             )
             continue
