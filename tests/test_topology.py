@@ -129,3 +129,52 @@ def test_cli_topology_discover_show_impact(tmp_path: Path, monkeypatch) -> None:
     assert i.exit_code == 0
     impact_payload = json.loads(i.stdout)
     assert "svc-gateway" in impact_payload["direct_dependents"]
+
+
+def test_cli_topology_impact_merges_policy_slo_hints(tmp_path: Path, monkeypatch) -> None:
+    import lazysre.cli.main as main_module
+
+    graph = TopologyGraph(
+        env="prod",
+        source="mock",
+        generated_at="2026-04-28T10:00:00+00:00",
+        nodes=[
+            {"id": "svc-gateway", "kind": "service", "health": "green"},
+            {"id": "svc-payment", "kind": "service", "health": "green"},
+        ],
+        edges=[{"source": "svc-gateway", "target": "svc-payment", "relation": "calls"}],
+        notes=[],
+    )
+    topo_path = tmp_path / "topology" / "prod.json"
+    topo_path.parent.mkdir(parents=True, exist_ok=True)
+    topo_path.write_text(json.dumps(graph.to_dict(), ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(main_module, "_topology_store_path", lambda env: topo_path)
+
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "tenants": {
+                    "default": {
+                        "environments": {
+                            "prod": {
+                                "slo_endpoints": {
+                                    "payment": [
+                                        {"endpoint": "https://api.example.com/payment/health"},
+                                        {"query": 'sum(rate(http_requests_total{service="payment",code=~"5.."}[5m]))'},
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+    i = runner.invoke(app, ["topology", "impact", "payment", "--env", "prod", "--policy-file", str(policy)])
+    assert i.exit_code == 0
+    payload = json.loads(i.stdout)
+    assert any("payment/health" in x for x in payload.get("policy_slo_hints", []))

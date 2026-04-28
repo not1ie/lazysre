@@ -185,6 +185,9 @@ lazysre topology show payment --env prod
 
 # 分析某服务故障影响链（默认 2 跳）
 lazysre topology impact payment --env prod --depth 2
+
+# 结合策略文件中的 SLO/SLA 端点定义，输出影响端点提示
+lazysre topology impact payment --env prod --policy-file .data/lsre-policy.json
 ```
 
 ## SLO 看护与预算燃烧

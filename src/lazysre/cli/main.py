@@ -486,6 +486,7 @@ def topology_impact(
     service_name: Annotated[str, typer.Argument(help="Service node id or keyword.")],
     env: Annotated[str, typer.Option("--env", help="Topology environment name.")] = "local",
     depth: Annotated[int, typer.Option("--depth", help="Transitive impact depth (max 4).")] = 2,
+    policy_file: Annotated[str, typer.Option("--policy-file", help="Policy file path for SLO/SLA endpoint hints.")] = ".data/lsre-policy.json",
 ) -> None:
     graph = _load_topology_graph(env)
     if graph is None:
@@ -495,6 +496,24 @@ def topology_impact(
         raise typer.BadParameter(f"service not found in topology: {service_name}")
     selected = hits[0]
     report = analyze_impact(graph, selected, depth=max(1, min(depth, 4)))
+    policy_hints = _policy_slo_endpoint_hints(
+        service_name=selected,
+        env=env,
+        policy_file=Path(policy_file).expanduser(),
+    )
+    if policy_hints:
+        merged = [str(x) for x in report.get("affected_slo_endpoints", []) if str(x).strip()]
+        merged.extend(policy_hints)
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for item in merged:
+            key = item.strip()
+            if (not key) or (key in seen):
+                continue
+            seen.add(key)
+            dedup.append(key)
+        report["affected_slo_endpoints"] = dedup[:24]
+        report["policy_slo_hints"] = policy_hints[:12]
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 
 
@@ -713,6 +732,118 @@ def _match_topology_nodes(graph: TopologyGraph, keyword: str) -> list[str]:
             items.append(node_id)
     items.sort()
     return items
+
+
+def _policy_slo_endpoint_hints(*, service_name: str, env: str, policy_file: Path) -> list[str]:
+    if not policy_file.exists():
+        return []
+    try:
+        payload = json.loads(policy_file.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    svc_tokens = _service_tokens(service_name)
+    nodes: list[Any] = []
+    nodes.extend(
+        [
+            payload.get("slo_endpoints"),
+            payload.get("sla_endpoints"),
+            payload.get("service_slo_endpoints"),
+        ]
+    )
+    tenants = payload.get("tenants")
+    if isinstance(tenants, dict):
+        for tenant_cfg in tenants.values():
+            if not isinstance(tenant_cfg, dict):
+                continue
+            envs = tenant_cfg.get("environments")
+            if not isinstance(envs, dict):
+                continue
+            selected = envs.get(env) or envs.get(str(env).strip().lower()) or envs.get("prod")
+            if not isinstance(selected, dict):
+                continue
+            nodes.extend(
+                [
+                    selected.get("slo_endpoints"),
+                    selected.get("sla_endpoints"),
+                    selected.get("service_slo_endpoints"),
+                ]
+            )
+    out: list[str] = []
+    seen: set[str] = set()
+    for node in nodes:
+        for hint in _extract_slo_hints_from_node(node=node, service_tokens=svc_tokens):
+            key = hint.strip()
+            if (not key) or (key in seen):
+                continue
+            seen.add(key)
+            out.append(key)
+    return out[:24]
+
+
+def _service_tokens(service_name: str) -> set[str]:
+    raw = str(service_name or "").strip().lower()
+    if not raw:
+        return set()
+    tokens: set[str] = {raw}
+    parts = [x for x in re.split(r"[:/_-]", raw) if x]
+    tokens.update(parts)
+    if "/" in raw:
+        tokens.add(raw.split("/")[-1])
+    if ":" in raw:
+        tokens.add(raw.split(":")[-1])
+    return {x for x in tokens if x}
+
+
+def _extract_slo_hints_from_node(*, node: Any, service_tokens: set[str]) -> list[str]:
+    out: list[str] = []
+
+    def _match_service(value: str) -> bool:
+        lowered = str(value or "").strip().lower()
+        if not lowered:
+            return False
+        return any(token in lowered for token in service_tokens)
+
+    def _add(value: str) -> None:
+        text = str(value or "").strip()
+        if text:
+            out.append(text)
+
+    if isinstance(node, str):
+        if _match_service(node):
+            _add(node)
+        return out
+    if isinstance(node, list):
+        for item in node:
+            out.extend(_extract_slo_hints_from_node(node=item, service_tokens=service_tokens))
+        return out
+    if isinstance(node, dict):
+        for key, value in node.items():
+            key_text = str(key or "")
+            if _match_service(key_text):
+                if isinstance(value, str):
+                    _add(value)
+                elif isinstance(value, list):
+                    for row in value:
+                        if isinstance(row, str):
+                            _add(row)
+                        elif isinstance(row, dict):
+                            endpoint = str(row.get("endpoint") or row.get("name") or row.get("query") or "").strip()
+                            if endpoint:
+                                _add(endpoint)
+                elif isinstance(value, dict):
+                    endpoint = str(value.get("endpoint") or value.get("name") or value.get("query") or "").strip()
+                    if endpoint:
+                        _add(endpoint)
+            if isinstance(value, dict):
+                svc = str(value.get("service") or value.get("service_name") or value.get("name") or "").strip()
+                endpoint = str(value.get("endpoint") or value.get("metric") or value.get("query") or "").strip()
+                if svc and endpoint and _match_service(svc):
+                    _add(endpoint)
+            if isinstance(value, (dict, list)):
+                out.extend(_extract_slo_hints_from_node(node=value, service_tokens=service_tokens))
+    return out
 
 
 def _evaluate_slo_samples(items: list[Any], *, windows: list[str]) -> list[Any]:
@@ -4618,13 +4749,13 @@ def _parse_chat_topology_command(tail: str) -> dict[str, object]:
     idx = 0
     while idx < len(args):
         token = args[idx]
-        if token in {"--target", "--format", "--output", "--env", "--depth"}:
+        if token in {"--target", "--format", "--output", "--env", "--depth", "--policy-file"}:
             if idx + 1 >= len(args):
                 raise ValueError(f"missing value for {token}")
             parsed[token.lstrip("-").replace("-", "_")] = args[idx + 1]
             idx += 2
             continue
-        if "=" in token and token.split("=", 1)[0] in {"--target", "--format", "--output", "--env", "--depth"}:
+        if "=" in token and token.split("=", 1)[0] in {"--target", "--format", "--output", "--env", "--depth", "--policy-file"}:
             key, value = token.split("=", 1)
             parsed[key.lstrip("-").replace("-", "_")] = value
             idx += 1
@@ -12484,7 +12615,7 @@ def _render_chat_short_help() -> None:
         "- /runbook <name> [--apply] [--skip-preflight] [k=v]: 执行 runbook（简写）",
         "- /topology discover [--target prod] [--format rich|dot|json]: 自动发现服务依赖拓扑",
         "- /topology show <service>: 查看拓扑命中节点",
-        "- /topology impact <service>: 分析上下游影响链",
+        "- /topology impact <service> [--policy-file .data/lsre-policy.json]: 分析上下游影响链 + SLO端点提示",
         "- /slo init|status|burn-rate|alert: SLO 管理、预算燃烧率与告警",
         "- /report [--format json] [--no-doctor] [--push-to-git]: 导出复盘报告",
         "- /incident status|open|note|assign|severity|timeline|close|list|export: 事故生命周期管理",
@@ -17043,6 +17174,7 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                         service_name=str(command.get("service_name", "")),
                         env=str(command.get("env", "local")),
                         depth=int(command.get("depth", 2) or 2),
+                        policy_file=str(command.get("policy_file", ".data/lsre-policy.json")),
                     )
             except typer.BadParameter as exc:
                 typer.echo(f"topology 执行失败: {_safe_exception_text(exc)}")

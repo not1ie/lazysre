@@ -10,8 +10,9 @@ def test_parse_chat_slo_command_basic() -> None:
 
 
 def test_parse_chat_topology_command_basic() -> None:
-    parsed = _parse_chat_topology_command("impact payment --env prod --depth 3")
+    parsed = _parse_chat_topology_command("impact payment --env prod --depth 3 --policy-file /tmp/policy.json")
     assert parsed["action"] == "impact"
     assert parsed["service_name"] == "payment"
     assert parsed["env"] == "prod"
     assert parsed["depth"] == "3"
+    assert parsed["policy_file"] == "/tmp/policy.json"
