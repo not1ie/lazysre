@@ -132,3 +132,83 @@ def test_timeline_cli_json_and_compare(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["count"] == 2
     assert payload["comparison"]["delta_failed_events"] == 1
+    assert payload["comparison"]["candidates"][0]["delta_failed_events"] == 1
+
+
+def test_timeline_cli_json_multi_compare(tmp_path: Path) -> None:
+    file1 = tmp_path / "base.json"
+    file2 = tmp_path / "cand-a.json"
+    file3 = tmp_path / "cand-b.json"
+    file1.write_text(
+        json.dumps(
+            {
+                "outputs": [
+                    {
+                        "phase": "precheck",
+                        "command": "docker service ps api",
+                        "exit_code": 0,
+                        "started_at": "2026-04-28T10:00:00+00:00",
+                        "finished_at": "2026-04-28T10:00:02+00:00",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    file2.write_text(
+        json.dumps(
+            {
+                "outputs": [
+                    {
+                        "phase": "precheck",
+                        "command": "docker service ps api",
+                        "exit_code": 1,
+                        "started_at": "2026-04-28T10:00:00+00:00",
+                        "finished_at": "2026-04-28T10:00:03+00:00",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    file3.write_text(
+        json.dumps(
+            {
+                "outputs": [
+                    {
+                        "phase": "precheck",
+                        "command": "docker service ps api",
+                        "exit_code": 0,
+                        "started_at": "2026-04-28T10:00:00+00:00",
+                        "finished_at": "2026-04-28T10:00:01+00:00",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "timeline",
+            "--evidence-file",
+            str(file1),
+            "--compare",
+            str(file2),
+            "--compare",
+            str(file3),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 3
+    assert payload["comparison"]["baseline"] == "base"
+    assert len(payload["comparison"]["candidates"]) == 2
+    assert payload["comparison"]["candidates"][0]["candidate"] == "cand-a"
+    assert payload["comparison"]["candidates"][1]["candidate"] == "cand-b"

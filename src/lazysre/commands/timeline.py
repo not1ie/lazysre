@@ -40,10 +40,18 @@ class TimelineDataset:
     mttr_sec: float | None
 
     def to_dict(self) -> dict[str, Any]:
+        phase_counts: dict[str, int] = {}
+        for event in self.events:
+            phase_counts[event.phase] = phase_counts.get(event.phase, 0) + 1
+        failed_events = sum(1 for event in self.events if event.status == "failed")
+        total_duration_ms = sum(max(0, int(event.duration_ms)) for event in self.events)
         return {
             "label": self.label,
             "source_path": self.source_path,
             "event_count": len(self.events),
+            "failed_event_count": failed_events,
+            "total_duration_ms": total_duration_ms,
+            "phase_counts": phase_counts,
             "root_cause_at": self.root_cause_at.isoformat() if self.root_cause_at else None,
             "first_fix_at": self.first_fix_at.isoformat() if self.first_fix_at else None,
             "mttd_sec": self.mttd_sec,
@@ -112,6 +120,12 @@ def render_timeline_mermaid(datasets: list[TimelineDataset]) -> str:
             marks = f" ({'/'.join(event.marks)})" if event.marks else ""
             name = _escape_mermaid_text(f"{idx}. {event.phase} {event.status}{marks}")
             lines.append(f"  {name} :{status_tag}, {start}, {sec}s")
+        if ds.root_cause_at:
+            root_at = ds.root_cause_at.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S")
+            lines.append(f"  {_escape_mermaid_text('Root Cause Inferred')} :milestone, {root_at}, 1s")
+        if ds.first_fix_at:
+            fix_at = ds.first_fix_at.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S")
+            lines.append(f"  {_escape_mermaid_text('First Fix Action')} :milestone, {fix_at}, 1s")
     lines.append("```")
     return "\n".join(lines)
 
@@ -146,8 +160,25 @@ def render_timeline_rich_text(datasets: list[TimelineDataset]) -> str:
     comparison = _build_comparison(datasets)
     if comparison:
         rows.append("[comparison]")
-        for key, value in comparison.items():
-            rows.append(f"- {key}: {value}")
+        baseline = str(comparison.get("baseline", "")).strip()
+        if baseline:
+            rows.append(f"- baseline: {baseline}")
+        rows.append(f"- candidates: {len(comparison.get('candidates', []))}")
+        if "best_mttr_candidate" in comparison:
+            rows.append(f"- best_mttr_candidate: {comparison.get('best_mttr_candidate')}")
+        if "worst_mttr_candidate" in comparison:
+            rows.append(f"- worst_mttr_candidate: {comparison.get('worst_mttr_candidate')}")
+        for item in comparison.get("candidates", []):
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                "- "
+                f"{item.get('candidate', '-')}: "
+                f"delta_events={item.get('delta_events')} "
+                f"delta_failed={item.get('delta_failed_events')} "
+                f"delta_mttd={_fmt_sec(item.get('delta_mttd_sec'))} "
+                f"delta_mttr={_fmt_sec(item.get('delta_mttr_sec'))}"
+            )
     return "\n".join(rows).strip()
 
 
@@ -393,18 +424,38 @@ def _compute_metrics(
 def _build_comparison(datasets: list[TimelineDataset]) -> dict[str, Any]:
     if len(datasets) < 2:
         return {}
-    first = datasets[0]
-    second = datasets[1]
-    first_fail = sum(1 for x in first.events if x.status == "failed")
-    second_fail = sum(1 for x in second.events if x.status == "failed")
-    return {
-        "baseline": first.label,
-        "candidate": second.label,
-        "delta_events": len(second.events) - len(first.events),
-        "delta_failed_events": second_fail - first_fail,
-        "delta_mttd_sec": _delta(second.mttd_sec, first.mttd_sec),
-        "delta_mttr_sec": _delta(second.mttr_sec, first.mttr_sec),
+    baseline = datasets[0]
+    baseline_fail = sum(1 for x in baseline.events if x.status == "failed")
+    candidates: list[dict[str, Any]] = []
+    for candidate in datasets[1:]:
+        candidate_fail = sum(1 for x in candidate.events if x.status == "failed")
+        candidates.append(
+            {
+                "candidate": candidate.label,
+                "delta_events": len(candidate.events) - len(baseline.events),
+                "delta_failed_events": candidate_fail - baseline_fail,
+                "delta_mttd_sec": _delta(candidate.mttd_sec, baseline.mttd_sec),
+                "delta_mttr_sec": _delta(candidate.mttr_sec, baseline.mttr_sec),
+            }
+        )
+    out: dict[str, Any] = {
+        "baseline": baseline.label,
+        "candidates": candidates,
     }
+    if candidates:
+        mttr_rankable = [x for x in candidates if isinstance(x.get("delta_mttr_sec"), (int, float))]
+        if mttr_rankable:
+            best = min(mttr_rankable, key=lambda x: float(x.get("delta_mttr_sec", 0.0)))
+            worst = max(mttr_rankable, key=lambda x: float(x.get("delta_mttr_sec", 0.0)))
+            out["best_mttr_candidate"] = best.get("candidate")
+            out["worst_mttr_candidate"] = worst.get("candidate")
+        first = candidates[0]
+        out["candidate"] = first.get("candidate")
+        out["delta_events"] = first.get("delta_events")
+        out["delta_failed_events"] = first.get("delta_failed_events")
+        out["delta_mttd_sec"] = first.get("delta_mttd_sec")
+        out["delta_mttr_sec"] = first.get("delta_mttr_sec")
+    return out
 
 
 def _delta(current: float | None, baseline: float | None) -> float | None:

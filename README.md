@@ -118,6 +118,9 @@ lazysre timeline --evidence-file .data/skill-evidence.json --format mermaid
 
 # 对比两次故障
 lazysre timeline --evidence-file .data/a.json --compare .data/b.json --format json
+
+# 多次同类故障横向对比（基线 + 多候选）
+lazysre timeline --evidence-file .data/base.json --compare .data/case1.json --compare .data/case2.json --format rich
 ```
 
 支持阶段：`precheck / tool_call / llm_response / apply / verify / rollback`，并标注根因推断时刻、首次修复动作时刻与 `MTTD/MTTR`。
