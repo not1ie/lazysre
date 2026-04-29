@@ -53,6 +53,10 @@ from lazysre.cli.policy import PolicyDecision, assess_command, build_risk_report
 from lazysre.cli.policy_center import PolicyCenter
 from lazysre.cli.session import SessionStore
 from lazysre.cli.memory import IncidentMemoryStore, MemoryCase, format_memory_context
+from lazysre.cli.knowledge import (
+    KnowledgeBaseStore,
+    format_knowledge_context,
+)
 from lazysre.cli.incident import IncidentStore, IncidentRecord, render_incident_markdown
 from lazysre.cli.secrets import SecretStore
 from lazysre.cli.runbook import (
@@ -158,6 +162,7 @@ target_app = typer.Typer(help="Target environment profile management.")
 target_profile_app = typer.Typer(help="Multi-cluster target profile management.")
 history_app = typer.Typer(help="Session history management.")
 memory_app = typer.Typer(help="Long-term incident memory management.")
+kb_app = typer.Typer(help="Internal knowledge base ingestion and retrieval.")
 incident_app = typer.Typer(help="Incident lifecycle management.")
 policy_app = typer.Typer(help="Multi-tenant policy center and guardrails.")
 approval_app = typer.Typer(help="Approval ticket lifecycle for high-risk execution.")
@@ -2993,8 +2998,11 @@ def _run_once(
     session_hint = session.build_context_hint(instruction)
     dialogue_context = session.build_dialogue_context(max_chars=2200)
     memory_context = _build_memory_context(instruction)
+    knowledge_context = _build_knowledge_context(instruction)
     topology_context = _build_topology_context(instruction)
     memory_plus = memory_context
+    if knowledge_context:
+        memory_plus = f"{memory_plus}\n\n[knowledge]\n{knowledge_context}".strip()
     if topology_context:
         memory_plus = f"{memory_plus}\n\n[topology]\n{topology_context}".strip()
     prompt = instruction
@@ -3004,6 +3012,8 @@ def _run_once(
         prompt = f"{prompt}\n\n[dialogue]\n{dialogue_context}"
     if memory_context:
         prompt = f"{prompt}\n\n[memory]\n{memory_context}"
+    if knowledge_context:
+        prompt = f"{prompt}\n\n[knowledge]\n{knowledge_context}"
     if topology_context:
         prompt = f"{prompt}\n\n[topology]\n{topology_context}"
     prompt = context_window.fit_text(prompt, max_chars=9000)
@@ -3122,8 +3132,11 @@ def _run_fix(
     session_hint = session.build_context_hint(instruction)
     dialogue_context = session.build_dialogue_context(max_chars=2200)
     memory_context = _build_memory_context(instruction)
+    knowledge_context = _build_knowledge_context(instruction)
     topology_context = _build_topology_context(instruction)
     memory_plus = memory_context
+    if knowledge_context:
+        memory_plus = f"{memory_plus}\n\n[knowledge]\n{knowledge_context}".strip()
     if topology_context:
         memory_plus = f"{memory_plus}\n\n[topology]\n{topology_context}".strip()
     prompt = compose_fix_instruction(instruction)
@@ -3133,6 +3146,8 @@ def _run_fix(
         prompt = f"{prompt}\n\n[dialogue]\n{dialogue_context}"
     if memory_context:
         prompt = f"{prompt}\n\n[memory]\n{memory_context}"
+    if knowledge_context:
+        prompt = f"{prompt}\n\n[knowledge]\n{knowledge_context}"
     if topology_context:
         prompt = f"{prompt}\n\n[topology]\n{topology_context}"
     watch_context = _build_latest_watch_context(instruction)
@@ -3751,6 +3766,145 @@ def memory_recommend(
         "suggested_next": top.fix_commands[0] if top.fix_commands else "",
     }
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@kb_app.command("add")
+def kb_add(
+    source: Annotated[str, typer.Argument(help="File or directory to ingest into internal knowledge base.")],
+    title: Annotated[str, typer.Option("--title", help="Optional title override.")] = "",
+    chunk_size: Annotated[int, typer.Option("--chunk-size", help="Chunk size in characters.")] = 900,
+    overlap: Annotated[int, typer.Option("--overlap", help="Chunk overlap in characters.")] = 120,
+) -> None:
+    store = _open_knowledge_store()
+    if not store:
+        raise typer.BadParameter("knowledge store is unavailable.")
+    source_path = Path(source).expanduser()
+    result = store.ingest_path(
+        source_path,
+        title=title.strip(),
+        chunk_size=max(200, min(chunk_size, 3000)),
+        overlap=max(0, min(overlap, 1200)),
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "source": str(source_path),
+                "documents": int(result.get("documents", 0)),
+                "chunks": int(result.get("chunks", 0)),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+@kb_app.command("list")
+def kb_list(
+    limit: Annotated[int, typer.Option("--limit", help="Number of docs to list.")] = 20,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = _open_knowledge_store()
+    if not store:
+        raise typer.BadParameter("knowledge store is unavailable.")
+    rows = store.list_docs(limit=limit)
+    if as_json or (not _console):
+        payload = [
+            {
+                "id": item.id,
+                "created_at": item.created_at,
+                "title": item.title,
+                "source_path": item.source_path,
+                "chunk_count": item.chunk_count,
+                "metadata": item.metadata,
+            }
+            for item in rows
+        ]
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    table = Table(title="Knowledge Base Docs")
+    table.add_column("id", style="cyan", no_wrap=True)
+    table.add_column("title", style="green")
+    table.add_column("chunks", justify="right")
+    table.add_column("source", overflow="fold")
+    for item in rows:
+        table.add_row(str(item.id), item.title[:80], str(item.chunk_count), item.source_path)
+    _console.print(table)
+
+
+@kb_app.command("search")
+def kb_search(
+    query: Annotated[str, typer.Argument(help="Query to search internal knowledge base.")],
+    limit: Annotated[int, typer.Option("--limit", help="Max chunks to return.")] = 5,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = _open_knowledge_store()
+    if not store:
+        raise typer.BadParameter("knowledge store is unavailable.")
+    rows = store.search(query, limit=limit)
+    if as_json or (not _console):
+        payload = [
+            {
+                "doc_id": item.doc_id,
+                "title": item.title,
+                "source_path": item.source_path,
+                "chunk_id": item.chunk_id,
+                "score": round(item.score, 4),
+                "excerpt": item.excerpt,
+                "metadata": item.metadata,
+            }
+            for item in rows
+        ]
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    if not rows:
+        typer.echo("No knowledge hits.")
+        return
+    table = Table(title=f"Knowledge Search: {query}")
+    table.add_column("score", style="cyan", no_wrap=True)
+    table.add_column("doc", style="green")
+    table.add_column("source", overflow="fold")
+    table.add_column("excerpt", overflow="fold")
+    for item in rows:
+        table.add_row(f"{item.score:.2f}", item.title[:80], item.source_path, item.excerpt[:160])
+    _console.print(table)
+
+
+@kb_app.command("show")
+def kb_show(
+    doc_id: Annotated[int, typer.Argument(help="Knowledge document id.")],
+    chunk_limit: Annotated[int, typer.Option("--chunk-limit", help="Number of chunks to preview.")] = 6,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = _open_knowledge_store()
+    if not store:
+        raise typer.BadParameter("knowledge store is unavailable.")
+    item = store.get_doc(doc_id)
+    if not item:
+        raise typer.BadParameter(f"knowledge doc not found: {doc_id}")
+    chunks = store.get_doc_chunks(doc_id, limit=chunk_limit)
+    payload = {
+        "id": item.id,
+        "created_at": item.created_at,
+        "title": item.title,
+        "source_path": item.source_path,
+        "chunk_count": item.chunk_count,
+        "metadata": item.metadata,
+        "chunks": chunks,
+    }
+    if as_json or (not _console):
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    lines = [
+        f"id: {item.id}",
+        f"title: {item.title}",
+        f"source: {item.source_path}",
+        f"chunks: {item.chunk_count}",
+        "",
+        "preview:",
+    ]
+    for idx, chunk in enumerate(chunks, 1):
+        lines.append(f"[{idx}] {chunk[:300]}")
+    _console.print(Panel("\n".join(lines), title="Knowledge Doc", border_style="cyan"))
 
 
 @policy_app.command("init")
@@ -5592,6 +5746,7 @@ target_app.add_typer(target_profile_app, name="profile")
 app.add_typer(target_app, name="target")
 app.add_typer(history_app, name="history")
 app.add_typer(memory_app, name="memory")
+app.add_typer(kb_app, name="kb")
 app.add_typer(incident_app, name="incident")
 app.add_typer(policy_app, name="policy")
 app.add_typer(approval_app, name="approval")
@@ -6047,6 +6202,8 @@ def _collect_runtime_status(
     target_store = TargetEnvStore(profile_file)
     target = target_store.load()
     memory_db = _resolve_memory_db_path()
+    knowledge_db = _resolve_knowledge_db_path()
+    knowledge_rows = _count_knowledge_rows(knowledge_db)
     active_profile = ClusterProfileStore.default().get_active()
 
     snapshot: dict[str, object] = {
@@ -6063,6 +6220,11 @@ def _collect_runtime_status(
         "memory": {
             "db_path": str(memory_db),
             "cases": _count_memory_cases(memory_db),
+        },
+        "knowledge": {
+            "db_path": str(knowledge_db),
+            "docs": int(knowledge_rows.get("docs", 0)),
+            "chunks": int(knowledge_rows.get("chunks", 0)),
         },
     }
 
@@ -10097,6 +10259,10 @@ def _default_memory_db_path() -> Path:
     return Path.home() / ".lazysre" / "history_db"
 
 
+def _default_knowledge_db_path() -> Path:
+    return Path.home() / ".lazysre" / "knowledge_db"
+
+
 def _resolve_memory_db_path() -> Path:
     primary = _default_memory_db_path()
     try:
@@ -10108,9 +10274,27 @@ def _resolve_memory_db_path() -> Path:
         return fallback
 
 
+def _resolve_knowledge_db_path() -> Path:
+    primary = _default_knowledge_db_path()
+    try:
+        primary.parent.mkdir(parents=True, exist_ok=True)
+        return primary
+    except Exception:
+        fallback = Path(".data/lsre-knowledge_db")
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 def _open_incident_memory_store() -> IncidentMemoryStore | None:
     try:
         return IncidentMemoryStore(_resolve_memory_db_path())
+    except Exception:
+        return None
+
+
+def _open_knowledge_store() -> KnowledgeBaseStore | None:
+    try:
+        return KnowledgeBaseStore(_resolve_knowledge_db_path())
     except Exception:
         return None
 
@@ -10124,6 +10308,21 @@ def _count_memory_cases(path: Path) -> int:
             return int(row[0]) if row else 0
     except Exception:
         return 0
+
+
+def _count_knowledge_rows(path: Path) -> dict[str, int]:
+    if not path.exists():
+        return {"docs": 0, "chunks": 0}
+    try:
+        with sqlite3.connect(path) as conn:
+            docs_row = conn.execute("SELECT COUNT(*) FROM kb_docs").fetchone()
+            chunks_row = conn.execute("SELECT COUNT(*) FROM kb_chunks").fetchone()
+            return {
+                "docs": int(docs_row[0]) if docs_row else 0,
+                "chunks": int(chunks_row[0]) if chunks_row else 0,
+            }
+    except Exception:
+        return {"docs": 0, "chunks": 0}
 
 
 def _read_last_fix_plan_summary(path: Path) -> dict[str, object]:
@@ -13242,6 +13441,8 @@ def _render_chat_short_help() -> None:
         "- 自然语言策略：先只跑只读步骤再执行写操作 / 解释第2步为什么执行",
         "- /memory: 查看最近故障记忆",
         "- /memory <query>: 检索相似历史案例",
+        "- /kb add <file|dir>: 导入内部知识库文档",
+        "- /kb <query>: 检索内部知识库",
         "- TUI 里可用 Up/Down 浏览输入历史（支持前缀筛选），Ctrl-L 或 /clear 清空屏幕，1-4/F2 切换面板，F3 切换 UI",
         "- exit / quit: 退出",
     ]
@@ -16890,6 +17091,7 @@ _KNOWN_SLASH_COMMANDS: tuple[str, ...] = (
     "approve",
     "undo",
     "memory",
+    "kb",
     "apply",
     "activity",
     "focus",
@@ -17947,6 +18149,40 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
             else:
                 rows = store.list_recent(limit=8)
                 _render_memory_cases(rows, title="Incident Memory (Recent)")
+            continue
+        if text.lower().startswith("/kb"):
+            tail = text[len("/kb") :].strip()
+            store = _open_knowledge_store()
+            if not store:
+                typer.echo("knowledge store is unavailable.")
+                continue
+            if not tail:
+                kb_list(limit=12, as_json=False)
+                continue
+            lowered = tail.lower()
+            if lowered.startswith("add "):
+                source = tail[4:].strip()
+                if not source:
+                    typer.echo("usage: /kb add <file|dir>")
+                    continue
+                try:
+                    kb_add(source=source, title="", chunk_size=900, overlap=120)
+                except typer.BadParameter as exc:
+                    typer.echo(f"kb add failed: {_safe_exception_text(exc)}")
+                continue
+            if lowered.startswith("show "):
+                doc_text = tail[5:].strip()
+                try:
+                    doc_id = int(doc_text)
+                except Exception:
+                    typer.echo("usage: /kb show <doc_id>")
+                    continue
+                try:
+                    kb_show(doc_id=doc_id, chunk_limit=6, as_json=False)
+                except typer.BadParameter as exc:
+                    typer.echo(f"kb show failed: {_safe_exception_text(exc)}")
+                continue
+            kb_search(query=tail, limit=5, as_json=False)
             continue
         if text.lower() in {"/apply", "/apply-last"}:
             _apply_last_fix_plan(
@@ -21426,6 +21662,17 @@ def _build_memory_context(instruction: str) -> str:
         return ""
 
 
+def _build_knowledge_context(instruction: str) -> str:
+    try:
+        store = _open_knowledge_store()
+        if not store:
+            return ""
+        hits = store.search(instruction, limit=3)
+        return format_knowledge_context(hits)
+    except Exception:
+        return ""
+
+
 def _build_topology_context(instruction: str, *, env: str = "local") -> str:
     graph = _load_topology_graph(env)
     if graph is None:
@@ -21792,6 +22039,7 @@ def _rewrite_argv_for_default_run(argv: list[str]) -> None:
         "target",
         "history",
         "memory",
+        "kb",
         "version",
         "--help",
         "--version",
@@ -21871,6 +22119,7 @@ def _should_launch_default_tui(tokens: list[str]) -> bool:
         "target",
         "history",
         "memory",
+        "kb",
         "version",
         "--help",
         "--version",
@@ -21949,6 +22198,7 @@ def _should_launch_assistant(tokens: list[str]) -> bool:
         "target",
         "history",
         "memory",
+        "kb",
         "version",
         "--help",
         "--version",

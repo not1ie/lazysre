@@ -229,6 +229,30 @@ lazysre login --provider kimi
 lazysre status
 ```
 
+## 内部知识库（RAG）
+
+可把内部 SOP、故障复盘、值班手册、服务说明导入本地知识库，后续诊断时会自动注入相关上下文。
+
+```bash
+# 导入单文件或目录（支持 md/txt/log/json/yaml/conf）
+lazysre kb add ./docs
+lazysre kb add ./runbooks/payment.md --title "payment runbook"
+
+# 查看已导入文档
+lazysre kb list --json
+
+# 检索知识片段
+lazysre kb search "swarm 副本不足" --json
+
+# 查看文档详情与分片预览
+lazysre kb show 1 --json
+```
+
+说明：
+- 知识库默认路径：`~/.lazysre/knowledge_db`
+- 数据本地落盘，不会提交到 git（除非你手动 add）
+- 在 `lazysre` / `lazysre chat` / `lazysre run` / `lazysre fix` 里，自然语言诊断会自动参考命中知识片段
+
 ## IM 网关（替代终端对话入口）
 
 ```bash
