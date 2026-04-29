@@ -133,3 +133,46 @@ def test_knowledge_store_delete_and_prune_and_stats(tmp_path: Path) -> None:
     stats_after = store.stats()
     assert stats_after["docs"] == 0
     assert stats_after["chunks"] == 0
+
+
+def test_knowledge_store_rebuild_dedup_and_drop_missing(tmp_path: Path) -> None:
+    db = tmp_path / "kb.db"
+    source = tmp_path / "dup.md"
+    source.write_text("version one", encoding="utf-8")
+    store = KnowledgeBaseStore(db)
+    store.ingest_path(source)
+    store.ingest_path(source, title="dup-v2")
+    # Force a legacy duplicate row by manually inserting another record.
+    with store._connect() as conn:  # noqa: SLF001 - test-only direct DB shaping
+        conn.execute(
+            """
+            INSERT INTO kb_docs (created_at, updated_at, title, source_path, content_hash, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "legacy-dup",
+                str(source),
+                "",
+                "{}",
+            ),
+        )
+        conn.commit()
+    docs_before = store.list_docs(limit=10)
+    assert len(docs_before) >= 2
+
+    source.write_text("version two", encoding="utf-8")
+    rebuilt = store.rebuild(chunk_size=300, overlap=50, drop_missing=False)
+    assert rebuilt["scanned"] >= 1
+    assert rebuilt["deleted"] >= 1
+    assert rebuilt["updated"] >= 1
+    docs_after = store.list_docs(limit=10)
+    assert len(docs_after) == 1
+
+    source.unlink()
+    rebuilt_drop = store.rebuild(drop_missing=True)
+    assert rebuilt_drop["missing"] >= 1
+    assert rebuilt_drop["deleted"] >= 1
+    final_stats = store.stats()
+    assert final_stats["docs"] == 0

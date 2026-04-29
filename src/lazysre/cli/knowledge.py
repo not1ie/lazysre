@@ -267,6 +267,84 @@ class KnowledgeBaseStore:
             conn.commit()
         return {"pruned_docs": len(remove_ids), "pruned_chunks": pruned_chunks}
 
+    def rebuild(
+        self,
+        *,
+        chunk_size: int = 900,
+        overlap: int = 120,
+        drop_missing: bool = False,
+    ) -> dict[str, int]:
+        size = max(200, min(int(chunk_size), 3000))
+        ov = max(0, min(int(overlap), 1200))
+        scanned = 0
+        added = 0
+        updated = 0
+        skipped = 0
+        missing = 0
+        deleted = 0
+        total_chunks = 0
+        dedup_deleted = self._deduplicate_source_docs()
+        if dedup_deleted > 0:
+            deleted += dedup_deleted
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, source_path
+                FROM kb_docs
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        for row in rows:
+            scanned += 1
+            doc_id = int(row["id"])
+            title = str(row["title"] or "").strip()
+            source_path = str(row["source_path"] or "").strip()
+            path = Path(source_path).expanduser()
+            if not source_path or (not path.exists()):
+                missing += 1
+                if drop_missing:
+                    removed = self.delete_doc(doc_id)
+                    deleted += int(removed.get("deleted_docs", 0))
+                continue
+            text = _read_text_file(path)
+            if not text.strip():
+                skipped += 1
+                continue
+            chunks = _split_text_chunks(text, chunk_size=size, overlap=ov)
+            if not chunks:
+                skipped += 1
+                continue
+            content_hash = _sha256_text(text)
+            metadata = {
+                "source_path": str(path),
+                "bytes": path.stat().st_size if path.exists() else 0,
+                "content_hash": content_hash,
+            }
+            state = self._upsert_doc_with_chunks(
+                title=title or path.name,
+                source_path=str(path),
+                content_hash=content_hash,
+                metadata=metadata,
+                chunks=chunks,
+            )
+            if state == "added":
+                added += 1
+                total_chunks += len(chunks)
+            elif state == "updated":
+                updated += 1
+                total_chunks += len(chunks)
+            else:
+                skipped += 1
+        return {
+            "scanned": scanned,
+            "added": added,
+            "updated": updated,
+            "skipped": skipped,
+            "missing": missing,
+            "deleted": deleted,
+            "chunks": total_chunks,
+        }
+
     def search(self, query: str, *, limit: int = 5) -> list[KnowledgeHit]:
         q = str(query or "").strip()
         if not q:
@@ -433,6 +511,40 @@ class KnowledgeBaseStore:
                     ),
                 )
             conn.commit()
+
+    def _deduplicate_source_docs(self) -> int:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_path, GROUP_CONCAT(id) AS ids, COUNT(*) AS total
+                FROM kb_docs
+                WHERE source_path <> ''
+                GROUP BY source_path
+                HAVING COUNT(*) > 1
+                """
+            ).fetchall()
+            remove_ids: list[int] = []
+            for row in rows:
+                raw_ids = str(row["ids"] or "").strip()
+                if not raw_ids:
+                    continue
+                ids = [int(part) for part in raw_ids.split(",") if part.strip().isdigit()]
+                if len(ids) <= 1:
+                    continue
+                keep_id = max(ids)
+                remove_ids.extend([item for item in ids if item != keep_id])
+            if not remove_ids:
+                return 0
+            conn.execute(
+                f"DELETE FROM kb_chunks WHERE doc_id IN ({','.join('?' for _ in remove_ids)})",
+                tuple(remove_ids),
+            )
+            conn.execute(
+                f"DELETE FROM kb_docs WHERE id IN ({','.join('?' for _ in remove_ids)})",
+                tuple(remove_ids),
+            )
+            conn.commit()
+        return len(remove_ids)
 
 
 def format_knowledge_context(hits: list[KnowledgeHit]) -> str:

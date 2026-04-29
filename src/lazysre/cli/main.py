@@ -3945,6 +3945,24 @@ def kb_stats() -> None:
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+@kb_app.command("rebuild")
+def kb_rebuild(
+    chunk_size: Annotated[int, typer.Option("--chunk-size", help="Chunk size in characters.")] = 900,
+    overlap: Annotated[int, typer.Option("--overlap", help="Chunk overlap in characters.")] = 120,
+    drop_missing: Annotated[bool, typer.Option("--drop-missing", help="Delete docs whose source file no longer exists.")] = False,
+) -> None:
+    store = _open_knowledge_store()
+    if not store:
+        raise typer.BadParameter("knowledge store is unavailable.")
+    payload = store.rebuild(
+        chunk_size=max(200, min(chunk_size, 3000)),
+        overlap=max(0, min(overlap, 1200)),
+        drop_missing=bool(drop_missing),
+    )
+    payload["db_path"] = str(_resolve_knowledge_db_path())
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 @policy_app.command("init")
 def policy_init(
     policy_file: Annotated[str, typer.Option("--policy-file", help="Policy center JSON path.")] = ".data/lsre-policy.json",
@@ -13484,6 +13502,7 @@ def _render_chat_short_help() -> None:
         "- /kb delete <doc_id>: 删除指定知识文档",
         "- /kb prune: 清理源文件已不存在的文档",
         "- /kb stats: 查看知识库文档/分片规模",
+        "- /kb rebuild [--drop-missing]: 重建知识索引并去重历史重复 source_path",
         "- /kb <query>: 检索内部知识库",
         "- TUI 里可用 Up/Down 浏览输入历史（支持前缀筛选），Ctrl-L 或 /clear 清空屏幕，1-4/F2 切换面板，F3 切换 UI",
         "- exit / quit: 退出",
@@ -18247,6 +18266,18 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                     kb_stats()
                 except typer.BadParameter as exc:
                     typer.echo(f"kb stats failed: {_safe_exception_text(exc)}")
+                continue
+            if lowered == "rebuild":
+                try:
+                    kb_rebuild(chunk_size=900, overlap=120, drop_missing=False)
+                except typer.BadParameter as exc:
+                    typer.echo(f"kb rebuild failed: {_safe_exception_text(exc)}")
+                continue
+            if lowered == "rebuild --drop-missing":
+                try:
+                    kb_rebuild(chunk_size=900, overlap=120, drop_missing=True)
+                except typer.BadParameter as exc:
+                    typer.echo(f"kb rebuild failed: {_safe_exception_text(exc)}")
                 continue
             kb_search(query=tail, limit=5, as_json=False)
             continue

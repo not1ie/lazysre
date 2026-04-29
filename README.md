@@ -251,6 +251,8 @@ lazysre kb show 1 --json
 lazysre kb stats
 lazysre kb delete 1
 lazysre kb prune
+lazysre kb rebuild
+lazysre kb rebuild --drop-missing
 ```
 
 说明：

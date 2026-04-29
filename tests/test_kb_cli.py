@@ -84,3 +84,20 @@ def test_kb_cli_prune(monkeypatch, tmp_path: Path) -> None:
     payload = json.loads(pruned.stdout)
     assert payload["pruned_docs"] == 1
     assert payload["pruned_chunks"] >= 1
+
+
+def test_kb_cli_rebuild(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "knowledge.db"
+    monkeypatch.setattr(cli_main, "_default_knowledge_db_path", lambda: db_path)
+    note = tmp_path / "tmp-rebuild.md"
+    note.write_text("initial content", encoding="utf-8")
+    runner = CliRunner()
+    added = runner.invoke(app, ["kb", "add", str(note)])
+    assert added.exit_code == 0
+    note.write_text("updated content", encoding="utf-8")
+
+    rebuilt = runner.invoke(app, ["kb", "rebuild"])
+    assert rebuilt.exit_code == 0
+    payload = json.loads(rebuilt.stdout)
+    assert payload["scanned"] >= 1
+    assert payload["updated"] >= 1
