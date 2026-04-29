@@ -54,6 +54,7 @@ from lazysre.cli.policy_center import PolicyCenter
 from lazysre.cli.session import SessionStore
 from lazysre.cli.memory import IncidentMemoryStore, MemoryCase, format_memory_context
 from lazysre.cli.knowledge import (
+    KnowledgeHit,
     KnowledgeBaseStore,
     format_knowledge_context,
 )
@@ -2998,7 +2999,8 @@ def _run_once(
     session_hint = session.build_context_hint(instruction)
     dialogue_context = session.build_dialogue_context(max_chars=2200)
     memory_context = _build_memory_context(instruction)
-    knowledge_context = _build_knowledge_context(instruction)
+    knowledge_hits = _collect_knowledge_hits(instruction, limit=3)
+    knowledge_context = format_knowledge_context(knowledge_hits)
     topology_context = _build_topology_context(instruction)
     memory_plus = memory_context
     if knowledge_context:
@@ -3093,6 +3095,7 @@ def _run_once(
             _render_compact_result(result, title="LazySRE")
     else:
         typer.echo(result.final_text)
+    _render_knowledge_references(knowledge_hits)
     if runtime_options is not None:
         note = _maybe_apply_runtime_provider_fallback(runtime_options, result)
         if note:
@@ -3132,7 +3135,8 @@ def _run_fix(
     session_hint = session.build_context_hint(instruction)
     dialogue_context = session.build_dialogue_context(max_chars=2200)
     memory_context = _build_memory_context(instruction)
-    knowledge_context = _build_knowledge_context(instruction)
+    knowledge_hits = _collect_knowledge_hits(instruction, limit=3)
+    knowledge_context = format_knowledge_context(knowledge_hits)
     topology_context = _build_topology_context(instruction)
     memory_plus = memory_context
     if knowledge_context:
@@ -3224,6 +3228,7 @@ def _run_fix(
             _render_compact_result(result, title="Fix Plan")
     else:
         typer.echo(result.final_text)
+    _render_knowledge_references(knowledge_hits)
 
     plan = extract_fix_plan(result.final_text)
     _render_fix_summary(plan, max_apply_steps=max_apply_steps)
@@ -21664,13 +21669,38 @@ def _build_memory_context(instruction: str) -> str:
 
 def _build_knowledge_context(instruction: str) -> str:
     try:
-        store = _open_knowledge_store()
-        if not store:
-            return ""
-        hits = store.search(instruction, limit=3)
+        hits = _collect_knowledge_hits(instruction, limit=3)
         return format_knowledge_context(hits)
     except Exception:
         return ""
+
+
+def _collect_knowledge_hits(instruction: str, *, limit: int = 3) -> list[KnowledgeHit]:
+    query = str(instruction or "").strip()
+    if not query:
+        return []
+    store = _open_knowledge_store()
+    if not store:
+        return []
+    return store.search(query, limit=max(1, min(limit, 10)))
+
+
+def _render_knowledge_references(hits: list[KnowledgeHit]) -> None:
+    if not hits:
+        return
+    if _console and Table:
+        table = Table(title="Knowledge References")
+        table.add_column("#", style="cyan", no_wrap=True)
+        table.add_column("Score", style="magenta", no_wrap=True)
+        table.add_column("Doc", style="green")
+        table.add_column("Source", overflow="fold")
+        for idx, hit in enumerate(hits, 1):
+            table.add_row(str(idx), f"{hit.score:.2f}", hit.title[:80], hit.source_path[:140])
+        _console.print(table)
+        return
+    typer.echo("Knowledge references:")
+    for idx, hit in enumerate(hits, 1):
+        typer.echo(f"- [{idx}] score={hit.score:.2f} doc={hit.title} source={hit.source_path}")
 
 
 def _build_topology_context(instruction: str, *, env: str = "local") -> str:

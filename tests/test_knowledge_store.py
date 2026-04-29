@@ -44,3 +44,24 @@ def test_knowledge_store_ingest_directory(tmp_path: Path) -> None:
     store = KnowledgeBaseStore(db)
     result = store.ingest_path(root)
     assert result["documents"] == 2
+
+
+def test_knowledge_store_weighted_ranking_prefers_exact_phrase(tmp_path: Path) -> None:
+    db = tmp_path / "kb.db"
+    root = tmp_path / "docs"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "generic.md").write_text(
+        "service unstable issue incident check logs and restart if needed",
+        encoding="utf-8",
+    )
+    (root / "specific.md").write_text(
+        "docker swarm replica insufficient root cause: image pull backoff on worker node",
+        encoding="utf-8",
+    )
+    store = KnowledgeBaseStore(db)
+    result = store.ingest_path(root)
+    assert result["documents"] == 2
+
+    hits = store.search("swarm replica insufficient", limit=2)
+    assert hits
+    assert "specific.md" in hits[0].source_path

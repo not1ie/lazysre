@@ -252,6 +252,7 @@ lazysre kb show 1 --json
 - 知识库默认路径：`~/.lazysre/knowledge_db`
 - 数据本地落盘，不会提交到 git（除非你手动 add）
 - 在 `lazysre` / `lazysre chat` / `lazysre run` / `lazysre fix` 里，自然语言诊断会自动参考命中知识片段
+- 每次命中会在终端追加 `Knowledge References`，显示引用文档、来源路径和匹配分数
 
 ## IM 网关（替代终端对话入口）
 

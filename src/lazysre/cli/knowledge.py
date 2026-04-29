@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -179,6 +180,7 @@ class KnowledgeBaseStore:
         q_tokens = _tokenize(q)
         if not q_tokens:
             return []
+        q_norm = " ".join(_tokenize_in_order(q))
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -186,13 +188,28 @@ class KnowledgeBaseStore:
                 FROM kb_chunks c
                 JOIN kb_docs d ON d.id = c.doc_id
                 ORDER BY c.id DESC
-                LIMIT 500
+                LIMIT 1000
                 """
             ).fetchall()
-        ranked: list[KnowledgeHit] = []
+        candidates: list[tuple[sqlite3.Row, set[str], int]] = []
         for row in rows:
             tokens = _safe_token_set(row["token_json"])
-            score = _jaccard(q_tokens, tokens)
+            if not tokens:
+                continue
+            candidates.append((row, tokens, len(tokens)))
+        if not candidates:
+            return []
+        idf = _build_idf(candidates, q_tokens)
+        ranked: list[KnowledgeHit] = []
+        for row, tokens, token_len in candidates:
+            score = _hybrid_score(
+                query_tokens=q_tokens,
+                chunk_tokens=tokens,
+                idf=idf,
+                chunk_len=token_len,
+                query_norm=q_norm,
+                content=str(row["content"]),
+            )
             if score <= 0:
                 continue
             excerpt = str(row["content"]).strip().replace("\n", " ")
@@ -326,7 +343,9 @@ def _safe_token_set(raw: Any) -> set[str]:
 
 
 def _tokenize(text: str) -> set[str]:
-    normalized = "".join(ch.lower() if (ch.isalnum() or ch in {"_", "-"} or "\u4e00" <= ch <= "\u9fff") else " " for ch in text)
+    normalized = "".join(
+        ch.lower() if (ch.isalnum() or ch in {"_", "-"} or "\u4e00" <= ch <= "\u9fff") else " " for ch in text
+    )
     return {part for part in normalized.split() if len(part) >= 2}
 
 
@@ -338,3 +357,54 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     if union <= 0:
         return 0.0
     return inter / union
+
+
+def _tokenize_in_order(text: str) -> list[str]:
+    normalized = "".join(
+        ch.lower() if (ch.isalnum() or ch in {"_", "-"} or "\u4e00" <= ch <= "\u9fff") else " " for ch in text
+    )
+    return [part for part in normalized.split() if len(part) >= 2]
+
+
+def _build_idf(candidates: list[tuple[sqlite3.Row, set[str], int]], query_tokens: set[str]) -> dict[str, float]:
+    total = max(1, len(candidates))
+    df: dict[str, int] = {token: 0 for token in query_tokens}
+    for _, tokens, _ in candidates:
+        for token in query_tokens:
+            if token in tokens:
+                df[token] = df.get(token, 0) + 1
+    out: dict[str, float] = {}
+    for token in query_tokens:
+        count = max(0, int(df.get(token, 0)))
+        out[token] = math.log(1.0 + ((total - count + 0.5) / (count + 0.5)))
+    return out
+
+
+def _hybrid_score(
+    *,
+    query_tokens: set[str],
+    chunk_tokens: set[str],
+    idf: dict[str, float],
+    chunk_len: int,
+    query_norm: str,
+    content: str,
+) -> float:
+    if not query_tokens or not chunk_tokens:
+        return 0.0
+    inter = query_tokens & chunk_tokens
+    if not inter:
+        return 0.0
+    base = _jaccard(query_tokens, chunk_tokens) * 0.35
+    weighted_hit = sum(idf.get(token, 1.0) for token in inter)
+    weighted_total = sum(idf.get(token, 1.0) for token in query_tokens)
+    idf_score = (weighted_hit / weighted_total) if weighted_total > 0 else 0.0
+    coverage = len(inter) / max(1, len(query_tokens))
+    length_penalty = 1.0 / (1.0 + max(0, chunk_len - 80) / 400.0)
+    phrase_bonus = 0.0
+    text_norm = " ".join(_tokenize_in_order(content))
+    if query_norm and query_norm in text_norm:
+        phrase_bonus = 0.12
+    elif any(len(token) >= 6 and token in text_norm for token in query_tokens):
+        phrase_bonus = 0.05
+    score = base + (idf_score * 0.45) + (coverage * 0.15) + (length_penalty * 0.05) + phrase_bonus
+    return max(0.0, min(score, 1.0))
