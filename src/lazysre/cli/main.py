@@ -3915,6 +3915,36 @@ def kb_show(
     _console.print(Panel("\n".join(lines), title="Knowledge Doc", border_style="cyan"))
 
 
+@kb_app.command("delete")
+def kb_delete(
+    doc_id: Annotated[int, typer.Argument(help="Knowledge document id to delete.")],
+) -> None:
+    store = _open_knowledge_store()
+    if not store:
+        raise typer.BadParameter("knowledge store is unavailable.")
+    result = store.delete_doc(doc_id)
+    typer.echo(json.dumps({"doc_id": int(doc_id), **result}, ensure_ascii=False, indent=2))
+
+
+@kb_app.command("prune")
+def kb_prune() -> None:
+    store = _open_knowledge_store()
+    if not store:
+        raise typer.BadParameter("knowledge store is unavailable.")
+    result = store.prune_missing_sources()
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@kb_app.command("stats")
+def kb_stats() -> None:
+    store = _open_knowledge_store()
+    if not store:
+        raise typer.BadParameter("knowledge store is unavailable.")
+    payload = store.stats()
+    payload["db_path"] = str(_resolve_knowledge_db_path())
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 @policy_app.command("init")
 def policy_init(
     policy_file: Annotated[str, typer.Option("--policy-file", help="Policy center JSON path.")] = ".data/lsre-policy.json",
@@ -13450,6 +13480,10 @@ def _render_chat_short_help() -> None:
         "- /memory: 查看最近故障记忆",
         "- /memory <query>: 检索相似历史案例",
         "- /kb add <file|dir>: 导入内部知识库文档",
+        "- /kb show <doc_id>: 查看文档详情",
+        "- /kb delete <doc_id>: 删除指定知识文档",
+        "- /kb prune: 清理源文件已不存在的文档",
+        "- /kb stats: 查看知识库文档/分片规模",
         "- /kb <query>: 检索内部知识库",
         "- TUI 里可用 Up/Down 浏览输入历史（支持前缀筛选），Ctrl-L 或 /clear 清空屏幕，1-4/F2 切换面板，F3 切换 UI",
         "- exit / quit: 退出",
@@ -18189,6 +18223,30 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                     kb_show(doc_id=doc_id, chunk_limit=6, as_json=False)
                 except typer.BadParameter as exc:
                     typer.echo(f"kb show failed: {_safe_exception_text(exc)}")
+                continue
+            if lowered.startswith("delete "):
+                doc_text = tail[7:].strip()
+                try:
+                    doc_id = int(doc_text)
+                except Exception:
+                    typer.echo("usage: /kb delete <doc_id>")
+                    continue
+                try:
+                    kb_delete(doc_id=doc_id)
+                except typer.BadParameter as exc:
+                    typer.echo(f"kb delete failed: {_safe_exception_text(exc)}")
+                continue
+            if lowered == "prune":
+                try:
+                    kb_prune()
+                except typer.BadParameter as exc:
+                    typer.echo(f"kb prune failed: {_safe_exception_text(exc)}")
+                continue
+            if lowered == "stats":
+                try:
+                    kb_stats()
+                except typer.BadParameter as exc:
+                    typer.echo(f"kb stats failed: {_safe_exception_text(exc)}")
                 continue
             kb_search(query=tail, limit=5, as_json=False)
             continue

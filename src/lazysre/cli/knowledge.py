@@ -43,6 +43,7 @@ class KnowledgeBaseStore:
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -216,6 +217,55 @@ class KnowledgeBaseStore:
                 (int(doc_id), cap),
             ).fetchall()
         return [str(row["content"]) for row in rows if str(row["content"]).strip()]
+
+    def stats(self) -> dict[str, int]:
+        with self._connect() as conn:
+            docs_row = conn.execute("SELECT COUNT(*) FROM kb_docs").fetchone()
+            chunks_row = conn.execute("SELECT COUNT(*) FROM kb_chunks").fetchone()
+        return {
+            "docs": int(docs_row[0]) if docs_row else 0,
+            "chunks": int(chunks_row[0]) if chunks_row else 0,
+        }
+
+    def delete_doc(self, doc_id: int) -> dict[str, int]:
+        target = int(doc_id)
+        if target <= 0:
+            return {"deleted_docs": 0, "deleted_chunks": 0}
+        with self._connect() as conn:
+            chunk_row = conn.execute("SELECT COUNT(*) FROM kb_chunks WHERE doc_id = ?", (target,)).fetchone()
+            deleted_chunks = int(chunk_row[0]) if chunk_row else 0
+            conn.execute("DELETE FROM kb_chunks WHERE doc_id = ?", (target,))
+            cur = conn.execute("DELETE FROM kb_docs WHERE id = ?", (target,))
+            conn.commit()
+            deleted_docs = int(cur.rowcount or 0)
+        return {"deleted_docs": deleted_docs, "deleted_chunks": deleted_chunks if deleted_docs else 0}
+
+    def prune_missing_sources(self) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, source_path
+                FROM kb_docs
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            remove_ids: list[int] = []
+            for row in rows:
+                doc_id = int(row["id"])
+                source = Path(str(row["source_path"] or "")).expanduser()
+                if not source.exists():
+                    remove_ids.append(doc_id)
+            if not remove_ids:
+                return {"pruned_docs": 0, "pruned_chunks": 0}
+            chunk_row = conn.execute(
+                f"SELECT COUNT(*) FROM kb_chunks WHERE doc_id IN ({','.join('?' for _ in remove_ids)})",
+                tuple(remove_ids),
+            ).fetchone()
+            pruned_chunks = int(chunk_row[0]) if chunk_row else 0
+            conn.execute(f"DELETE FROM kb_chunks WHERE doc_id IN ({','.join('?' for _ in remove_ids)})", tuple(remove_ids))
+            conn.execute(f"DELETE FROM kb_docs WHERE id IN ({','.join('?' for _ in remove_ids)})", tuple(remove_ids))
+            conn.commit()
+        return {"pruned_docs": len(remove_ids), "pruned_chunks": pruned_chunks}
 
     def search(self, query: str, *, limit: int = 5) -> list[KnowledgeHit]:
         q = str(query or "").strip()

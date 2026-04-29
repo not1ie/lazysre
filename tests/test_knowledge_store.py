@@ -102,3 +102,34 @@ def test_knowledge_store_incremental_upsert_and_skip(tmp_path: Path) -> None:
     assert docs3[0].id == doc_id
     new_hits = store.search("payment timeout", limit=3)
     assert new_hits
+
+
+def test_knowledge_store_delete_and_prune_and_stats(tmp_path: Path) -> None:
+    db = tmp_path / "kb.db"
+    existing = tmp_path / "exists.md"
+    missing = tmp_path / "missing.md"
+    existing.write_text("k8s healthy", encoding="utf-8")
+    missing.write_text("swarm unhealthy", encoding="utf-8")
+    store = KnowledgeBaseStore(db)
+    store.ingest_path(existing)
+    store.ingest_path(missing)
+
+    stats_before = store.stats()
+    assert stats_before["docs"] == 2
+    assert stats_before["chunks"] >= 2
+
+    docs = store.list_docs(limit=10)
+    existing_doc = next(item for item in docs if item.source_path.endswith("exists.md"))
+    missing_doc = next(item for item in docs if item.source_path.endswith("missing.md"))
+    removed = store.delete_doc(existing_doc.id)
+    assert removed["deleted_docs"] == 1
+    assert removed["deleted_chunks"] >= 1
+
+    missing.unlink()
+    pruned = store.prune_missing_sources()
+    assert pruned["pruned_docs"] == 1
+    assert pruned["pruned_chunks"] >= 1
+
+    stats_after = store.stats()
+    assert stats_after["docs"] == 0
+    assert stats_after["chunks"] == 0

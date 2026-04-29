@@ -246,6 +246,11 @@ lazysre kb search "swarm 副本不足" --json
 
 # 查看文档详情与分片预览
 lazysre kb show 1 --json
+
+# 清理与运维
+lazysre kb stats
+lazysre kb delete 1
+lazysre kb prune
 ```
 
 说明：

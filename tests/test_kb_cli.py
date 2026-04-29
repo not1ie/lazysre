@@ -55,3 +55,32 @@ def test_kb_cli_add_list_search_show(monkeypatch, tmp_path: Path) -> None:
     show_payload = json.loads(shown.stdout)
     assert show_payload["id"] == doc_id
     assert show_payload["chunks"]
+
+    stats = runner.invoke(app, ["kb", "stats"])
+    assert stats.exit_code == 0
+    stats_payload = json.loads(stats.stdout)
+    assert stats_payload["docs"] == 1
+    assert stats_payload["chunks"] >= 1
+
+    deleted = runner.invoke(app, ["kb", "delete", str(doc_id)])
+    assert deleted.exit_code == 0
+    deleted_payload = json.loads(deleted.stdout)
+    assert deleted_payload["deleted_docs"] == 1
+    assert deleted_payload["deleted_chunks"] >= 1
+
+
+def test_kb_cli_prune(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "knowledge.db"
+    monkeypatch.setattr(cli_main, "_default_knowledge_db_path", lambda: db_path)
+    note = tmp_path / "tmp-prune.md"
+    note.write_text("remove me", encoding="utf-8")
+    runner = CliRunner()
+    added = runner.invoke(app, ["kb", "add", str(note)])
+    assert added.exit_code == 0
+    note.unlink()
+
+    pruned = runner.invoke(app, ["kb", "prune"])
+    assert pruned.exit_code == 0
+    payload = json.loads(pruned.stdout)
+    assert payload["pruned_docs"] == 1
+    assert payload["pruned_chunks"] >= 1
