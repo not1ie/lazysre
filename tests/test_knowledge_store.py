@@ -65,6 +65,11 @@ def test_knowledge_store_weighted_ranking_prefers_exact_phrase(tmp_path: Path) -
     hits = store.search("swarm replica insufficient", limit=2)
     assert hits
     assert "specific.md" in hits[0].source_path
+    filtered = store.search("swarm replica insufficient", limit=3, source_contains="specific")
+    assert filtered
+    assert all("specific.md" in item.source_path for item in filtered)
+    threshold_hits = store.search("swarm replica insufficient", limit=3, min_score=0.35)
+    assert threshold_hits
 
 
 def test_knowledge_store_incremental_upsert_and_skip(tmp_path: Path) -> None:

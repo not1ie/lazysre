@@ -345,13 +345,22 @@ class KnowledgeBaseStore:
             "chunks": total_chunks,
         }
 
-    def search(self, query: str, *, limit: int = 5) -> list[KnowledgeHit]:
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        source_contains: str = "",
+        min_score: float = 0.0,
+    ) -> list[KnowledgeHit]:
         q = str(query or "").strip()
         if not q:
             return []
         q_tokens = _tokenize(q)
         if not q_tokens:
             return []
+        source_filter = str(source_contains or "").strip().lower()
+        threshold = max(0.0, min(float(min_score), 1.0))
         q_norm = " ".join(_tokenize_in_order(q))
         with self._connect() as conn:
             rows = conn.execute(
@@ -374,6 +383,9 @@ class KnowledgeBaseStore:
         idf = _build_idf(candidates, q_tokens)
         ranked: list[KnowledgeHit] = []
         for row, tokens, token_len in candidates:
+            source_path = str(row["source_path"])
+            if source_filter and source_filter not in source_path.lower():
+                continue
             score = _hybrid_score(
                 query_tokens=q_tokens,
                 chunk_tokens=tokens,
@@ -382,14 +394,14 @@ class KnowledgeBaseStore:
                 query_norm=q_norm,
                 content=str(row["content"]),
             )
-            if score <= 0:
+            if score <= 0 or score < threshold:
                 continue
             excerpt = str(row["content"]).strip().replace("\n", " ")
             ranked.append(
                 KnowledgeHit(
                     doc_id=int(row["doc_id"]),
                     title=str(row["title"]),
-                    source_path=str(row["source_path"]),
+                    source_path=source_path,
                     chunk_id=int(row["chunk_id"]),
                     score=score,
                     excerpt=excerpt[:220],

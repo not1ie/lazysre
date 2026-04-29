@@ -3843,12 +3843,19 @@ def kb_list(
 def kb_search(
     query: Annotated[str, typer.Argument(help="Query to search internal knowledge base.")],
     limit: Annotated[int, typer.Option("--limit", help="Max chunks to return.")] = 5,
+    source: Annotated[str, typer.Option("--source", help="Filter by source path substring.")] = "",
+    min_score: Annotated[float, typer.Option("--min-score", help="Minimum score threshold (0-1).")] = 0.0,
     as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
 ) -> None:
     store = _open_knowledge_store()
     if not store:
         raise typer.BadParameter("knowledge store is unavailable.")
-    rows = store.search(query, limit=limit)
+    rows = store.search(
+        query,
+        limit=limit,
+        source_contains=source,
+        min_score=max(0.0, min(float(min_score), 1.0)),
+    )
     if as_json or (not _console):
         payload = [
             {
@@ -3867,7 +3874,12 @@ def kb_search(
     if not rows:
         typer.echo("No knowledge hits.")
         return
-    table = Table(title=f"Knowledge Search: {query}")
+    title = f"Knowledge Search: {query}"
+    if source.strip():
+        title += f" | source~{source.strip()}"
+    if min_score > 0:
+        title += f" | min_score>={min_score:.2f}"
+    table = Table(title=title)
     table.add_column("score", style="cyan", no_wrap=True)
     table.add_column("doc", style="green")
     table.add_column("source", overflow="fold")
@@ -13504,6 +13516,7 @@ def _render_chat_short_help() -> None:
         "- /kb stats: 查看知识库文档/分片规模",
         "- /kb rebuild [--drop-missing]: 重建知识索引并去重历史重复 source_path",
         "- /kb <query>: 检索内部知识库",
+        "- /kb source:<path关键字> min:0.35 <query>: 按来源与分数阈值检索",
         "- TUI 里可用 Up/Down 浏览输入历史（支持前缀筛选），Ctrl-L 或 /clear 清空屏幕，1-4/F2 切换面板，F3 切换 UI",
         "- exit / quit: 退出",
     ]
@@ -18279,7 +18292,34 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 except typer.BadParameter as exc:
                     typer.echo(f"kb rebuild failed: {_safe_exception_text(exc)}")
                 continue
-            kb_search(query=tail, limit=5, as_json=False)
+            source_filter = ""
+            min_score = 0.0
+            query_text = tail
+            parts = [item for item in tail.split() if item.strip()]
+            consumed = 0
+            for part in parts[:3]:
+                lower_part = part.lower()
+                if lower_part.startswith("source:"):
+                    source_filter = part.split(":", 1)[1].strip()
+                    consumed += 1
+                    continue
+                if lower_part.startswith("min:"):
+                    raw = part.split(":", 1)[1].strip()
+                    try:
+                        min_score = max(0.0, min(float(raw), 1.0))
+                    except Exception:
+                        min_score = 0.0
+                    consumed += 1
+                    continue
+            if consumed:
+                query_text = " ".join(parts[consumed:]).strip() or tail
+            kb_search(
+                query=query_text,
+                limit=5,
+                source=source_filter,
+                min_score=min_score,
+                as_json=False,
+            )
             continue
         if text.lower() in {"/apply", "/apply-last"}:
             _apply_last_fix_plan(

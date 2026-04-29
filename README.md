@@ -243,6 +243,7 @@ lazysre kb list --json
 
 # 检索知识片段
 lazysre kb search "swarm 副本不足" --json
+lazysre kb search "swarm 副本不足" --source swarm --min-score 0.35 --json
 
 # 查看文档详情与分片预览
 lazysre kb show 1 --json
@@ -261,6 +262,7 @@ lazysre kb rebuild --drop-missing
 - 在 `lazysre` / `lazysre chat` / `lazysre run` / `lazysre fix` 里，自然语言诊断会自动参考命中知识片段
 - 每次命中会在终端追加 `Knowledge References`，显示引用文档、来源路径和匹配分数
 - `kb add` 支持增量去重：同一路径内容未变会 `skipped`，内容变化会 `updated`，避免重复膨胀
+- TUI/Chat 支持 `/kb source:<path关键字> min:0.35 <query>` 精准检索
 
 ## IM 网关（替代终端对话入口）
 

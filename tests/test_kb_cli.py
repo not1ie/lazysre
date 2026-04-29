@@ -50,6 +50,15 @@ def test_kb_cli_add_list_search_show(monkeypatch, tmp_path: Path) -> None:
     assert search_payload
     assert search_payload[0]["doc_id"] == doc_id
 
+    filtered = runner.invoke(
+        app,
+        ["kb", "search", "replica recovery", "--source", "swarm-guide", "--min-score", "0.30", "--json"],
+    )
+    assert filtered.exit_code == 0
+    filtered_payload = json.loads(filtered.stdout)
+    assert filtered_payload
+    assert all("swarm-guide" in item["source_path"] for item in filtered_payload)
+
     shown = runner.invoke(app, ["kb", "show", str(doc_id), "--json"])
     assert shown.exit_code == 0
     show_payload = json.loads(shown.stdout)
