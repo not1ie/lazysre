@@ -65,3 +65,40 @@ def test_knowledge_store_weighted_ranking_prefers_exact_phrase(tmp_path: Path) -
     hits = store.search("swarm replica insufficient", limit=2)
     assert hits
     assert "specific.md" in hits[0].source_path
+
+
+def test_knowledge_store_incremental_upsert_and_skip(tmp_path: Path) -> None:
+    db = tmp_path / "kb.db"
+    source = tmp_path / "ops.md"
+    source.write_text("first line\ncheck payment latency\n", encoding="utf-8")
+    store = KnowledgeBaseStore(db)
+
+    first = store.ingest_path(source)
+    assert first["documents"] == 1
+    assert first["added"] == 1
+    assert first["updated"] == 0
+    assert first["skipped"] == 0
+    docs1 = store.list_docs(limit=5)
+    assert len(docs1) == 1
+    doc_id = docs1[0].id
+
+    second = store.ingest_path(source)
+    assert second["documents"] == 0
+    assert second["added"] == 0
+    assert second["updated"] == 0
+    assert second["skipped"] == 1
+    docs2 = store.list_docs(limit=5)
+    assert len(docs2) == 1
+    assert docs2[0].id == doc_id
+
+    source.write_text("first line\ncheck payment timeout\n", encoding="utf-8")
+    third = store.ingest_path(source)
+    assert third["documents"] == 1
+    assert third["added"] == 0
+    assert third["updated"] == 1
+    assert third["skipped"] == 0
+    docs3 = store.list_docs(limit=5)
+    assert len(docs3) == 1
+    assert docs3[0].id == doc_id
+    new_hits = store.search("payment timeout", limit=3)
+    assert new_hits

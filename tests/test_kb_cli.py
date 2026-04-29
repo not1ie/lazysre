@@ -26,6 +26,17 @@ def test_kb_cli_add_list_search_show(monkeypatch, tmp_path: Path) -> None:
     add_payload = json.loads(added.stdout)
     assert add_payload["documents"] == 1
     assert add_payload["chunks"] >= 1
+    assert add_payload["added"] == 1
+    assert add_payload["updated"] == 0
+    assert add_payload["skipped"] == 0
+
+    added_again = runner.invoke(app, ["kb", "add", str(note)])
+    assert added_again.exit_code == 0
+    add_again_payload = json.loads(added_again.stdout)
+    assert add_again_payload["documents"] == 0
+    assert add_again_payload["added"] == 0
+    assert add_again_payload["updated"] == 0
+    assert add_again_payload["skipped"] == 1
 
     listed = runner.invoke(app, ["kb", "list", "--json"])
     assert listed.exit_code == 0

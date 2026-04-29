@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
@@ -52,8 +53,10 @@ class KnowledgeBaseStore:
                 CREATE TABLE IF NOT EXISTS kb_docs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
                     title TEXT NOT NULL,
                     source_path TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
                     metadata_json TEXT NOT NULL
                 )
                 """
@@ -71,7 +74,25 @@ class KnowledgeBaseStore:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_kb_chunks_doc_id ON kb_chunks(doc_id)")
+            self._ensure_column(conn, "kb_docs", "updated_at", "TEXT", default_sql="''")
+            self._ensure_column(conn, "kb_docs", "content_hash", "TEXT", default_sql="''")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kb_docs_source_path ON kb_docs(source_path)")
             conn.commit()
+
+    def _ensure_column(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        column_type: str,
+        *,
+        default_sql: str,
+    ) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        names = {str(row[1]) for row in rows}
+        if column in names:
+            return
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type} NOT NULL DEFAULT {default_sql}")
 
     def ingest_path(
         self,
@@ -86,9 +107,12 @@ class KnowledgeBaseStore:
         if path.is_file():
             docs = [path]
         if not docs:
-            return {"documents": 0, "chunks": 0}
+            return {"documents": 0, "chunks": 0, "added": 0, "updated": 0, "skipped": 0}
         total_docs = 0
         total_chunks = 0
+        added = 0
+        updated = 0
+        skipped = 0
         for file_path in docs:
             text = _read_text_file(file_path)
             if not text.strip():
@@ -97,15 +121,35 @@ class KnowledgeBaseStore:
             doc_chunks = _split_text_chunks(text, chunk_size=chunk_size, overlap=overlap)
             if not doc_chunks:
                 continue
+            content_hash = _sha256_text(text)
             metadata = {
                 "source_path": str(file_path),
                 "bytes": file_path.stat().st_size if file_path.exists() else 0,
+                "content_hash": content_hash,
             }
-            doc_id = self._insert_doc(title=doc_title, source_path=str(file_path), metadata=metadata)
-            self._insert_chunks(doc_id=doc_id, chunks=doc_chunks)
+            upserted = self._upsert_doc_with_chunks(
+                title=doc_title,
+                source_path=str(file_path),
+                content_hash=content_hash,
+                metadata=metadata,
+                chunks=doc_chunks,
+            )
+            if upserted == "skipped":
+                skipped += 1
+                continue
             total_docs += 1
             total_chunks += len(doc_chunks)
-        return {"documents": total_docs, "chunks": total_chunks}
+            if upserted == "added":
+                added += 1
+            elif upserted == "updated":
+                updated += 1
+        return {
+            "documents": total_docs,
+            "chunks": total_chunks,
+            "added": added,
+            "updated": updated,
+            "skipped": skipped,
+        }
 
     def list_docs(self, *, limit: int = 20) -> list[KnowledgeDoc]:
         cap = max(1, min(limit, 200))
@@ -227,23 +271,100 @@ class KnowledgeBaseStore:
         ranked.sort(key=lambda x: x.score, reverse=True)
         return ranked[: max(1, min(limit, 20))]
 
-    def _insert_doc(self, *, title: str, source_path: str, metadata: dict[str, Any]) -> int:
+    def _insert_doc(
+        self,
+        *,
+        title: str,
+        source_path: str,
+        content_hash: str,
+        metadata: dict[str, Any],
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             row = conn.execute(
                 """
-                INSERT INTO kb_docs (created_at, title, source_path, metadata_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO kb_docs (created_at, updated_at, title, source_path, content_hash, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?)
                 RETURNING id
                 """,
                 (
-                    datetime.now(timezone.utc).isoformat(),
+                    now,
+                    now,
                     title.strip(),
                     source_path.strip(),
+                    content_hash.strip(),
                     json.dumps(metadata, ensure_ascii=False),
                 ),
             ).fetchone()
             conn.commit()
         return int(row["id"]) if row else 0
+
+    def _upsert_doc_with_chunks(
+        self,
+        *,
+        title: str,
+        source_path: str,
+        content_hash: str,
+        metadata: dict[str, Any],
+        chunks: list[str],
+    ) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, content_hash
+                FROM kb_docs
+                WHERE source_path = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (source_path.strip(),),
+            ).fetchone()
+        if not row:
+            doc_id = self._insert_doc(
+                title=title,
+                source_path=source_path,
+                content_hash=content_hash,
+                metadata=metadata,
+            )
+            self._insert_chunks(doc_id=doc_id, chunks=chunks)
+            return "added"
+        doc_id = int(row["id"])
+        existing_hash = str(row["content_hash"] or "").strip()
+        if existing_hash and existing_hash == content_hash:
+            return "skipped"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE kb_docs
+                SET updated_at = ?, title = ?, content_hash = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    title.strip(),
+                    content_hash.strip(),
+                    json.dumps(metadata, ensure_ascii=False),
+                    doc_id,
+                ),
+            )
+            conn.execute("DELETE FROM kb_chunks WHERE doc_id = ?", (doc_id,))
+            for idx, chunk in enumerate(chunks):
+                tokens = sorted(_tokenize(chunk))
+                conn.execute(
+                    """
+                    INSERT INTO kb_chunks (doc_id, chunk_index, content, token_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        int(doc_id),
+                        int(idx),
+                        chunk,
+                        json.dumps(tokens, ensure_ascii=False),
+                    ),
+                )
+            conn.commit()
+        return "updated"
 
     def _insert_chunks(self, *, doc_id: int, chunks: list[str]) -> None:
         with self._connect() as conn:
@@ -408,3 +529,7 @@ def _hybrid_score(
         phrase_bonus = 0.05
     score = base + (idf_score * 0.45) + (coverage * 0.15) + (length_penalty * 0.05) + phrase_bonus
     return max(0.0, min(score, 1.0))
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
