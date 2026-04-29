@@ -240,6 +240,9 @@ lazysre channel-recipe --provider feishu --base-url http://127.0.0.1:8010
 
 # 本地直接模拟 webhook 消息并查看返回（不依赖公网）
 lazysre channel-test --provider telegram --text "检查 k8s 集群是否异常" --json
+
+# 查看最近渠道执行记录（trace/provider/是否需审批）
+lazysre channel-tail --limit 20 --json
 ```
 
 支持 webhook 路径：

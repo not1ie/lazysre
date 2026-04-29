@@ -2532,6 +2532,124 @@ def verify_artifact(
         raise typer.Exit(code=1)
 
 
+@app.command("channel-tail")
+def channel_tail(
+    limit: Annotated[int, typer.Option("--limit", help="Max number of recent channel run artifacts.")] = 10,
+    provider: Annotated[str, typer.Option("--provider", help="Provider filter: generic|feishu|dingtalk|telegram|onebot")] = "",
+    needs_approval: Annotated[str, typer.Option("--needs-approval", help="Filter by approval need: yes|no|all")] = "all",
+    run_dir: Annotated[str, typer.Option("--run-dir", help="Channel run artifact directory.")] = "",
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    max_items = max(1, min(int(limit), 200))
+    filter_provider = str(provider or "").strip().lower()
+    if filter_provider == "qq":
+        filter_provider = "onebot"
+    if filter_provider and filter_provider not in {"generic", "feishu", "dingtalk", "telegram", "onebot"}:
+        raise typer.BadParameter("provider must be generic|feishu|dingtalk|telegram|onebot")
+    approval_filter = str(needs_approval or "all").strip().lower()
+    if approval_filter not in {"all", "yes", "no"}:
+        raise typer.BadParameter("needs-approval must be yes|no|all")
+    target_dir = Path(run_dir.strip() or os.environ.get("LAZYSRE_CHANNEL_RUN_DIR", ".data/channel-runs")).expanduser()
+    records = _collect_channel_run_records(target_dir=target_dir, limit=max_items, provider=filter_provider, needs_approval=approval_filter)
+    payload = {
+        "run_dir": str(target_dir),
+        "count": len(records),
+        "records": records,
+    }
+    if as_json:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    if _console:
+        table = Table(title=f"Channel Runs ({len(records)})")
+        table.add_column("created_at", style="cyan", overflow="fold")
+        table.add_column("trace_id", style="green")
+        table.add_column("provider", style="yellow")
+        table.add_column("approval", style="magenta")
+        table.add_column("cmds", justify="right")
+        table.add_column("events", justify="right")
+        table.add_column("instruction", overflow="fold")
+        for row in records:
+            table.add_row(
+                str(row.get("created_at", "-")),
+                str(row.get("trace_id", "-")),
+                str(row.get("provider", "-")),
+                "yes" if bool(row.get("needs_approval", False)) else "no",
+                str(row.get("command_count", 0)),
+                str(row.get("event_count", 0)),
+                str(row.get("instruction", "-")),
+            )
+        _console.print(table)
+        return
+    typer.echo(f"Channel Runs ({len(records)}) dir={target_dir}")
+    for row in records:
+        typer.echo(
+            f"- {row.get('created_at', '-')} trace={row.get('trace_id', '-')} "
+            f"provider={row.get('provider', '-')} approval={'yes' if row.get('needs_approval') else 'no'} "
+            f"cmds={row.get('command_count', 0)} events={row.get('event_count', 0)} "
+            f"instruction={row.get('instruction', '-')}"
+        )
+
+
+def _collect_channel_run_records(
+    *,
+    target_dir: Path,
+    limit: int,
+    provider: str,
+    needs_approval: str,
+) -> list[dict[str, Any]]:
+    if not target_dir.exists():
+        return []
+    files = sorted(
+        target_dir.glob("*.json"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )
+    out: list[dict[str, Any]] = []
+    for path in files:
+        payload = _read_json_object(path)
+        if not payload:
+            continue
+        row = _build_channel_run_summary(path=path, payload=payload)
+        if provider and str(row.get("provider", "")).lower() != provider:
+            continue
+        if needs_approval == "yes" and (not bool(row.get("needs_approval", False))):
+            continue
+        if needs_approval == "no" and bool(row.get("needs_approval", False)):
+            continue
+        out.append(row)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _build_channel_run_summary(*, path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    actionables = payload.get("actionables", {})
+    commands = actionables.get("commands", []) if isinstance(actionables, dict) else []
+    command_count = len(commands) if isinstance(commands, list) else 0
+    needs = bool(actionables.get("needs_approval", False)) if isinstance(actionables, dict) else False
+    return {
+        "trace_id": str(payload.get("trace_id", "")).strip(),
+        "created_at": str(payload.get("created_at", "")).strip(),
+        "provider": str(payload.get("provider", "")).strip().lower(),
+        "instruction": str(payload.get("instruction", "")).strip()[:160],
+        "event_count": int(payload.get("event_count", 0) or 0),
+        "command_count": command_count,
+        "needs_approval": needs,
+        "path": str(path),
+        "digest": str((payload.get("integrity", {}) or {}).get("digest", "")).strip(),
+    }
+
+
 @app.command("fix")
 def fix_instruction(
     ctx: typer.Context,
