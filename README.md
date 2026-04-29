@@ -237,6 +237,9 @@ lazysre gateway --host 127.0.0.1 --port 8010 --provider mock
 
 # 生成某个渠道的接入配方（URL/Header/测试curl）
 lazysre channel-recipe --provider feishu --base-url http://127.0.0.1:8010
+
+# 本地直接模拟 webhook 消息并查看返回（不依赖公网）
+lazysre channel-test --provider telegram --text "检查 k8s 集群是否异常" --json
 ```
 
 支持 webhook 路径：

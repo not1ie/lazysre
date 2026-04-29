@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 from difflib import get_close_matches
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -2167,42 +2170,41 @@ def channel_recipe(
     as_json: Annotated[bool, typer.Option("--json", help="Print recipe as JSON.")] = False,
 ) -> None:
     """Print provider-specific webhook recipe and smoke curl example."""
-    name = str(provider or "generic").strip().lower()
-    if name not in {"generic", "feishu", "dingtalk", "telegram", "onebot", "qq"}:
-        raise typer.BadParameter("provider must be generic|feishu|dingtalk|telegram|onebot")
-    normalized = "onebot" if name == "qq" else name
+    normalized = _normalize_channel_provider_name(provider)
     url_base = str(base_url or "http://127.0.0.1:8010").strip().rstrip("/")
     inbound_token = token.strip() or os.environ.get("LAZYSRE_CHANNEL_TOKEN", "").strip() or "<CHANNEL_TOKEN>"
     path = f"/v1/channels/{normalized}/webhook"
-    webhook_url = f"{url_base}{path}"
-
-    headers = {"Content-Type": "application/json", "X-LazySRE-Channel-Token": inbound_token}
+    base_event = "evt-001"
+    sample_text = "检查 swarm"
+    payload = _build_channel_sample_payload(provider=normalized, text=sample_text, event_id=base_event)
+    signed = _build_channel_signed_request(
+        provider=normalized,
+        payload=payload,
+        webhook_url=f"{url_base}{path}",
+        inbound_token=inbound_token,
+    )
+    webhook_url = signed["url"]
+    headers = signed["headers"]
     provider_hints: list[str] = [
         "默认是 dry-run 诊断入口；生产执行建议走 approval ticket + CLI execute。",
         "首次联调建议先用 `--provider mock` 启动 gateway。",
     ]
-    payload: dict[str, Any]
     if normalized == "feishu":
-        payload = {"event": {"message": {"chat_id": "oc_xxx", "message_id": "om_xxx", "content": "{\"text\":\"检查 swarm\"}"}, "sender": {"sender_id": {"open_id": "ou_xxx"}}}}
         provider_hints.append("若开启签名：设置 LAZYSRE_FEISHU_SIGN_SECRET，并透传 X-Lark-Request-Timestamp / X-Lark-Signature。")
     elif normalized == "dingtalk":
-        payload = {"conversationId": "cid_xxx", "senderStaffId": "u_xxx", "msgId": "m_xxx", "text": {"content": "检查 swarm"}}
         provider_hints.append("若开启签名：设置 LAZYSRE_DINGTALK_WEBHOOK_SECRET，并在 query 带 timestamp/sign。")
     elif normalized == "telegram":
-        payload = {"update_id": 1001, "message": {"message_id": 99, "chat": {"id": 12345}, "from": {"id": 67890}, "text": "检查 swarm"}}
         provider_hints.append("若开启秘钥头：设置 LAZYSRE_TELEGRAM_SECRET_TOKEN，并传 X-Telegram-Bot-Api-Secret-Token。")
-    elif normalized == "onebot":
-        payload = {"message_id": 88, "user_id": 10001, "group_id": 20001, "raw_message": "检查 swarm"}
-    else:
-        payload = {"text": "检查 swarm", "user_id": "u-demo", "chat_id": "c-demo", "event_id": "evt-001"}
 
     curl_lines = [
         "curl -sS -X POST \\",
         f"  '{webhook_url}' \\",
-        "  -H 'Content-Type: application/json' \\",
-        f"  -H 'X-LazySRE-Channel-Token: {inbound_token}' \\",
-        f"  -d '{json.dumps(payload, ensure_ascii=False)}'",
     ]
+    for k, v in headers.items():
+        curl_lines.append(f"  -H '{k}: {v}' \\")
+    curl_lines.append(
+        f"  -d '{json.dumps(payload, ensure_ascii=False)}'",
+    )
     recipe = {
         "provider": normalized,
         "webhook_url": webhook_url,
@@ -2230,6 +2232,272 @@ def channel_recipe(
     lines.append("curl example:")
     lines.extend(curl_lines)
     typer.echo("\n".join(lines))
+
+
+@app.command("channel-test")
+def channel_test(
+    provider: Annotated[str, typer.Option("--provider", help="generic|feishu|dingtalk|telegram|onebot")] = "generic",
+    text: Annotated[str, typer.Option("--text", help="Natural-language message payload text.")] = "检查 swarm 是否异常",
+    token: Annotated[str, typer.Option("--token", help="Inbound X-LazySRE-Channel-Token value.")] = "",
+    base_url: Annotated[str, typer.Option("--base-url", help="Remote gateway base URL. Omit to use in-process local test.")] = "",
+    event_id: Annotated[str, typer.Option("--event-id", help="Optional event id for dedup and trace testing.")] = "",
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="HTTP timeout seconds for remote mode.")] = 10,
+    as_json: Annotated[bool, typer.Option("--json", help="Print full response as JSON.")] = False,
+) -> None:
+    """Send a simulated channel webhook message and print response summary."""
+    normalized = _normalize_channel_provider_name(provider)
+    inbound_token = token.strip() or os.environ.get("LAZYSRE_CHANNEL_TOKEN", "").strip() or "local-test-token"
+    event = event_id.strip() or f"evt-{int(time.time())}"
+    payload = _build_channel_sample_payload(provider=normalized, text=str(text or "").strip() or "检查 swarm", event_id=event)
+
+    if not base_url.strip():
+        os.environ["LAZYSRE_CHANNEL_TOKEN"] = inbound_token
+        os.environ.setdefault("LAZYSRE_CHANNEL_PROVIDER", "mock")
+        from fastapi.testclient import TestClient
+        from lazysre.main import app as api_app
+
+        path = f"/v1/channels/{normalized}/webhook"
+        signed = _build_channel_signed_request(
+            provider=normalized,
+            payload=payload,
+            webhook_url=path,
+            inbound_token=inbound_token,
+        )
+        client = TestClient(api_app)
+        response = client.post(
+            signed["url"],
+            headers=signed["headers"],
+            json=payload,
+        )
+        body: Any
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
+        result = {
+            "mode": "local",
+            "provider": normalized,
+            "url": signed["url"],
+            "status_code": int(response.status_code),
+            "ok": int(response.status_code) < 400,
+            "request": {
+                "headers": _mask_channel_headers(signed["headers"]),
+                "payload": payload,
+            },
+            "response": body,
+        }
+    else:
+        target = str(base_url).strip().rstrip("/")
+        webhook_url = f"{target}/v1/channels/{normalized}/webhook"
+        signed = _build_channel_signed_request(
+            provider=normalized,
+            payload=payload,
+            webhook_url=webhook_url,
+            inbound_token=inbound_token,
+        )
+        try:
+            import httpx
+
+            response = httpx.post(
+                signed["url"],
+                headers=signed["headers"],
+                json=payload,
+                timeout=max(2, min(timeout_sec, 20)),
+            )
+            try:
+                body = response.json()
+            except Exception:
+                body = {"raw": response.text[:1000]}
+            result = {
+                "mode": "remote",
+                "provider": normalized,
+                "url": signed["url"],
+                "status_code": int(response.status_code),
+                "ok": int(response.status_code) < 400,
+                "request": {
+                    "headers": _mask_channel_headers(signed["headers"]),
+                    "payload": payload,
+                },
+                "response": body,
+            }
+        except Exception as exc:
+            result = {
+                "mode": "remote",
+                "provider": normalized,
+                "url": signed["url"],
+                "ok": False,
+                "error": _safe_exception_text(exc),
+                "request": {
+                    "headers": _mask_channel_headers(signed["headers"]),
+                    "payload": payload,
+                },
+            }
+    if as_json:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        if not bool(result.get("ok", False)):
+            raise typer.Exit(code=1)
+        return
+    summary = _render_channel_test_summary(result)
+    typer.echo(summary)
+    if not bool(result.get("ok", False)):
+        raise typer.Exit(code=1)
+
+
+def _normalize_channel_provider_name(provider: str) -> str:
+    name = str(provider or "generic").strip().lower()
+    if name == "qq":
+        name = "onebot"
+    if name not in {"generic", "feishu", "dingtalk", "telegram", "onebot"}:
+        raise typer.BadParameter("provider must be generic|feishu|dingtalk|telegram|onebot")
+    return name
+
+
+def _build_channel_sample_payload(*, provider: str, text: str, event_id: str) -> dict[str, Any]:
+    msg = str(text or "").strip() or "检查 swarm"
+    evt = str(event_id or "").strip() or "evt-001"
+    if provider == "feishu":
+        return {
+            "event": {
+                "message": {
+                    "chat_id": "oc_xxx",
+                    "message_id": evt,
+                    "content": json.dumps({"text": msg}, ensure_ascii=False),
+                },
+                "sender": {"sender_id": {"open_id": "ou_xxx"}},
+            },
+            "header": {"event_id": evt},
+        }
+    if provider == "dingtalk":
+        return {
+            "conversationId": "cid_xxx",
+            "senderStaffId": "u_xxx",
+            "msgId": evt,
+            "text": {"content": msg},
+        }
+    if provider == "telegram":
+        return {
+            "update_id": int(time.time()),
+            "message": {
+                "message_id": int(time.time()) % 100000,
+                "chat": {"id": 12345},
+                "from": {"id": 67890},
+                "text": msg,
+            },
+        }
+    if provider == "onebot":
+        return {
+            "message_id": evt,
+            "user_id": 10001,
+            "group_id": 20001,
+            "raw_message": msg,
+        }
+    return {"text": msg, "user_id": "u-demo", "chat_id": "c-demo", "event_id": evt}
+
+
+def _build_channel_signed_request(
+    *,
+    provider: str,
+    payload: dict[str, Any],
+    webhook_url: str,
+    inbound_token: str,
+) -> dict[str, Any]:
+    headers = {
+        "Content-Type": "application/json",
+        "X-LazySRE-Channel-Token": inbound_token,
+    }
+    url = str(webhook_url or "").strip()
+
+    if provider == "telegram":
+        secret = os.environ.get("LAZYSRE_TELEGRAM_SECRET_TOKEN", "").strip()
+        if secret:
+            headers["X-Telegram-Bot-Api-Secret-Token"] = secret
+
+    if provider == "feishu":
+        verify_token = os.environ.get("LAZYSRE_FEISHU_VERIFICATION_TOKEN", "").strip()
+        if verify_token:
+            payload["token"] = verify_token
+        sign_secret = os.environ.get("LAZYSRE_FEISHU_SIGN_SECRET", "").strip()
+        if sign_secret:
+            ts = str(int(time.time()))
+            nonce = secrets.token_hex(8)
+            body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            digest = hmac.new(
+                sign_secret.encode("utf-8"),
+                (ts + nonce).encode("utf-8") + body_bytes,
+                hashlib.sha256,
+            ).hexdigest()
+            headers["X-Lark-Request-Timestamp"] = ts
+            headers["X-Lark-Request-Nonce"] = nonce
+            headers["X-Lark-Signature"] = digest
+
+    if provider == "onebot":
+        secret = os.environ.get("LAZYSRE_ONEBOT_SECRET", "").strip()
+        if secret:
+            body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            signature = hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha1).hexdigest()
+            headers["X-Signature"] = f"sha1={signature}"
+
+    if provider == "dingtalk":
+        secret = os.environ.get("LAZYSRE_DINGTALK_WEBHOOK_SECRET", "").strip()
+        if secret:
+            ts = str(int(time.time() * 1000))
+            raw = f"{ts}\n{secret}".encode("utf-8")
+            sign = base64.b64encode(hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).digest()).decode("utf-8")
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}timestamp={ts}&sign={sign}"
+    return {"url": url, "headers": headers}
+
+
+def _mask_channel_headers(headers: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k, v in headers.items():
+        key = str(k)
+        lower = key.lower()
+        value = str(v)
+        if any(token in lower for token in ("token", "signature", "secret")):
+            out[key] = _mask_secret_for_display(value)
+        else:
+            out[key] = value
+    return out
+
+
+def _mask_secret_for_display(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:4]}...{text[-4:]}"
+
+
+def _render_channel_test_summary(result: dict[str, Any]) -> str:
+    lines = [
+        "LazySRE channel test",
+        f"mode: {result.get('mode', '-')}",
+        f"provider: {result.get('provider', '-')}",
+        f"url: {result.get('url', '-')}",
+        f"ok: {result.get('ok', False)}",
+    ]
+    if "status_code" in result:
+        lines.append(f"status_code: {result.get('status_code')}")
+    error = str(result.get("error", "")).strip()
+    if error:
+        lines.append(f"error: {error}")
+    response = result.get("response")
+    if isinstance(response, dict):
+        trace_id = str(response.get("trace_id", "")).strip()
+        if trace_id:
+            lines.append(f"trace_id: {trace_id}")
+        ack = response.get("ack")
+        if isinstance(ack, dict):
+            lines.append(f"duplicate: {bool(ack.get('duplicate', False))}")
+        receipt = response.get("receipt")
+        if isinstance(receipt, dict):
+            lines.append(f"receipt_status: {receipt.get('status', '-')}")
+        reply = response.get("reply")
+        if isinstance(reply, dict):
+            preview = str(reply.get("reply") or reply.get("text") or "").strip().replace("\n", " ")
+            if preview:
+                lines.append(f"reply_preview: {preview[:120]}")
+    return "\n".join(lines)
 
 
 @app.command("verify-artifact")
