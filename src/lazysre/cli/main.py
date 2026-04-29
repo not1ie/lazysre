@@ -2590,6 +2590,36 @@ def channel_tail(
         )
 
 
+@app.command("channel-show")
+def channel_show(
+    trace_or_path: Annotated[str, typer.Argument(help="Trace id keyword or artifact file path.")],
+    run_dir: Annotated[str, typer.Option("--run-dir", help="Channel run artifact directory.")] = "",
+    hmac_key: Annotated[str, typer.Option("--hmac-key", help="Optional HMAC key for signed artifact verification.")] = "",
+    timeline_limit: Annotated[int, typer.Option("--timeline-limit", help="Max timeline rows in summary output.")] = 12,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    from lazysre.main import _verify_channel_run_artifact
+
+    limit = max(1, min(int(timeline_limit), 200))
+    target_dir = Path(run_dir.strip() or os.environ.get("LAZYSRE_CHANNEL_RUN_DIR", ".data/channel-runs")).expanduser()
+    resolved = _resolve_channel_run_artifact(trace_or_path=trace_or_path, run_dir=target_dir)
+    if resolved is None:
+        raise typer.BadParameter(f"channel artifact not found: {trace_or_path}")
+    payload = _read_json_object(resolved)
+    if not payload:
+        raise typer.BadParameter(f"invalid channel artifact json: {resolved}")
+    verify = _verify_channel_run_artifact(resolved, hmac_key=hmac_key)
+    summary = _build_channel_run_detail(path=resolved, payload=payload, verify=verify, timeline_limit=limit)
+    if as_json:
+        typer.echo(json.dumps(summary, ensure_ascii=False, indent=2))
+        if not bool(verify.get("ok", False)):
+            raise typer.Exit(code=1)
+        return
+    typer.echo(_render_channel_show_text(summary))
+    if not bool(verify.get("ok", False)):
+        raise typer.Exit(code=1)
+
+
 def _collect_channel_run_records(
     *,
     target_dir: Path,
@@ -2648,6 +2678,130 @@ def _build_channel_run_summary(*, path: Path, payload: dict[str, Any]) -> dict[s
         "path": str(path),
         "digest": str((payload.get("integrity", {}) or {}).get("digest", "")).strip(),
     }
+
+
+def _resolve_channel_run_artifact(*, trace_or_path: str, run_dir: Path) -> Path | None:
+    raw = str(trace_or_path or "").strip()
+    if not raw:
+        return None
+    direct = Path(raw).expanduser()
+    if direct.exists():
+        return direct
+    if not run_dir.exists():
+        return None
+    files = sorted(
+        run_dir.glob("*.json"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )
+    keyword = raw.lower()
+    for path in files:
+        if keyword in path.stem.lower():
+            return path
+    for path in files:
+        payload = _read_json_object(path)
+        if not payload:
+            continue
+        trace_id = str(payload.get("trace_id", "")).strip().lower()
+        if trace_id and keyword in trace_id:
+            return path
+    return None
+
+
+def _build_channel_run_detail(
+    *,
+    path: Path,
+    payload: dict[str, Any],
+    verify: dict[str, Any],
+    timeline_limit: int,
+) -> dict[str, Any]:
+    summary = _build_channel_run_summary(path=path, payload=payload)
+    timeline = payload.get("timeline", [])
+    timeline_rows: list[dict[str, Any]] = []
+    if isinstance(timeline, list):
+        for item in timeline[:timeline_limit]:
+            if not isinstance(item, dict):
+                continue
+            timeline_rows.append(
+                {
+                    "kind": str(item.get("kind", "")).strip(),
+                    "message": str(item.get("message", "")).strip()[:200],
+                    "duration_ms": int(item.get("duration_ms", 0) or 0),
+                }
+            )
+    actionables = payload.get("actionables", {})
+    commands: list[dict[str, Any]] = []
+    if isinstance(actionables, dict):
+        rows = actionables.get("commands", [])
+        if isinstance(rows, list):
+            for item in rows[:20]:
+                if not isinstance(item, dict):
+                    continue
+                commands.append(
+                    {
+                        "command": str(item.get("command", "")).strip()[:300],
+                        "risk_level": str(item.get("risk_level", "")).strip(),
+                        "requires_approval": bool(item.get("requires_approval", False)),
+                    }
+                )
+    return {
+        "path": str(path),
+        "summary": summary,
+        "verify": verify,
+        "instruction": str(payload.get("instruction", "")).strip(),
+        "final_text": str(payload.get("final_text", "")).strip()[:1000],
+        "timeline": timeline_rows,
+        "commands": commands,
+        "approval_snapshot": payload.get("approval_snapshot", {}),
+    }
+
+
+def _render_channel_show_text(detail: dict[str, Any]) -> str:
+    summary = detail.get("summary", {}) if isinstance(detail.get("summary"), dict) else {}
+    verify = detail.get("verify", {}) if isinstance(detail.get("verify"), dict) else {}
+    lines = [
+        "LazySRE Channel Run",
+        f"path: {detail.get('path', '-')}",
+        f"trace_id: {summary.get('trace_id', '-')}",
+        f"created_at: {summary.get('created_at', '-')}",
+        f"provider: {summary.get('provider', '-')}",
+        f"events: {summary.get('event_count', 0)}",
+        f"commands: {summary.get('command_count', 0)}",
+        f"needs_approval: {summary.get('needs_approval', False)}",
+        f"verify_ok: {verify.get('ok', False)}",
+        f"digest_match: {verify.get('digest_match', False)}",
+        f"signed: {verify.get('signed', False)}",
+        f"signature_valid: {verify.get('signature_valid', None)}",
+        "",
+        "instruction:",
+        str(detail.get("instruction", "")),
+        "",
+        "commands:",
+    ]
+    commands = detail.get("commands", [])
+    if isinstance(commands, list) and commands:
+        for item in commands:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- [{item.get('risk_level', '-')}] approval={item.get('requires_approval', False)} "
+                f"{item.get('command', '')}"
+            )
+    else:
+        lines.append("- (none)")
+    lines.append("")
+    lines.append("timeline:")
+    timeline = detail.get("timeline", [])
+    if isinstance(timeline, list) and timeline:
+        for row in timeline:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"- {row.get('kind', '-')}: {row.get('message', '')} ({row.get('duration_ms', 0)}ms)"
+            )
+    else:
+        lines.append("- (none)")
+    return "\n".join(lines)
 
 
 @app.command("fix")

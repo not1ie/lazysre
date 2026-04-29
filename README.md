@@ -243,6 +243,9 @@ lazysre channel-test --provider telegram --text "检查 k8s 集群是否异常" 
 
 # 查看最近渠道执行记录（trace/provider/是否需审批）
 lazysre channel-tail --limit 20 --json
+
+# 查看某次渠道执行详情（trace_id 关键字或文件路径）
+lazysre channel-show trc-demo --json
 ```
 
 支持 webhook 路径：
