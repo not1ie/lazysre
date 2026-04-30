@@ -88,6 +88,11 @@ from lazysre.cli.remediation_templates import (
 )
 from lazysre.cli.target import TargetEnvStore, probe_target_environment
 from lazysre.cli.target_profiles import ClusterProfileStore
+from lazysre.integrations.aiops_bridge import (
+    AIOpsBridgeClient,
+    AIOpsBridgeConfig,
+    AIOpsBridgeStore,
+)
 from lazysre.commands.preflight_risk import (
     build_preflight_risk_result,
     collect_preflight_risk_context,
@@ -164,6 +169,7 @@ target_profile_app = typer.Typer(help="Multi-cluster target profile management."
 history_app = typer.Typer(help="Session history management.")
 memory_app = typer.Typer(help="Long-term incident memory management.")
 kb_app = typer.Typer(help="Internal knowledge base ingestion and retrieval.")
+aiops_app = typer.Typer(help="Bridge and integrate external AIOps platform APIs.")
 incident_app = typer.Typer(help="Incident lifecycle management.")
 policy_app = typer.Typer(help="Multi-tenant policy center and guardrails.")
 approval_app = typer.Typer(help="Approval ticket lifecycle for high-risk execution.")
@@ -3975,6 +3981,95 @@ def kb_rebuild(
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+@aiops_app.command("bind")
+def aiops_bind(
+    base_url: Annotated[str, typer.Option("--base-url", help="AIOps platform base URL, e.g. http://host:port.")],
+    api_key_env: Annotated[str, typer.Option("--api-key-env", help="Environment variable name storing API key.")] = "LAZY_AIOPS_API_KEY",
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", help="HTTP timeout seconds.")] = 12,
+    verify_tls: Annotated[bool, typer.Option("--verify-tls/--no-verify-tls", help="Enable TLS certificate verification.")] = True,
+) -> None:
+    store = _open_aiops_bridge_store()
+    if not store:
+        raise typer.BadParameter("aiops bridge store is unavailable.")
+    payload = store.save(
+        AIOpsBridgeConfig(
+            base_url=str(base_url).strip(),
+            api_key_env=str(api_key_env).strip(),
+            timeout_sec=max(3, min(int(timeout_sec), 120)),
+            verify_tls=bool(verify_tls),
+        )
+    )
+    payload["db_path"] = str(_resolve_aiops_bridge_path())
+    payload["has_api_key"] = bool(os.getenv(str(payload.get("api_key_env", "")), "").strip())
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@aiops_app.command("show")
+def aiops_show() -> None:
+    store = _open_aiops_bridge_store()
+    if not store:
+        raise typer.BadParameter("aiops bridge store is unavailable.")
+    cfg = store.load()
+    payload = {
+        "base_url": cfg.base_url,
+        "api_key_env": cfg.api_key_env,
+        "has_api_key": bool(os.getenv(cfg.api_key_env, "").strip()),
+        "timeout_sec": cfg.timeout_sec,
+        "verify_tls": cfg.verify_tls,
+        "updated_at": cfg.updated_at,
+        "config_path": str(_resolve_aiops_bridge_path()),
+    }
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@aiops_app.command("ping")
+def aiops_ping() -> None:
+    store = _open_aiops_bridge_store()
+    if not store:
+        raise typer.BadParameter("aiops bridge store is unavailable.")
+    cfg = store.load()
+    client = _build_aiops_bridge_client(cfg)
+    payload = client.health()
+    payload["base_url"] = cfg.base_url
+    payload["api_key_env"] = cfg.api_key_env
+    payload["has_api_key"] = bool(os.getenv(cfg.api_key_env, "").strip())
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@aiops_app.command("skills")
+def aiops_skills(
+    limit: Annotated[int, typer.Option("--limit", help="Max skills to return.")] = 30,
+    as_json: Annotated[bool, typer.Option("--json", help="Print as JSON.")] = False,
+) -> None:
+    store = _open_aiops_bridge_store()
+    if not store:
+        raise typer.BadParameter("aiops bridge store is unavailable.")
+    cfg = store.load()
+    client = _build_aiops_bridge_client(cfg)
+    payload = client.list_skills(limit=max(1, min(int(limit), 200)))
+    if as_json or (not _console):
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    if not payload.get("ok"):
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    items = payload.get("items", [])
+    if not isinstance(items, list) or (not items):
+        typer.echo("no skills found on remote aiops platform")
+        return
+    table = Table(title="AIOps Skills")
+    table.add_column("#", style="cyan", no_wrap=True)
+    table.add_column("name", style="green")
+    table.add_column("description", overflow="fold")
+    for idx, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", item.get("id", f"skill-{idx}"))).strip()
+        desc = str(item.get("description", item.get("summary", ""))).strip()
+        table.add_row(str(idx), name[:80], desc[:180])
+    _console.print(table)
+
+
 @policy_app.command("init")
 def policy_init(
     policy_file: Annotated[str, typer.Option("--policy-file", help="Policy center JSON path.")] = ".data/lsre-policy.json",
@@ -5815,6 +5910,7 @@ app.add_typer(target_app, name="target")
 app.add_typer(history_app, name="history")
 app.add_typer(memory_app, name="memory")
 app.add_typer(kb_app, name="kb")
+app.add_typer(aiops_app, name="aiops")
 app.add_typer(incident_app, name="incident")
 app.add_typer(policy_app, name="policy")
 app.add_typer(approval_app, name="approval")
@@ -10331,6 +10427,10 @@ def _default_knowledge_db_path() -> Path:
     return Path.home() / ".lazysre" / "knowledge_db"
 
 
+def _default_aiops_bridge_path() -> Path:
+    return Path.home() / ".lazysre" / "aiops_bridge.json"
+
+
 def _resolve_memory_db_path() -> Path:
     primary = _default_memory_db_path()
     try:
@@ -10353,6 +10453,17 @@ def _resolve_knowledge_db_path() -> Path:
         return fallback
 
 
+def _resolve_aiops_bridge_path() -> Path:
+    primary = _default_aiops_bridge_path()
+    try:
+        primary.parent.mkdir(parents=True, exist_ok=True)
+        return primary
+    except Exception:
+        fallback = Path(".data/lsre-aiops-bridge.json")
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 def _open_incident_memory_store() -> IncidentMemoryStore | None:
     try:
         return IncidentMemoryStore(_resolve_memory_db_path())
@@ -10365,6 +10476,21 @@ def _open_knowledge_store() -> KnowledgeBaseStore | None:
         return KnowledgeBaseStore(_resolve_knowledge_db_path())
     except Exception:
         return None
+
+
+def _open_aiops_bridge_store() -> AIOpsBridgeStore | None:
+    try:
+        return AIOpsBridgeStore(_resolve_aiops_bridge_path())
+    except Exception:
+        return None
+
+
+def _build_aiops_bridge_client(
+    config: AIOpsBridgeConfig,
+    *,
+    explicit_api_key: str = "",
+) -> AIOpsBridgeClient:
+    return AIOpsBridgeClient(config, explicit_api_key=explicit_api_key)
 
 
 def _count_memory_cases(path: Path) -> int:
@@ -13517,6 +13643,8 @@ def _render_chat_short_help() -> None:
         "- /kb rebuild [--drop-missing]: 重建知识索引并去重历史重复 source_path",
         "- /kb <query>: 检索内部知识库",
         "- /kb source:<path关键字> min:0.35 <query>: 按来源与分数阈值检索",
+        "- /aiops bind <base_url>: 绑定外部 AIOps 平台",
+        "- /aiops show|ping|skills: 查看桥接配置/健康检查/技能列表",
         "- TUI 里可用 Up/Down 浏览输入历史（支持前缀筛选），Ctrl-L 或 /clear 清空屏幕，1-4/F2 切换面板，F3 切换 UI",
         "- exit / quit: 退出",
     ]
@@ -17166,6 +17294,7 @@ _KNOWN_SLASH_COMMANDS: tuple[str, ...] = (
     "undo",
     "memory",
     "kb",
+    "aiops",
     "apply",
     "activity",
     "focus",
@@ -18320,6 +18449,38 @@ def _assistant_chat_loop(options: dict[str, object]) -> None:
                 min_score=min_score,
                 as_json=False,
             )
+            continue
+        if text.lower().startswith("/aiops"):
+            tail = text[len("/aiops") :].strip()
+            if not tail:
+                aiops_show()
+                continue
+            lowered = tail.lower()
+            if lowered.startswith("bind "):
+                base_url = tail[5:].strip()
+                if not base_url:
+                    typer.echo("usage: /aiops bind <base_url>")
+                    continue
+                try:
+                    aiops_bind(
+                        base_url=base_url,
+                        api_key_env="LAZY_AIOPS_API_KEY",
+                        timeout_sec=12,
+                        verify_tls=True,
+                    )
+                except typer.BadParameter as exc:
+                    typer.echo(f"aiops bind failed: {_safe_exception_text(exc)}")
+                continue
+            if lowered == "show":
+                aiops_show()
+                continue
+            if lowered == "ping":
+                aiops_ping()
+                continue
+            if lowered == "skills":
+                aiops_skills(limit=30, as_json=False)
+                continue
+            typer.echo("usage: /aiops [show|ping|skills|bind <base_url>]")
             continue
         if text.lower() in {"/apply", "/apply-last"}:
             _apply_last_fix_plan(

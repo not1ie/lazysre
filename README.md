@@ -293,6 +293,30 @@ POST /v1/channels/onebot/webhook
 POST /v1/channels/generic/webhook
 ```
 
+## 融合外部 AIOps 平台（lazy_aiops 桥接）
+
+可把 LazySRE 作为“执行与诊断终端”，把 `lazy_aiops` 作为“平台中台”接入：
+
+```bash
+# 绑定外部平台
+lazysre aiops bind --base-url http://127.0.0.1:19090
+
+# 查看配置
+lazysre aiops show
+
+# 健康检查
+lazysre aiops ping
+
+# 拉取平台技能目录
+lazysre aiops skills --json
+```
+
+在 TUI/Chat 内可直接使用：
+- `/aiops show`
+- `/aiops ping`
+- `/aiops skills`
+- `/aiops bind http://127.0.0.1:19090`
+
 说明：
 - 网关只做自然语言接入与诊断回复
 - 生产变更仍建议回到 CLI 审批执行
