@@ -6,6 +6,8 @@ import json
 import os
 import re
 import secrets
+import shlex
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,7 +19,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from lazysre import __version__
 from lazysre.cli.approval import ApprovalStore, RISK_ORDER
 from lazysre.cli.memory import IncidentMemoryStore
-from lazysre.cli.policy import assess_command
+from lazysre.cli.policy import assess_command, build_risk_report
 from lazysre.cli.target import TargetEnvStore
 from lazysre.cli.target_profiles import ClusterProfileStore
 from lazysre.channels import ChannelParseError, format_channel_reply, parse_channel_message
@@ -94,6 +96,63 @@ def _max_actionable_risk(actionables: dict[str, Any]) -> str:
         if RISK_ORDER.get(risk, 0) > RISK_ORDER.get(highest, 0):
             highest = risk
     return highest
+
+
+def _split_command_text(command: str) -> list[str]:
+    text = str(command or "").strip()
+    if not text:
+        return []
+    try:
+        return shlex.split(text)
+    except Exception:
+        return text.split()
+
+
+def _is_web_exec_allowed(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    allow = {"kubectl", "docker", "curl", "tail", "echo", "lazysre", "lsre"}
+    return argv[0] in allow
+
+
+def _run_local_command(argv: list[str], *, timeout_sec: int) -> dict[str, Any]:
+    start = datetime.now(timezone.utc)
+    try:
+        completed = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=max(3, min(int(timeout_sec), 180)),
+            check=False,
+        )
+        return {
+            "ok": completed.returncode == 0,
+            "exit_code": int(completed.returncode),
+            "stdout": str(completed.stdout or "")[:6000],
+            "stderr": str(completed.stderr or "")[:6000],
+            "started_at": start.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "exit_code": 124,
+            "stdout": str(exc.stdout or "")[:6000],
+            "stderr": str(exc.stderr or "")[:6000],
+            "started_at": start.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "error": "timeout",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "",
+            "started_at": start.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(exc),
+        }
 
 
 @app.get("/health")
@@ -272,6 +331,152 @@ async def aiops_ops_diagnose(payload: dict[str, Any]) -> dict[str, Any]:
         "approval_ticket": approval_ticket,
         "ticket": ticket_data,
         "environment": _render_environment_block(_channel_target_context()),
+    }
+
+
+@app.post("/v1/aiops/ops/approve")
+async def aiops_ops_approve(payload: dict[str, Any]) -> dict[str, Any]:
+    ticket_id = str(payload.get("ticket_id", "")).strip()
+    approver = str(payload.get("approver", "web-approver")).strip() or "web-approver"
+    comment = str(payload.get("comment", "")).strip()
+    if not ticket_id:
+        raise HTTPException(status_code=400, detail="ticket_id is required")
+    store_path = Path(os.environ.get("LAZYSRE_APPROVAL_STORE", ".data/lsre-approvals.json")).expanduser()
+    store = ApprovalStore(store_path)
+    item = store.approve(ticket_id, approver=approver, comment=comment)
+    if not item:
+        raise HTTPException(status_code=404, detail="approval ticket not found")
+    remaining = max(0, int(item.required_approvers) - len(item.approvals))
+    return {
+        "ok": True,
+        "ticket": item.to_dict(),
+        "remaining_approvals": remaining,
+        "is_ready": item.status == "approved",
+    }
+
+
+@app.post("/v1/aiops/ops/execute")
+async def aiops_ops_execute(payload: dict[str, Any]) -> dict[str, Any]:
+    command = str(payload.get("command", "")).strip()
+    if not command:
+        raise HTTPException(status_code=400, detail="command is required")
+    execute = bool(payload.get("execute", False))
+    approval_mode = str(payload.get("approval_mode", "strict")).strip().lower() or "strict"
+    if approval_mode not in {"strict", "balanced", "permissive"}:
+        approval_mode = "strict"
+    timeout_sec = max(3, min(int(payload.get("timeout_sec", 40) or 40), 180))
+    approval_ticket = str(payload.get("approval_ticket", "")).strip()
+    tenant = str(payload.get("tenant", "default")).strip() or "default"
+    environment = str(payload.get("environment", "prod")).strip() or "prod"
+    actor_role = str(payload.get("actor_role", "operator")).strip() or "operator"
+    dry_run_probe = bool(payload.get("dry_run_probe", True))
+
+    argv = _split_command_text(command)
+    if not argv:
+        raise HTTPException(status_code=400, detail="invalid command")
+    if not _is_web_exec_allowed(argv):
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": f"command binary not allowed: {argv[0]}",
+            "command": command,
+            "argv": argv,
+        }
+
+    if argv and argv[0] == "echo":
+        decision = assess_command(["tail", "/dev/null"], approval_mode=approval_mode)
+        decision.risk_level = "low"
+        decision.requires_approval = False
+        decision.reasons = ["echo is treated as a low-risk local preview command."]
+        risk = {
+            "risk_level": "low",
+            "risk_score": 8,
+            "impact_scope": "local",
+            "blast_radius": "none",
+            "requires_approval": False,
+            "reasons": list(decision.reasons),
+            "rollback": "not required",
+        }
+    else:
+        decision = assess_command(argv, approval_mode=approval_mode)
+        risk = build_risk_report(argv, decision)
+    requires_approval = bool(decision.requires_approval)
+
+    ticket_detail: dict[str, Any] | None = None
+    if requires_approval:
+        if (not approval_ticket) and execute:
+            return {
+                "ok": False,
+                "blocked": True,
+                "reason": "approval_ticket required for high-risk command",
+                "command": command,
+                "argv": argv,
+                "risk": risk,
+            }
+        if not approval_ticket:
+            return {
+                "ok": True,
+                "execute": False,
+                "dry_run": True,
+                "command": command,
+                "argv": argv,
+                "risk": risk,
+                "requires_approval": True,
+                "approval_ticket": "",
+                "ticket": None,
+                "probe": _run_local_command(argv, timeout_sec=timeout_sec) if dry_run_probe else None,
+                "next": "approval required before execute; call /v1/aiops/ops/approve then re-run with approval_ticket",
+            }
+        store_path = Path(os.environ.get("LAZYSRE_APPROVAL_STORE", ".data/lsre-approvals.json")).expanduser()
+        store = ApprovalStore(store_path)
+        valid, reason, item = store.validate_for_execution(
+            approval_ticket,
+            tenant=tenant,
+            environment=environment,
+            actor_role=actor_role,
+            risk_level=str(risk.get("risk_level", "critical")),
+            command=argv,
+        )
+        if item:
+            ticket_detail = item.to_dict()
+        if not valid:
+            return {
+                "ok": False,
+                "blocked": True,
+                "reason": f"approval validation failed: {reason}",
+                "approval_ticket": approval_ticket,
+                "command": command,
+                "argv": argv,
+                "risk": risk,
+                "ticket": ticket_detail,
+            }
+
+    if not execute:
+        return {
+            "ok": True,
+            "execute": False,
+            "dry_run": True,
+            "command": command,
+            "argv": argv,
+            "risk": risk,
+            "requires_approval": requires_approval,
+            "approval_ticket": approval_ticket,
+            "ticket": ticket_detail,
+            "probe": _run_local_command(argv, timeout_sec=timeout_sec) if dry_run_probe else None,
+            "next": "set execute=true to run command",
+        }
+
+    result = _run_local_command(argv, timeout_sec=timeout_sec)
+    return {
+        "ok": bool(result.get("ok", False)),
+        "execute": True,
+        "command": command,
+        "argv": argv,
+        "risk": risk,
+        "requires_approval": requires_approval,
+        "approval_ticket": approval_ticket,
+        "ticket": ticket_detail,
+        "result": result,
     }
 
 

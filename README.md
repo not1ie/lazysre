@@ -325,12 +325,19 @@ POST /v1/aiops/bridge/bind
 GET  /v1/aiops/bridge/ping
 GET  /v1/aiops/bridge/skills?limit=30
 POST /v1/aiops/ops/diagnose
+POST /v1/aiops/ops/approve
+POST /v1/aiops/ops/execute
 ```
 
 `/v1/aiops/ops/diagnose` 用于 Web 一键诊断：
 - 输入自然语言 `instruction`
 - 返回 `actionables + execution_templates + timeline`
 - 若命中高风险命令可自动创建审批单（`approval_ticket`）
+
+建议的 Web 闭环顺序：
+1. 调 `/v1/aiops/ops/diagnose` 生成修复动作与模板
+2. 审批人调用 `/v1/aiops/ops/approve` 批准 `approval_ticket`
+3. 执行器调用 `/v1/aiops/ops/execute`（`execute=true`）并携带 `approval_ticket`
 
 说明：
 - 网关只做自然语言接入与诊断回复
