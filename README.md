@@ -324,7 +324,13 @@ GET  /v1/aiops/bridge
 POST /v1/aiops/bridge/bind
 GET  /v1/aiops/bridge/ping
 GET  /v1/aiops/bridge/skills?limit=30
+POST /v1/aiops/ops/diagnose
 ```
+
+`/v1/aiops/ops/diagnose` 用于 Web 一键诊断：
+- 输入自然语言 `instruction`
+- 返回 `actionables + execution_templates + timeline`
+- 若命中高风险命令可自动创建审批单（`approval_ticket`）
 
 说明：
 - 网关只做自然语言接入与诊断回复

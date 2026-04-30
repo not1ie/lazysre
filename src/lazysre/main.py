@@ -15,7 +15,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from lazysre import __version__
-from lazysre.cli.approval import ApprovalStore
+from lazysre.cli.approval import ApprovalStore, RISK_ORDER
 from lazysre.cli.memory import IncidentMemoryStore
 from lazysre.cli.policy import assess_command
 from lazysre.cli.target import TargetEnvStore
@@ -80,6 +80,20 @@ def _open_aiops_bridge_store() -> AIOpsBridgeStore:
 
 def _build_aiops_bridge_client(config: AIOpsBridgeConfig, *, explicit_api_key: str = "") -> AIOpsBridgeClient:
     return AIOpsBridgeClient(config, explicit_api_key=explicit_api_key)
+
+
+def _max_actionable_risk(actionables: dict[str, Any]) -> str:
+    rows = actionables.get("commands", []) if isinstance(actionables, dict) else []
+    highest = "low"
+    if not isinstance(rows, list):
+        return highest
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        risk = str(item.get("risk_level", "low")).strip().lower() or "low"
+        if RISK_ORDER.get(risk, 0) > RISK_ORDER.get(highest, 0):
+            highest = risk
+    return highest
 
 
 @app.get("/health")
@@ -163,6 +177,102 @@ async def aiops_bridge_skills(
     payload["api_key_env"] = cfg.api_key_env
     payload["has_api_key"] = bool(os.getenv(cfg.api_key_env, "").strip() or x_aiops_api_key.strip())
     return payload
+
+
+@app.post("/v1/aiops/ops/diagnose")
+async def aiops_ops_diagnose(payload: dict[str, Any]) -> dict[str, Any]:
+    instruction = str(payload.get("instruction", "")).strip()
+    if not instruction:
+        raise HTTPException(status_code=400, detail="instruction is required")
+
+    provider = str(payload.get("provider", os.environ.get("LAZYSRE_CHANNEL_PROVIDER", "mock"))).strip() or "mock"
+    model = str(
+        payload.get(
+            "model",
+            os.environ.get("LAZYSRE_CHANNEL_MODEL", os.environ.get("LAZYSRE_MODEL_NAME", "gpt-5.4-mini")),
+        )
+    ).strip() or "gpt-5.4-mini"
+    approval_mode = str(payload.get("approval_mode", os.environ.get("LAZYSRE_CHANNEL_APPROVAL_MODE", "strict"))).strip()
+    if approval_mode not in {"strict", "balanced", "permissive"}:
+        approval_mode = "strict"
+    max_steps = max(1, min(int(payload.get("max_steps", 5) or 5), 16))
+    history_context = str(payload.get("history_context", "")).strip()
+    auto_create_ticket = bool(payload.get("auto_create_ticket", True))
+    requester = str(payload.get("requester", "web-user")).strip() or "web-user"
+    tenant = str(payload.get("tenant", "default")).strip() or "default"
+    environment = str(payload.get("environment", "prod")).strip() or "prod"
+    actor_role = str(payload.get("actor_role", "operator")).strip() or "operator"
+    required_approvers = max(1, min(int(payload.get("required_approvers", 1) or 1), 5))
+
+    from lazysre.cli.main import _dispatch
+
+    result = await _dispatch(
+        instruction=instruction,
+        execute=False,
+        approve=False,
+        interactive_approval=False,
+        approval_mode=approval_mode,
+        audit_log=os.environ.get("LAZYSRE_CHANNEL_AUDIT_LOG", ".data/lsre-channel-audit.jsonl"),
+        lock_file=os.environ.get("LAZYSRE_CHANNEL_LOCK_FILE", ".data/lsre-tool-lock.json"),
+        deny_tool=[],
+        deny_prefix=[],
+        tool_pack=["builtin"],
+        remote_gateway=[],
+        model=model,
+        provider=provider,
+        max_steps=max_steps,
+        conversation_context=history_context,
+    )
+    timeline = _compact_channel_timeline(result.events)
+    actionables = _build_channel_actionables(result.final_text, approval_mode=approval_mode)
+    approval_ticket = os.environ.get("LAZYSRE_APPROVAL_TICKET", "").strip()
+    ticket_data: dict[str, Any] | None = None
+    if (not approval_ticket) and auto_create_ticket and bool(actionables.get("needs_approval", False)):
+        store_path = Path(os.environ.get("LAZYSRE_APPROVAL_STORE", ".data/lsre-approvals.json")).expanduser()
+        store = ApprovalStore(store_path)
+        highest_risk = _max_actionable_risk(actionables)
+        first_command = ""
+        rows = actionables.get("commands", []) if isinstance(actionables, dict) else []
+        if isinstance(rows, list):
+            for item in rows:
+                if isinstance(item, dict):
+                    first_command = str(item.get("command", "")).strip()
+                    if first_command:
+                        break
+        prefix = " ".join(_command_to_argv(first_command)[:2]).strip().lower() if first_command else ""
+        ticket = store.create(
+            reason=f"web aiops diagnose: {instruction[:120]}",
+            risk_level=highest_risk,
+            tenant=tenant,
+            environment=environment,
+            actor_role=actor_role,
+            requester=requester,
+            required_approvers=required_approvers,
+            command_prefix=prefix,
+        )
+        approval_ticket = ticket.id
+        ticket_data = ticket.to_dict()
+    execution_templates = _build_execution_templates_from_actionables(
+        actionables,
+        source="aiops-web",
+        approval_ticket=approval_ticket,
+        target_context=_channel_target_context(),
+    )
+    return {
+        "ok": True,
+        "instruction": instruction,
+        "provider": provider,
+        "model": model,
+        "approval_mode": approval_mode,
+        "final_text": result.final_text,
+        "event_count": len(result.events),
+        "timeline": timeline,
+        "actionables": actionables,
+        "execution_templates": execution_templates,
+        "approval_ticket": approval_ticket,
+        "ticket": ticket_data,
+        "environment": _render_environment_block(_channel_target_context()),
+    }
 
 
 @app.post("/v1/channels/{provider}/webhook")
