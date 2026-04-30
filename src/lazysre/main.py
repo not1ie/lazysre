@@ -21,6 +21,11 @@ from lazysre.cli.policy import assess_command
 from lazysre.cli.target import TargetEnvStore
 from lazysre.cli.target_profiles import ClusterProfileStore
 from lazysre.channels import ChannelParseError, format_channel_reply, parse_channel_message
+from lazysre.integrations.aiops_bridge import (
+    AIOpsBridgeClient,
+    AIOpsBridgeConfig,
+    AIOpsBridgeStore,
+)
 from lazysre.models import MemorySearchResponse, TaskCreateRequest, TaskRecord
 from lazysre.platform.models import (
     AgentCreateRequest,
@@ -58,6 +63,25 @@ task_service = TaskService()
 platform_service = PlatformService()
 
 
+def _aiops_bridge_config_path() -> Path:
+    primary = Path.home() / ".lazysre" / "aiops_bridge.json"
+    try:
+        primary.parent.mkdir(parents=True, exist_ok=True)
+        return primary
+    except Exception:
+        fallback = Path(".data/lsre-aiops-bridge.json")
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def _open_aiops_bridge_store() -> AIOpsBridgeStore:
+    return AIOpsBridgeStore(_aiops_bridge_config_path())
+
+
+def _build_aiops_bridge_client(config: AIOpsBridgeConfig, *, explicit_api_key: str = "") -> AIOpsBridgeClient:
+    return AIOpsBridgeClient(config, explicit_api_key=explicit_api_key)
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -66,6 +90,79 @@ async def health() -> dict[str, str]:
 @app.get("/", include_in_schema=False)
 async def root() -> dict[str, str]:
     return {"service": "lazysre", "status": "ok"}
+
+
+@app.get("/v1/aiops/bridge")
+async def aiops_bridge_show() -> dict[str, Any]:
+    store = _open_aiops_bridge_store()
+    cfg = store.load()
+    return {
+        "base_url": cfg.base_url,
+        "api_key_env": cfg.api_key_env,
+        "has_api_key": bool(os.getenv(cfg.api_key_env, "").strip()),
+        "timeout_sec": cfg.timeout_sec,
+        "verify_tls": cfg.verify_tls,
+        "updated_at": cfg.updated_at,
+        "config_path": str(_aiops_bridge_config_path()),
+    }
+
+
+@app.post("/v1/aiops/bridge/bind")
+async def aiops_bridge_bind(payload: dict[str, Any]) -> dict[str, Any]:
+    base_url = str(payload.get("base_url", "")).strip()
+    if not base_url:
+        raise HTTPException(status_code=400, detail="base_url is required")
+    api_key_env = str(payload.get("api_key_env", "LAZY_AIOPS_API_KEY")).strip() or "LAZY_AIOPS_API_KEY"
+    timeout_sec = max(3, min(int(payload.get("timeout_sec", 12) or 12), 120))
+    verify_tls = bool(payload.get("verify_tls", True))
+    store = _open_aiops_bridge_store()
+    saved = store.save(
+        AIOpsBridgeConfig(
+            base_url=base_url,
+            api_key_env=api_key_env,
+            timeout_sec=timeout_sec,
+            verify_tls=verify_tls,
+        )
+    )
+    saved["config_path"] = str(_aiops_bridge_config_path())
+    saved["has_api_key"] = bool(os.getenv(api_key_env, "").strip())
+    return saved
+
+
+@app.get("/v1/aiops/bridge/ping")
+async def aiops_bridge_ping(x_aiops_api_key: str = Header(default="")) -> dict[str, Any]:
+    store = _open_aiops_bridge_store()
+    cfg = store.load()
+    client = _build_aiops_bridge_client(cfg, explicit_api_key=x_aiops_api_key.strip())
+    payload = client.health()
+    payload["base_url"] = cfg.base_url
+    payload["api_key_env"] = cfg.api_key_env
+    payload["has_api_key"] = bool(os.getenv(cfg.api_key_env, "").strip() or x_aiops_api_key.strip())
+    return payload
+
+
+@app.get("/v1/aiops/bridge/skills")
+async def aiops_bridge_skills(
+    limit: int = 30,
+    min_score: float = 0.0,
+    source_contains: str = "",
+    x_aiops_api_key: str = Header(default=""),
+) -> dict[str, Any]:
+    cap = max(1, min(int(limit), 200))
+    store = _open_aiops_bridge_store()
+    cfg = store.load()
+    client = _build_aiops_bridge_client(cfg, explicit_api_key=x_aiops_api_key.strip())
+    payload = client.list_skills(limit=cap)
+    # Reserved fields for web-side unified filters, kept for forward compatibility.
+    payload["query_options"] = {
+        "limit": cap,
+        "min_score": max(0.0, min(float(min_score), 1.0)),
+        "source_contains": str(source_contains or "").strip(),
+    }
+    payload["base_url"] = cfg.base_url
+    payload["api_key_env"] = cfg.api_key_env
+    payload["has_api_key"] = bool(os.getenv(cfg.api_key_env, "").strip() or x_aiops_api_key.strip())
+    return payload
 
 
 @app.post("/v1/channels/{provider}/webhook")

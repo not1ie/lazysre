@@ -317,6 +317,15 @@ lazysre aiops skills --json
 - `/aiops skills`
 - `/aiops bind http://127.0.0.1:19090`
 
+Web 融合接口（供 `lazy_aiops` 前端直接调用）：
+
+```bash
+GET  /v1/aiops/bridge
+POST /v1/aiops/bridge/bind
+GET  /v1/aiops/bridge/ping
+GET  /v1/aiops/bridge/skills?limit=30
+```
+
 说明：
 - 网关只做自然语言接入与诊断回复
 - 生产变更仍建议回到 CLI 审批执行
